@@ -48,7 +48,9 @@ struct UsageSnapshot {
 
 enum UsageError: LocalizedError {
     case unauthorized
-    case rateLimited
+    /// Carries the server's own `Retry-After` when it sent one, which outranks
+    /// the locally computed backoff.
+    case rateLimited(retryAfter: Date?)
     case http(Int)
     case badPayload
 
@@ -218,11 +220,17 @@ enum UsageClient {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let (data, response) = try await URLSession.shared.data(for: req)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let http = response as? HTTPURLResponse
+        let code = http?.statusCode ?? 0
         switch code {
         case 200: return try UsageDecoder.decode(data)
         case 401, 403: throw UsageError.unauthorized
-        case 429: throw UsageError.rateLimited
+        case 429:
+            throw UsageError.rateLimited(
+                retryAfter: RetryAfter.parse(
+                    http?.value(forHTTPHeaderField: "Retry-After")
+                )
+            )
         default: throw UsageError.http(code)
         }
     }

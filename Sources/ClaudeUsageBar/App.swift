@@ -2,8 +2,16 @@ import AppKit
 import SwiftUI
 
 struct AccountState {
+    /// The last reading that actually arrived. Deliberately kept across
+    /// failures: a transient 429 must never wipe the numbers off the screen,
+    /// so this only ever goes back to `nil` if nothing has *ever* loaded.
     var snapshot: UsageSnapshot?
+    /// Set while the newest attempt is failing. Alongside a non-nil `snapshot`
+    /// it means what is on screen is real but no longer live.
     var error: String?
+
+    /// Showing real numbers that are no longer being refreshed.
+    var isStale: Bool { error != nil && snapshot != nil }
 }
 
 @MainActor
@@ -19,6 +27,12 @@ final class AppState: ObservableObject {
     private let vault = TokenVault()
     private var pollTask: Task<Void, Never>?
     private var lastManualRefresh: Date = .distantPast
+    /// When each account was last *asked* — success or failure. The ordinary
+    /// schedule is measured from here.
+    private var lastAttempt: [UUID: Date] = [:]
+    /// Per-account backoff. The one gate no refresh reason may override.
+    private var retry: [UUID: RetrySchedule] = [:]
+    private var isPassRunning = false
 
     init(demo: Bool = false) {
         isDemo = demo
@@ -30,29 +44,33 @@ final class AppState: ObservableObject {
             return
         }
         accounts = Store.load()
+        // The loop wakes often but asks each account's own schedule whether it
+        // is due, so waking is free — only a due account costs a request.
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.refreshAll()
-                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                await self?.refresh(reason: .scheduled)
+                try? await Task.sleep(nanoseconds: UInt64(PollPolicy.tick * 1_000_000_000))
             }
         }
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in await self?.refreshAll() }
+            Task { @MainActor in await self?.refresh(reason: .opportunistic) }
         }
     }
 
     var canAddAccount: Bool { !isDemo && accounts.count < Store.maxAccounts && !isSigningIn }
 
-    /// What the status item draws, one cell per account.
+    /// What the status item draws, one cell per account. `headroom` is the last
+    /// reading that arrived even when the newest attempt failed, so a 429 dims
+    /// the gauge's track rather than emptying it.
     var barCells: [BarCell] {
         accounts.map { account in
             let state = states[account.id]
             return BarCell(
                 character: account.character,
                 headroom: state?.snapshot?.headroom,
-                isError: state?.error != nil
+                isUnreachable: state?.error != nil
             )
         }
     }
@@ -60,58 +78,125 @@ final class AppState: ObservableObject {
     func state(for account: Account) -> AccountState? { states[account.id] }
 
     // MARK: Refreshing
+    //
+    // Two gates stand between a reason to refresh and an actual request:
+    //
+    //   backoff   — set only by a failure, and overridable by nothing. Manual
+    //               refresh does not escape it; that is the whole point.
+    //   staleness — how old the on-screen reading may be before this particular
+    //               reason justifies spending a request (`RefreshReason.maxAge`).
+    //
+    // Everything that used to call `refreshAll()` now names its reason, so the
+    // popover opening and the machine waking can no longer stack extra requests
+    // on top of the poll loop.
 
-    func refreshAll() async {
+    func refresh(reason: RefreshReason) async {
         guard !isDemo else { return }
         guard !accounts.isEmpty else {
             lastUpdated = Date()
             return
         }
+        // One pass at a time: a pass sleeps between accounts, so overlapping
+        // passes would reintroduce exactly the burst the stagger removes.
+        guard !isPassRunning else { return }
+        isPassRunning = true
+        defer { isPassRunning = false }
+
+        let now = Date()
+        let due = accounts.filter { isDue($0, reason: reason, now: now) }
+        guard !due.isEmpty else { return }
+
         isRefreshing = true
-        let snapshot = accounts
-        let vault = self.vault
-        let results = await withTaskGroup(of: (UUID, AccountState).self) { group in
-            for account in snapshot {
-                group.addTask { (account.id, await Self.load(account, vault: vault)) }
+        defer { isRefreshing = false }
+        for (index, account) in due.enumerated() {
+            if index > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(PollPolicy.stagger * 1_000_000_000))
             }
-            var out: [UUID: AccountState] = [:]
-            for await (id, state) in group { out[id] = state }
-            return out
+            // The account may have been signed out mid-pass.
+            guard accounts.contains(where: { $0.id == account.id }) else { continue }
+            await fetch(account)
         }
-        for (id, state) in results { states[id] = state }
-        states = states.filter { id, _ in snapshot.contains { $0.id == id } }
-        lastUpdated = Date()
-        isRefreshing = false
+    }
+
+    private func isDue(_ account: Account, reason: RefreshReason, now: Date) -> Bool {
+        if retry[account.id]?.isBlocked(at: now) == true { return false }
+        guard let maxAge = reason.maxAge else { return true }
+        guard let last = lastAttempt[account.id] else { return true }
+        return now.timeIntervalSince(last) >= maxAge
+    }
+
+    private func fetch(_ account: Account) async {
+        lastAttempt[account.id] = Date()
+        let outcome = await Self.load(account, vault: vault)
+        guard accounts.contains(where: { $0.id == account.id }) else { return }
+
+        var state = states[account.id] ?? AccountState()
+        var schedule = retry[account.id] ?? RetrySchedule()
+        switch outcome {
+        case .success(let snapshot):
+            state.snapshot = snapshot
+            state.error = nil
+            schedule.recordSuccess()
+            lastUpdated = Date()
+        case .failure(let message, let kind, let retryAfter):
+            // The last good numbers stay exactly where they are; only the
+            // verdict changes and the track goes hollow.
+            state.error = message
+            schedule.recordFailure(kind, retryAfter: retryAfter)
+        }
+        states[account.id] = state
+        retry[account.id] = schedule
     }
 
     func manualRefresh() {
-        guard Date().timeIntervalSince(lastManualRefresh) >= 5 else { return }
+        guard Date().timeIntervalSince(lastManualRefresh) >= PollPolicy.manualDebounce else { return }
         lastManualRefresh = Date()
-        Task { await refreshAll() }
+        Task { await refresh(reason: .manual) }
     }
 
-    /// Refresh when the popover opens, but don't hammer it.
+    /// Popover open and wake from sleep: worth a request only if what is on
+    /// screen has actually gone stale.
     func refreshIfStale() {
         guard !isDemo else { return }
-        if let last = lastUpdated, Date().timeIntervalSince(last) < 5 { return }
-        Task { await refreshAll() }
+        Task { await refresh(reason: .opportunistic) }
     }
 
-    private static func load(_ account: Account, vault: TokenVault) async -> AccountState {
+    private enum FetchOutcome {
+        case success(UsageSnapshot)
+        case failure(message: String, kind: Backoff.Failure, retryAfter: Date?)
+    }
+
+    private static func load(_ account: Account, vault: TokenVault) async -> FetchOutcome {
         do {
             let token = try await vault.accessToken(for: account)
             do {
-                return AccountState(snapshot: try await UsageClient.fetch(accessToken: token), error: nil)
+                return .success(try await UsageClient.fetch(accessToken: token))
             } catch UsageError.unauthorized {
                 let fresh = try await vault.accessToken(for: account, force: true)
-                return AccountState(snapshot: try await UsageClient.fetch(accessToken: fresh), error: nil)
+                return .success(try await UsageClient.fetch(accessToken: fresh))
             }
         } catch let error as UsageError {
-            return AccountState(error: error.errorDescription)
+            // Only a 429 is a real rate limit; everything else backs off on the
+            // gentler transient schedule, but everything backs off, so no
+            // failure mode can spin the loop.
+            if case .rateLimited(let retryAfter) = error {
+                return .failure(
+                    message: error.errorDescription ?? "rate limited",
+                    kind: .rateLimited, retryAfter: retryAfter
+                )
+            }
+            return .failure(
+                message: error.errorDescription ?? "failed", kind: .transient, retryAfter: nil
+            )
         } catch let error as OAuthError {
-            return AccountState(error: error.errorDescription)
+            return .failure(
+                message: error.errorDescription ?? "sign-in failed",
+                kind: .transient, retryAfter: nil
+            )
         } catch {
-            return AccountState(error: error.localizedDescription)
+            return .failure(
+                message: error.localizedDescription, kind: .transient, retryAfter: nil
+            )
         }
     }
 
@@ -129,7 +214,7 @@ final class AppState: ObservableObject {
                 accounts = updated
                 Store.save(updated)
                 isSigningIn = false
-                await refreshAll()
+                await refresh(reason: .manual)
             } catch {
                 signInError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 isSigningIn = false
@@ -140,9 +225,37 @@ final class AppState: ObservableObject {
     func remove(_ account: Account) {
         accounts.removeAll { $0.id == account.id }
         states[account.id] = nil
+        lastAttempt[account.id] = nil
+        retry[account.id] = nil
         guard !isDemo else { return }
         Store.save(accounts)
         Task { await vault.forget(account.id) }
+    }
+
+    // MARK: Order
+    //
+    // The menu bar draws `accounts` left to right, so reordering the array *is*
+    // the feature. Every path writes through immediately: the status item
+    // redraws off `objectWillChange`, so the cluster rearranges as the drag
+    // crosses each row rather than on drop.
+
+    func canMove(_ account: Account, by delta: Int) -> Bool {
+        AccountOrder.shifted(accounts, id: account.id, by: delta) != nil
+    }
+
+    func move(_ account: Account, by delta: Int) {
+        guard let reordered = AccountOrder.shifted(accounts, id: account.id, by: delta) else { return }
+        applyOrder(reordered)
+    }
+
+    func move(_ account: Account, onto target: Account) {
+        guard let reordered = AccountOrder.moved(accounts, id: account.id, onto: target.id) else { return }
+        applyOrder(reordered)
+    }
+
+    private func applyOrder(_ reordered: [Account]) {
+        accounts = reordered
+        if !isDemo { Store.save(accounts) }
     }
 
     func setLabel(_ raw: String, for account: Account) {
@@ -163,13 +276,19 @@ final class AppState: ObservableObject {
 
     // MARK: Demo
 
-    /// `--demo`: three in-memory accounts at headroom 85 / 22 / 8 so every visual
-    /// tier (monochrome, orange, red) can be inspected without signing in.
+    /// `--demo`: three in-memory accounts covering every state worth looking at
+    /// without signing in — blocked (dimmed letter, empty painted gauge), rate
+    /// limited but still showing its last known reading (hollow gauge), and
+    /// plain healthy monochrome. Plus a 100% row and a Fable bucket the API
+    /// never reported, which is the `0%` + `—` case.
     private static func demoData() -> (accounts: [Account], states: [UUID: AccountState]) {
-        let specs: [(label: String, nickname: String, email: String, five: Double, weekly: Double, fable: Double)] = [
-            ("P", "Personal", "izu@personal.com", 15, 5, 10),
-            ("W", "Work", "izu@work.example", 78, 20, 40),
-            ("T", "Team", "izu@team.example", 92, 30, 50)
+        let specs: [(
+            label: String, nickname: String, email: String,
+            five: Double, weekly: Double, fable: Double?, error: String?
+        )] = [
+            ("P", "Personal", "izu@personal.com", 100, 5, nil, nil),
+            ("W", "Work", "izu@work.example", 78, 20, 40, "rate limited"),
+            ("T", "Team", "izu@team.example", 15, 5, 10, nil)
         ]
         var accounts: [Account] = []
         var states: [UUID: AccountState] = [:]
@@ -187,12 +306,13 @@ final class AppState: ObservableObject {
                 id: "weekly", label: "Weekly", percent: spec.weekly,
                 resetsAt: Date().addingTimeInterval(273_600)
             )
+            // A nil Fable is the API's "no data" sentinel: 0% with no reset.
             snap.scoped = [UsageBucket(
-                id: "scoped:Fable", label: "Fable", percent: spec.fable,
-                resetsAt: Date().addingTimeInterval(273_600)
+                id: "scoped:Fable", label: "Fable", percent: spec.fable ?? 0,
+                resetsAt: spec.fable == nil ? nil : Date().addingTimeInterval(273_600)
             )]
             accounts.append(account)
-            states[account.id] = AccountState(snapshot: snap, error: nil)
+            states[account.id] = AccountState(snapshot: snap, error: spec.error)
         }
         return (accounts, states)
     }

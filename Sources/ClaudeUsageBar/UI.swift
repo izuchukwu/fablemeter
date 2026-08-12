@@ -100,21 +100,55 @@ struct PressableButtonStyle: ButtonStyle {
     }
 }
 
-/// Usage meter — filled means consumed, the inverse of the menu bar gauge.
+/// Usage meter — filled means consumed, the inverse of the menu bar gauge, and
+/// carrying the same two-state track: painted while the reading is live, hollow
+/// once it isn't. An empty painted track is a real zero; an empty hollow track
+/// is no data at all.
 struct UsageMeter: View {
     let percent: Double
     let tint: Color
+    /// The newest fetch failed. What is drawn is the last thing that arrived.
+    let isUnreachable: Bool
+
+    private var fraction: Double { max(0, min(1, percent / 100)) }
 
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.10))
-                Capsule()
-                    .fill(tint)
-                    .frame(width: max(0, min(1, percent / 100)) * geo.size.width)
+                if isUnreachable {
+                    Capsule().strokeBorder(Color.primary.opacity(0.35), lineWidth: 1)
+                } else {
+                    Capsule().fill(Color.primary.opacity(0.10))
+                }
+                if fraction > 0 {
+                    Capsule()
+                        // Held back while stale so the outline stays the thing
+                        // the eye lands on.
+                        .fill(tint.opacity(isUnreachable ? 0.45 : 1))
+                        .frame(width: fraction * geo.size.width)
+                }
             }
         }
         .frame(height: 5)
+    }
+}
+
+/// What a metric row prints. A bucket the API did not report reads as a real
+/// `0%` — it has genuinely used nothing — and only its reset time is a dash,
+/// because there is no window to reset. The headroom maths still skips it
+/// (see `UsageSnapshot.headroom`); this is display only.
+enum MetricDisplay {
+    static func percentText(_ bucket: UsageBucket?) -> String {
+        "\(Int((bucket?.percent ?? 0).rounded()))%"
+    }
+
+    static func resetText(
+        _ bucket: UsageBucket?,
+        from now: Date = Date(),
+        locale: Locale = .current,
+        timeZone: TimeZone = .current
+    ) -> String {
+        Format.resetStamp(bucket?.resetsAt, from: now, locale: locale, timeZone: timeZone)
     }
 }
 
@@ -122,12 +156,17 @@ struct MetricRow: View {
     let title: String
     let bucket: UsageBucket?
     let now: Date
+    /// Passed down from the account: the whole row is as live as its fetch was.
+    let isUnreachable: Bool
 
-    private var present: Bool { bucket?.hasData == true }
+    /// Columns are sized off the widest string each can hold at its own weight:
+    /// `100%` measures 32.2pt at 11pt medium, `Wed 12 PM` 61.2pt at 11pt
+    /// regular. Both are pinned so neither can ever wrap again.
+    private static let percentWidth: CGFloat = 36
+    private static let resetWidth: CGFloat = 66
+
     private var percent: Double { bucket?.percent ?? 0 }
-    private var tint: Color {
-        present ? Verdict.color(usedPercent: percent) : .secondary
-    }
+    private var tint: Color { Verdict.color(usedPercent: percent) }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -137,21 +176,26 @@ struct MetricRow: View {
                 .frame(width: 44, alignment: .leading)
 
             UsageMeter(
-                percent: present ? percent : 0,
-                tint: present ? (tint == .secondary ? Color.primary.opacity(0.55) : tint) : .clear
+                percent: percent,
+                tint: tint == .secondary ? Color.primary.opacity(0.55) : tint,
+                isUnreachable: isUnreachable
             )
 
-            Text(present ? "\(Int(percent.rounded()))%" : "—")
+            Text(MetricDisplay.percentText(bucket))
                 .font(.system(size: 11, weight: .medium))
                 .monospacedDigit()
-                .foregroundStyle(present ? tint : Color.secondary)
-                .frame(width: 32, alignment: .trailing)
+                .foregroundStyle(tint)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: Self.percentWidth, alignment: .trailing)
 
-            Text(present ? Format.resetStamp(bucket?.resetsAt, from: now) : "—")
+            Text(MetricDisplay.resetText(bucket, from: now))
                 .font(.system(size: 11))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-                .frame(width: 58, alignment: .trailing)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: Self.resetWidth, alignment: .trailing)
         }
     }
 }
@@ -200,9 +244,15 @@ struct AccountRow: View {
     /// Bumped when something outside the row is clicked — the cue to commit any
     /// in-place edit and give up focus.
     let dismissToken: Int
+    /// The ends of the list disable rather than hide their move item, so the
+    /// menu keeps the same shape wherever the account sits.
+    let canMoveUp: Bool
+    let canMoveDown: Bool
     let setLabel: (String) -> Void
     let setNickname: (String) -> Void
-    let remove: () -> Void
+    let moveUp: () -> Void
+    let moveDown: () -> Void
+    let signOut: () -> Void
 
     @State private var editingLabel = false
     @State private var editingName = false
@@ -211,7 +261,11 @@ struct AccountRow: View {
     @FocusState private var focus: Field?
 
     private var headroom: Double? { state?.snapshot?.headroom }
+    private var isUnreachable: Bool { state?.error != nil }
 
+    /// The failure replaces the verdict word rather than the numbers: the row
+    /// still shows the last reading that arrived, and this says why it may be
+    /// old. That is the whole message — no sentence underneath it.
     private var verdict: (text: String, color: Color) {
         if let error = state?.error { return (error, .orange) }
         guard state?.snapshot != nil else { return ("—", .secondary) }
@@ -257,9 +311,18 @@ struct AccountRow: View {
                     .truncationMode(.middle)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    MetricRow(title: "5-hour", bucket: state?.snapshot?.fiveHour, now: now)
-                    MetricRow(title: "Weekly", bucket: state?.snapshot?.weekly, now: now)
-                    MetricRow(title: "Fable", bucket: state?.snapshot?.fable, now: now)
+                    MetricRow(
+                        title: "5-hour", bucket: state?.snapshot?.fiveHour,
+                        now: now, isUnreachable: isUnreachable
+                    )
+                    MetricRow(
+                        title: "Weekly", bucket: state?.snapshot?.weekly,
+                        now: now, isUnreachable: isUnreachable
+                    )
+                    MetricRow(
+                        title: "Fable", bucket: state?.snapshot?.fable,
+                        now: now, isUnreachable: isUnreachable
+                    )
                 }
                 .padding(.top, 5)
             }
@@ -275,7 +338,10 @@ struct AccountRow: View {
             Button("Set Label…", action: beginLabelEdit)
             Button("Rename…", action: beginNameEdit)
             Divider()
-            Button("Remove Account", action: remove)
+            Button("Move Up", action: moveUp).disabled(!canMoveUp)
+            Button("Move Down", action: moveDown).disabled(!canMoveDown)
+            Divider()
+            Button("Sign Out", action: signOut)
         }
         .onChange(of: focus) { old, _ in
             if old == .label { commitLabel() }
@@ -321,6 +387,79 @@ struct AccountRow: View {
     }
 }
 
+// MARK: - Reordering
+
+/// The lifted row stays put and recedes; the thing under the cursor is the
+/// drag preview. Scale settles from 1, never from 0.
+struct LiftEffect: ViewModifier {
+    let isLifted: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(isLifted ? 0.98 : 1)
+            .opacity(isLifted ? 0.35 : 1)
+            .animation(.easeOut(duration: 0.12), value: isLifted)
+    }
+}
+
+extension View {
+    /// A lone account has nowhere to go, and an always-on `.onDrag` would still
+    /// lift it out of the list.
+    @ViewBuilder
+    func onDrag(if enabled: Bool, _ provider: @escaping () -> NSItemProvider) -> some View {
+        if enabled { onDrag(provider) } else { self }
+    }
+}
+
+/// Catches the drop that lands in the popover but not on a row — the footer,
+/// the padding, a divider — so the lifted row settles back instead of staying
+/// dimmed.
+struct LiftReleaseDelegate: DropDelegate {
+    @Binding var draggingID: UUID?
+
+    func validateDrop(info: DropInfo) -> Bool { draggingID != nil }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+
+    func performDrop(info: DropInfo) -> Bool {
+        withAnimation(.easeOut(duration: 0.12)) { draggingID = nil }
+        return true
+    }
+}
+
+/// Reorders as the drag crosses a row rather than on drop, so the rows part
+/// under the cursor and the menu bar cluster rearranges live. The account list
+/// is the model, so there is nothing to commit afterwards — the drop only ends
+/// the lift.
+struct AccountDropDelegate: DropDelegate {
+    let target: Account
+    let state: AppState
+    @Binding var draggingID: UUID?
+
+    func validateDrop(info: DropInfo) -> Bool { draggingID != nil }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+
+    func dropEntered(info: DropInfo) {
+        MainActor.assumeIsolated {
+            guard let draggingID, draggingID != target.id,
+                  let source = state.accounts.first(where: { $0.id == draggingID })
+            else { return }
+            withAnimation(.easeInOut(duration: 0.18)) {
+                state.move(source, onto: target)
+            }
+        }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        MainActor.assumeIsolated {
+            let landed = draggingID != nil
+            withAnimation(.easeOut(duration: 0.12)) { draggingID = nil }
+            return landed
+        }
+    }
+}
+
 // MARK: - Popover
 
 struct PopoverView: View {
@@ -329,6 +468,10 @@ struct PopoverView: View {
     /// drop focus.
     @State private var dismissToken = 0
     @State private var clickMonitor: Any?
+    /// The account currently lifted out of the list, if any.
+    @State private var draggingID: UUID?
+
+    private var canReorder: Bool { state.accounts.count > 1 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -341,9 +484,24 @@ struct PopoverView: View {
                             state: state.state(for: account),
                             now: context.date,
                             dismissToken: dismissToken,
+                            canMoveUp: state.canMove(account, by: -1),
+                            canMoveDown: state.canMove(account, by: 1),
                             setLabel: { state.setLabel($0, for: account) },
                             setNickname: { state.setNickname($0, for: account) },
-                            remove: { state.remove(account) }
+                            moveUp: { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: -1) } },
+                            moveDown: { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: 1) } },
+                            signOut: { state.remove(account) }
+                        )
+                        .modifier(LiftEffect(isLifted: draggingID == account.id))
+                        .onDrag(if: canReorder) {
+                            draggingID = account.id
+                            return NSItemProvider(object: account.id.uuidString as NSString)
+                        }
+                        .onDrop(
+                            of: [.text],
+                            delegate: AccountDropDelegate(
+                                target: account, state: state, draggingID: $draggingID
+                            )
                         )
                     }
                 }
@@ -362,11 +520,18 @@ struct PopoverView: View {
             footer
         }
         .frame(width: 300)
+        // A drag released outside the popover reports nothing back, so the lift
+        // is cleared on the way in and out rather than trusted to the drop.
+        .onDrop(of: [.text], delegate: LiftReleaseDelegate(draggingID: $draggingID))
         .onAppear {
+            draggingID = nil
             state.refreshIfStale()
             installClickMonitor()
         }
-        .onDisappear(perform: removeClickMonitor)
+        .onDisappear {
+            draggingID = nil
+            removeClickMonitor()
+        }
     }
 
     /// A transparent hit target behind the rows never sees these clicks — the

@@ -66,14 +66,48 @@ struct Account: Codable, Identifiable, Equatable {
     }
 }
 
+/// Menu bar order is the account array's own order — there is no separate index
+/// to keep in sync — so every reorder is a pure transform of that array.
+/// Returning `nil` for a move that cannot happen is what disables the matching
+/// menu item.
+enum AccountOrder {
+    /// Shift `id` by `delta` places; negative moves it towards the front, which
+    /// is towards the left of the menu bar cluster.
+    static func shifted(_ accounts: [Account], id: UUID, by delta: Int) -> [Account]? {
+        guard delta != 0, let from = accounts.firstIndex(where: { $0.id == id }) else { return nil }
+        let to = from + delta
+        guard to >= 0, to < accounts.count else { return nil }
+        var out = accounts
+        out.insert(out.remove(at: from), at: to)
+        return out
+    }
+
+    /// Drop `id` into `targetID`'s slot; everything between it and its old slot
+    /// shuffles along by one.
+    static func moved(_ accounts: [Account], id: UUID, onto targetID: UUID) -> [Account]? {
+        guard id != targetID,
+              let from = accounts.firstIndex(where: { $0.id == id }),
+              let to = accounts.firstIndex(where: { $0.id == targetID })
+        else { return nil }
+        var out = accounts
+        out.insert(out.remove(at: from), at: to)
+        return out
+    }
+}
+
 /// Plaintext-on-disk account store. Deliberately not the Keychain: this app is
 /// ad-hoc signed, so every rebuild changes the signature and macOS would prompt
 /// for keychain access on each launch.
 enum Store {
     static let maxAccounts = 3
 
+    /// Only `--selftest` sets this, so a real save/load round-trip can run
+    /// against a temporary file instead of the user's own.
+    static var directoryOverride: URL?
+
     static var directory: URL {
-        FileManager.default
+        if let directoryOverride { return directoryOverride }
+        return FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ClaudeUsageBar", isDirectory: true)
     }

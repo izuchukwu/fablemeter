@@ -6,6 +6,11 @@ if arguments.contains("--selftest") {
     exit(SelfTest.run())
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--render") {
+    let directory = CommandLine.arguments.dropFirst(index + 1).first ?? "."
+    exit(MainActor.assumeIsolated { RenderStates.run(into: directory) })
+}
+
 if arguments.contains("--probe") {
     let semaphore = DispatchSemaphore(value: 0)
     var status: Int32 = 1

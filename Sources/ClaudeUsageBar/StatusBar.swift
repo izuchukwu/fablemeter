@@ -3,11 +3,18 @@ import Combine
 import SwiftUI
 
 /// One account's presence in the menu bar: a capsule gauge over a single character.
+///
+/// The two fields are independent, and that is what lets the gauge say two
+/// things at once. `isUnreachable` is about the *connection* — it hollows the
+/// track. `headroom` is about the *reading* — it fills the track. So a rate
+/// limited account still shows the last number it managed to fetch, inside a
+/// hollow track that says the number is no longer live.
 struct BarCell: Equatable {
     let character: Character
-    /// Remaining headroom, 0...100. `nil` when nothing has resolved yet.
+    /// Remaining headroom, 0...100. `nil` when nothing has ever resolved.
     let headroom: Double?
-    let isError: Bool
+    /// The newest attempt failed — rate limited, offline, errored.
+    let isUnreachable: Bool
 }
 
 /// Draws the status item image by hand. `MenuBarExtra`'s SwiftUI label cannot
@@ -25,6 +32,15 @@ enum BarRenderer {
     static let fontSize: CGFloat = 8
     static let imageHeight: CGFloat = 22
     static let minimumFill: CGFloat = 1.5
+    /// The painted track, when the reading is live.
+    static let trackAlpha: CGFloat = 0.20
+    /// The hollow track, when it is not. Stronger than the painted track so the
+    /// outline reads as a deliberate treatment rather than a faded one.
+    static let outlineAlpha: CGFloat = 0.45
+    static let outlineWidth: CGFloat = 1
+    /// An account with nothing left is unusable, so its letter recedes. This is
+    /// the "you cannot use this one" signal — the letters never take colour.
+    static let blockedGlyphAlpha: CGFloat = 0.38
 
     /// `nil` means healthy — draw monochrome and let the system tint it.
     static func warningColor(for headroom: Double?) -> NSColor? {
@@ -34,7 +50,40 @@ enum BarRenderer {
         return nil
     }
 
-    static func image(for cells: [BarCell]) -> NSImage {
+    /// The ink everything that isn't a warning level is drawn in — the track,
+    /// and every character. `.black` is the template-image stand-in for
+    /// "whatever the system tints this to"; once any cell forces real colour,
+    /// the menu bar's own `labelColor` takes over, which is white on a dark
+    /// menu bar and black on a light one.
+    static func neutralColor(anyWarning: Bool) -> NSColor {
+        anyWarning ? .labelColor : .black
+    }
+
+    /// Characters never carry the warning colour: the letters stay uniform and
+    /// only the gauge level goes orange/red.
+    static func glyphColor(anyWarning: Bool) -> NSColor {
+        neutralColor(anyWarning: anyWarning)
+    }
+
+    /// …but a letter does dim when its account is out, which is the one thing
+    /// colour used to say and now doesn't. An unreachable account is not dimmed:
+    /// its numbers are stale, not spent, and the hollow track already says so.
+    static func glyphAlpha(headroom: Double?) -> CGFloat {
+        guard let headroom, headroom <= 0 else { return 1 }
+        return blockedGlyphAlpha
+    }
+
+    /// Height of the drawn level. Blocked is genuinely empty — no nub, nothing
+    /// drawn — while a small-but-real headroom keeps a visible floor.
+    static func fillHeight(headroom: Double) -> CGFloat {
+        guard headroom > 0 else { return 0 }
+        return min(barHeight, max(minimumFill, barHeight * CGFloat(headroom) / 100))
+    }
+
+    /// - Parameter appearance: resolved for `labelColor` at draw time. `NSImage`
+    ///   drawing handlers run lazily, so the appearance is re-entered inside the
+    ///   handler rather than only around the call.
+    static func image(for cells: [BarCell], appearance: NSAppearance? = nil) -> NSImage {
         guard !cells.isEmpty else { return emptyImage() }
 
         let anyWarning = cells.contains { warningColor(for: $0.headroom) != nil }
@@ -48,65 +97,81 @@ enum BarRenderer {
         let image = NSImage(
             size: NSSize(width: width, height: imageHeight), flipped: false
         ) { _ in
-            let baseY = ((imageHeight - contentHeight) / 2).rounded()
-            let barY = baseY + textHeight + gap
-            let radius = barWidth / 2
+            let draw = {
+                let baseY = ((imageHeight - contentHeight) / 2).rounded()
+                let barY = baseY + textHeight + gap
+                let radius = barWidth / 2
+                let neutral = neutralColor(anyWarning: anyWarning)
+                let glyphInk = glyphColor(anyWarning: anyWarning)
 
-            for (index, cell) in cells.enumerated() {
-                // A template image carries no colour, so `.black` is only a
-                // stand-in for "whatever the system tints this to".
-                let warning = warningColor(for: cell.headroom)
-                let neutral: NSColor = anyWarning ? .labelColor : .black
-                // Like the battery icon: the track stays monochrome, only the
-                // level and its label go orange/red.
-                let ink: NSColor = warning ?? neutral
+                for (index, cell) in cells.enumerated() {
+                    // Like the battery icon: the track and the character stay
+                    // monochrome, only the level goes orange/red.
+                    let level: NSColor = warningColor(for: cell.headroom) ?? neutral
 
-                let cellX = outerPadding + CGFloat(index) * (cellWidth + cellSpacing)
-                let barRect = NSRect(
-                    x: cellX + (cellWidth - barWidth) / 2, y: barY,
-                    width: barWidth, height: barHeight
-                )
-                let capsule = NSBezierPath(roundedRect: barRect, xRadius: radius, yRadius: radius)
-
-                if cell.isError {
-                    // Quiet, not alarming: an empty outline where the gauge goes.
-                    let outline = NSBezierPath(
-                        roundedRect: barRect.insetBy(dx: 0.5, dy: 0.5),
-                        xRadius: radius, yRadius: radius
+                    let cellX = outerPadding + CGFloat(index) * (cellWidth + cellSpacing)
+                    let barRect = NSRect(
+                        x: cellX + (cellWidth - barWidth) / 2, y: barY,
+                        width: barWidth, height: barHeight
                     )
-                    outline.lineWidth = 1
-                    neutral.withAlphaComponent(0.85).setStroke()
-                    outline.stroke()
-                } else if let headroom = cell.headroom {
-                    neutral.withAlphaComponent(0.20).setFill()
-                    capsule.fill()
+                    let capsule = NSBezierPath(
+                        roundedRect: barRect, xRadius: radius, yRadius: radius
+                    )
 
-                    // Square-cut level, clipped by the capsule so only the
-                    // bottom cap rounds — a fuel gauge, not a floating dot.
-                    let fillHeight = max(minimumFill, barHeight * CGFloat(headroom) / 100)
-                    NSGraphicsContext.saveGraphicsState()
-                    capsule.addClip()
-                    ink.setFill()
-                    NSBezierPath(rect: NSRect(
-                        x: barRect.minX, y: barRect.minY,
-                        width: barWidth, height: fillHeight
-                    )).fill()
-                    NSGraphicsContext.restoreGraphicsState()
-                } else {
-                    // Unknown: the empty track alone.
-                    neutral.withAlphaComponent(0.20).setFill()
-                    capsule.fill()
+                    // The track says whether the reading is live: painted when
+                    // it is, hollow when the last fetch failed. So a hollow
+                    // gauge means "no data", and a painted one with nothing
+                    // inside means "the data says zero" — two different
+                    // problems, two different pictures.
+                    if cell.isUnreachable {
+                        let outline = NSBezierPath(
+                            roundedRect: barRect.insetBy(
+                                dx: outlineWidth / 2, dy: outlineWidth / 2
+                            ),
+                            xRadius: radius, yRadius: radius
+                        )
+                        outline.lineWidth = outlineWidth
+                        neutral.withAlphaComponent(outlineAlpha).setStroke()
+                        outline.stroke()
+                    } else {
+                        neutral.withAlphaComponent(trackAlpha).setFill()
+                        capsule.fill()
+                    }
+
+                    // A failed fetch keeps drawing the last level it knew —
+                    // losing the reading was the actual complaint.
+                    let height = fillHeight(headroom: cell.headroom ?? 0)
+                    if height > 0 {
+                        // Square-cut level, clipped by the capsule so only the
+                        // bottom cap rounds — a fuel gauge, not a floating dot.
+                        NSGraphicsContext.saveGraphicsState()
+                        capsule.addClip()
+                        level.setFill()
+                        NSBezierPath(rect: NSRect(
+                            x: barRect.minX, y: barRect.minY,
+                            width: barWidth, height: height
+                        )).fill()
+                        NSGraphicsContext.restoreGraphicsState()
+                    }
+
+                    let glyph = String(cell.character) as NSString
+                    let attributes: [NSAttributedString.Key: Any] = [
+                        .font: font,
+                        .foregroundColor: glyphInk.withAlphaComponent(
+                            glyphAlpha(headroom: cell.headroom)
+                        )
+                    ]
+                    let size = glyph.size(withAttributes: attributes)
+                    glyph.draw(
+                        at: NSPoint(x: cellX + (cellWidth - size.width) / 2, y: baseY),
+                        withAttributes: attributes
+                    )
                 }
-
-                let glyph = String(cell.character) as NSString
-                let attributes: [NSAttributedString.Key: Any] = [
-                    .font: font, .foregroundColor: ink
-                ]
-                let size = glyph.size(withAttributes: attributes)
-                glyph.draw(
-                    at: NSPoint(x: cellX + (cellWidth - size.width) / 2, y: baseY),
-                    withAttributes: attributes
-                )
+            }
+            if let appearance {
+                appearance.performAsCurrentDrawingAppearance(draw)
+            } else {
+                draw()
             }
             return true
         }
@@ -183,10 +248,13 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         guard force || cells != renderedCells else { return }
         renderedCells = cells
         guard let button = statusItem.button else { return }
-        // Resolve `labelColor` against the menu bar's own appearance.
+        // Resolve `labelColor` against the menu bar's own appearance — white on
+        // a dark menu bar, black on a light one — both around the call and
+        // inside the (lazily invoked) drawing handler.
+        let appearance = button.effectiveAppearance
         var image: NSImage?
-        button.effectiveAppearance.performAsCurrentDrawingAppearance {
-            image = BarRenderer.image(for: cells)
+        appearance.performAsCurrentDrawingAppearance {
+            image = BarRenderer.image(for: cells, appearance: appearance)
         }
         button.image = image
     }

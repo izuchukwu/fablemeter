@@ -12,7 +12,29 @@ headroom = min(100 − 5-hour%, 100 − weekly%, 100 − Fable weekly%)
 ```
 
 Monochrome above 25% headroom, orange at or below 25%, red at or below 10%.
+An account with no headroom left dims its letter and empties its gauge.
 Click the gauges for per-window percentages and reset countdowns.
+
+## Polling
+
+Each account is fetched once every **5 minutes**, and the accounts in a cycle
+are spaced a couple of seconds apart rather than fired together. A 5-hour window
+moves about 1% every three minutes, so polling faster buys no new information
+and only spends request budget against an endpoint that rate limits.
+
+Opening the popover or waking from sleep only refetches if the reading on screen
+is more than 60 seconds old. Manual refresh ignores that, but nothing ignores
+backoff.
+
+On failure each account backs off on its own: an HTTP 429 waits 5, 10, 20, 40
+minutes and then holds at 45, with ±15% jitter so several accounts that failed
+together don't return in lockstep. A `Retry-After` header wins over that
+schedule, though it can never pull the next attempt in front of the ordinary
+5-minute interval. Other failures — 5xx, timeouts, offline — back off on the
+same curve from 1 minute, capped at 15. The first success clears it all.
+
+A failed fetch never blanks the display: the last reading stays on screen inside
+a hollow gauge, which is what tells you it is no longer live.
 
 ## Build
 
@@ -30,7 +52,12 @@ browser; it never touches Claude Code's own credentials, so signing in here does
 not sign you out of the CLI. Up to three accounts.
 
 Click an account's character token to change it. Double-click the name to rename
-it. Right-click a row for Set Label / Rename / Remove.
+it. Right-click a row for Set Label / Rename / Move Up / Move Down / Sign Out.
+
+Drag an account block to reorder it. The menu bar draws the accounts in the
+popover's order, left to right, and rearranges as the drag crosses each row.
+The order is the order of the array in `accounts.json`, so it survives a
+relaunch without a separate index to keep in sync.
 
 ## Storage
 
@@ -46,6 +73,7 @@ signature and macOS would prompt for Keychain access on each launch.
 | `--selftest` | Decodes an embedded usage fixture and asserts the parsed values. |
 | `--probe` | Reads Claude Code's existing access token read-only and prints live parsed buckets. Never writes or refreshes it. |
 | `--demo` | Three fake in-memory accounts, for looking at the drawing. |
+| `--render <dir>` | Writes the menu bar image for every state in both appearances. The real menu bar takes its appearance from the desktop picture behind it, so a dark wallpaper otherwise makes the light case impossible to see on screen. |
 
 ## Caveat
 
