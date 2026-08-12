@@ -25,8 +25,19 @@ enum BarRenderer {
     static let barHeight: CGFloat = 11
     /// Just wide enough for the glyph; the cells read as one cluster, not as
     /// three separate menu bar items.
-    static let cellWidth: CGFloat = 9
-    static let cellSpacing: CGFloat = 3
+    ///
+    /// What actually sets the density is the *pitch* — `cellWidth + cellSpacing`
+    /// — because the glyph is centred in its cell, so the gap between two
+    /// neighbouring letters is `pitch - glyphWidth` however the pitch is split.
+    /// At 8pt medium the widest single character a label can hold is `W`, which
+    /// inks about 7pt, and that is the floor everything here is set against: the
+    /// 9pt pitch below leaves ~2pt of daylight between two adjacent `W`s —
+    /// measured on screen, four pixels at 2x — and more between ordinary
+    /// letters, while the gauges themselves sit 5.5pt apart. The cluster still
+    /// keeps the ~20pt clearance from its neighbour that any two native menu bar
+    /// items have, so it reads as one item rather than three.
+    static let cellWidth: CGFloat = 7.5
+    static let cellSpacing: CGFloat = 1.5
     static let outerPadding: CGFloat = 2.5
     static let gap: CGFloat = 1.5
     static let fontSize: CGFloat = 8
@@ -80,9 +91,13 @@ enum BarRenderer {
         return min(barHeight, max(minimumFill, barHeight * CGFloat(headroom) / 100))
     }
 
-    /// - Parameter appearance: resolved for `labelColor` at draw time. `NSImage`
-    ///   drawing handlers run lazily, so the appearance is re-entered inside the
-    ///   handler rather than only around the call.
+    /// - Parameter appearance: pins `labelColor` to a specific appearance. Only
+    ///   `--render`, which draws both menu bars into files, has any business
+    ///   passing this. The status item leaves it `nil` on purpose: the drawing
+    ///   handler runs lazily, inside whichever appearance AppKit has already made
+    ///   current for the menu bar it is drawing into, which is more correct than
+    ///   anything this could pin — and pinning it is what required watching
+    ///   `effectiveAppearance`, which is what span the redraw loop.
     static func image(for cells: [BarCell], appearance: NSAppearance? = nil) -> NSImage {
         guard !cells.isEmpty else { return emptyImage() }
 
@@ -176,6 +191,11 @@ enum BarRenderer {
             return true
         }
         image.isTemplate = !anyWarning
+        // Never cached, so the handler above re-runs for every draw and resolves
+        // `labelColor` against the appearance current at that moment. That is
+        // what makes watching the button's appearance unnecessary — and the
+        // watcher was a feedback loop, so removing the need for it is the fix.
+        image.cacheMode = .never
         return image
     }
 
@@ -211,7 +231,6 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
     private var cancellable: AnyCancellable?
-    private var appearanceObservation: NSKeyValueObservation?
     private var renderedCells: [BarCell]?
 
     init(state: AppState) {
@@ -231,9 +250,6 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             button.action = #selector(togglePopover)
             button.imagePosition = .imageOnly
             button.toolTip = "Claude usage"
-            appearanceObservation = button.observe(\.effectiveAppearance) { [weak self] _, _ in
-                Task { @MainActor in self?.redraw(force: true) }
-            }
         }
 
         cancellable = state.objectWillChange.sink { [weak self] _ in
@@ -243,20 +259,28 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         redraw(force: true)
     }
 
+    /// Assigns a new image **only when the cells actually changed**, and that
+    /// restraint is load-bearing rather than an optimisation.
+    ///
+    /// `setImage:` makes the status item re-snapshot itself for its replicants,
+    /// and rendering a replicant sets the button's appearance — which used to
+    /// come back here through a `\.effectiveAppearance` observation that forced
+    /// another `setImage:`. Watch that cycle for a second and it never stops:
+    ///
+    ///     setImage: → _adjustLength → _updateReplicantsUnlessMenuIsTracking:
+    ///              → _redrawReplicantSnapshot: → -[NSView setAppearance:]
+    ///              → effectiveAppearance KVO → setImage: → …
+    ///
+    /// That was a whole CPU core, permanently, with the popover shut. There is
+    /// nothing left watching the appearance now: the image resolves its colours
+    /// lazily at draw time instead (see `BarRenderer.image`), so an unchanged
+    /// cluster costs exactly one comparison per state change and nothing else.
     private func redraw(force: Bool = false) {
         let cells = state.barCells
         guard force || cells != renderedCells else { return }
         renderedCells = cells
         guard let button = statusItem.button else { return }
-        // Resolve `labelColor` against the menu bar's own appearance — white on
-        // a dark menu bar, black on a light one — both around the call and
-        // inside the (lazily invoked) drawing handler.
-        let appearance = button.effectiveAppearance
-        var image: NSImage?
-        appearance.performAsCurrentDrawingAppearance {
-            image = BarRenderer.image(for: cells, appearance: appearance)
-        }
-        button.image = image
+        button.image = BarRenderer.image(for: cells)
     }
 
     @objc private func togglePopover() {

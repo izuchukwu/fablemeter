@@ -143,6 +143,9 @@ enum SelfTest {
                 BarCell(character: "E", headroom: headroom, isUnreachable: unreachable)
             ])
         }
+        func cellsFor(_ specs: [(Double?, Bool)]) -> [BarCell] {
+            specs.map { BarCell(character: "E", headroom: $0.0, isUnreachable: $0.1) }
+        }
         check("unreachable outlines, healthy zero does not",
               cell(nil, unreachable: true).tiffRepresentation
               != cell(0, unreachable: false).tiffRepresentation)
@@ -156,6 +159,23 @@ enum SelfTest {
         check("a stale reading is still drawn inside the hollow track",
               cell(60, unreachable: true).tiffRepresentation
               != cell(nil, unreachable: true).tiffRepresentation)
+        // The status item redraws only when the cluster actually changed, so the
+        // cells have to compare equal for equal inputs — otherwise every state
+        // change reassigns the image, and reassigning the image is what makes
+        // the status item re-snapshot itself.
+        check("identical readings produce identical cells",
+              cellsFor([(nil, false), (60, true), (0, false)])
+              == cellsFor([(nil, false), (60, true), (0, false)]))
+        check("a changed reading produces different cells",
+              cellsFor([(60, false)]) != cellsFor([(61, false)]))
+        // And the image resolves its colours at draw time rather than baking
+        // them in. That is what removed the need to watch the button's
+        // appearance — and watching it was a self-feeding redraw loop that cost
+        // a permanent CPU core.
+        check("the menu bar image is never cached",
+              cell(60, unreachable: false).cacheMode == .never,
+              "got \(cell(60, unreachable: false).cacheMode.rawValue)")
+
         check("verdicts", Verdict.word(headroom: 85) == "Available"
             && Verdict.word(headroom: 30) == "Limited"
             && Verdict.word(headroom: 8) == "Almost out"
@@ -271,6 +291,15 @@ enum SelfTest {
               "got \(PollPolicy.interval)s")
         check("accounts are staggered, not burst", PollPolicy.stagger > 0)
         check("the tick never outpaces the interval", PollPolicy.tick < PollPolicy.interval)
+        // The loop's only pause. At zero it stops being a poll loop and becomes
+        // a spin, so the wait is asserted rather than assumed — a whole CPU core
+        // is what the alternative costs.
+        check("the loop always waits between ticks", PollPolicy.tick > 0)
+        check("…and its sleep can never round down to nothing",
+              PollPolicy.tickNanoseconds >= 1_000_000_000,
+              "\(PollPolicy.tickNanoseconds)ns")
+        check("the sleep matches the tick it is derived from",
+              PollPolicy.tickNanoseconds == UInt64(PollPolicy.tick * 1_000_000_000))
         check("opportunistic refreshes coalesce inside a minute",
               PollPolicy.freshness >= 60)
         // Three accounts at the base interval, worst case.
@@ -375,6 +404,49 @@ enum SelfTest {
         schedule.recordFailure(.rateLimited, now: epoch) { _ in 0 }
         check("the ladder restarts from the base after a reset",
               schedule.blockedUntil == epoch.addingTimeInterval(300))
+
+        // Every failure has to push the next attempt *strictly* into the future.
+        // A schedule that ever hands back "now" leaves the account due on the
+        // very next tick, for ever, which is a poll loop with the brakes off.
+        var futureFailures: [String] = []
+        for kind in [Backoff.Failure.rateLimited, .transient] {
+            for failures in 1...24 {
+                for roll in [{ (r: ClosedRange<Double>) in r.lowerBound },
+                             { (r: ClosedRange<Double>) in r.upperBound },
+                             { (r: ClosedRange<Double>) in Double.random(in: r) }] {
+                    let next = Backoff.nextAttempt(
+                        failures: failures, kind: kind, now: epoch, roll: roll
+                    )
+                    if next <= epoch { futureFailures.append("\(kind) x\(failures)") }
+                }
+            }
+        }
+        check("every rung of the ladder lands strictly in the future",
+              futureFailures.isEmpty, futureFailures.first ?? "")
+        // Including when the server's own Retry-After is zero, negative or long
+        // expired — a `Retry-After: 0` must not become "due immediately".
+        let zeroAfter = Backoff.nextAttempt(
+            failures: 1, kind: .rateLimited, retryAfter: epoch, now: epoch
+        )
+        check("a Retry-After of now is still pushed out a full interval",
+              zeroAfter == epoch.addingTimeInterval(PollPolicy.interval))
+        check("an expired Retry-After is too",
+              Backoff.nextAttempt(
+                  failures: 1, kind: .rateLimited,
+                  retryAfter: epoch.addingTimeInterval(-86_400), now: epoch
+              ) == epoch.addingTimeInterval(PollPolicy.interval))
+        // And the schedule a failure writes must actually block at that instant.
+        var blockChecks: [String] = []
+        for failures in 1...24 {
+            var s = RetrySchedule()
+            for _ in 0..<failures { s.recordFailure(.transient, now: epoch) }
+            guard let until = s.blockedUntil, until > epoch, s.isBlocked(at: epoch) else {
+                blockChecks.append("x\(failures)")
+                continue
+            }
+        }
+        check("a failed account is blocked the moment it fails, at every depth",
+              blockChecks.isEmpty, blockChecks.first ?? "")
 
         // How stale each reason tolerates. Manual overrides staleness but is
         // not allowed to escape backoff — that gate lives in `isDue`.
@@ -718,6 +790,29 @@ enum SelfTest {
                   needsSignIn: false, retry: blocked, lastAttempt: nil,
                   reason: .manual, now: epoch
               ))
+        // A dead credential is terminal, so it must be un-due under *every*
+        // combination the loop can present — otherwise three signed-out accounts
+        // are three accounts the loop retries on every single tick, for ever.
+        var dueWhenDead: [String] = []
+        for reason in [RefreshReason.scheduled, .opportunistic, .manual] {
+            for retry in [nil, blocked, RetrySchedule()] as [RetrySchedule?] {
+                for last in [nil, never, epoch, epoch.addingTimeInterval(-86_400)] as [Date?] {
+                    if AppState.isDue(
+                        needsSignIn: true, retry: retry, lastAttempt: last,
+                        reason: reason, now: epoch
+                    ) { dueWhenDead.append("\(reason)/\(String(describing: last))") }
+                }
+            }
+        }
+        check("a signed-out account is never due, under any reason or history",
+              dueWhenDead.isEmpty, dueWhenDead.first ?? "")
+        // …and a backed-off account stays un-due right up to its deadline, so a
+        // failure can never leave the loop re-firing every tick.
+        check("a backed-off account is un-due until its block expires",
+              !AppState.isDue(needsSignIn: false, retry: blocked, lastAttempt: nil,
+                              reason: .scheduled, now: epoch.addingTimeInterval(299))
+              && AppState.isDue(needsSignIn: false, retry: blocked, lastAttempt: nil,
+                                reason: .scheduled, now: epoch.addingTimeInterval(301)))
 
         // On screen it is a state, not an error string.
         let rejectedState = AccountState(snapshot: nil, error: nil, needsSignIn: true)

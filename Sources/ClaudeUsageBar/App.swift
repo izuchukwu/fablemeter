@@ -65,7 +65,10 @@ final class AppState: ObservableObject {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh(reason: .scheduled)
-                try? await Task.sleep(nanoseconds: UInt64(PollPolicy.tick * 1_000_000_000))
+                // Unconditional, and outside every branch above it: there is no
+                // path through this loop that gets back to the top without
+                // waiting.
+                try? await Task.sleep(nanoseconds: PollPolicy.tickNanoseconds)
             }
         }
         NSWorkspace.shared.notificationCenter.addObserver(

@@ -21,6 +21,12 @@ enum PollPolicy {
     /// its own — no request is made unless an account's own schedule says so.
     static let tick: TimeInterval = 15
 
+    /// What the loop actually sleeps for, floored at a whole second. The loop
+    /// has no other pause in it, so a `tick` that ever reached zero — edited,
+    /// computed, whatever — would stop being a poll loop and start being a spin.
+    /// The floor makes that unreachable rather than merely unlikely.
+    static var tickNanoseconds: UInt64 { UInt64(max(1, tick) * 1_000_000_000) }
+
     /// Popover-open and wake-from-sleep are opportunistic: they only refetch
     /// when what is already on screen is older than this.
     static let freshness: TimeInterval = 60
