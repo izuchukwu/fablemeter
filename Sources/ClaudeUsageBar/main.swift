@@ -11,6 +11,13 @@ if let index = CommandLine.arguments.firstIndex(of: "--render") {
     exit(MainActor.assumeIsolated { RenderStates.run(into: directory) })
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--render-popover") {
+    let directory = CommandLine.arguments.dropFirst(index + 1).first ?? "."
+    let application = NSApplication.shared
+    application.setActivationPolicy(.prohibited)
+    exit(MainActor.assumeIsolated { RenderPopover.run(into: directory) })
+}
+
 if arguments.contains("--probe") {
     let semaphore = DispatchSemaphore(value: 0)
     var status: Int32 = 1

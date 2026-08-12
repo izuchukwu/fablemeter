@@ -9,9 +9,25 @@ struct AccountState {
     /// Set while the newest attempt is failing. Alongside a non-nil `snapshot`
     /// it means what is on screen is real but no longer live.
     var error: String?
+    /// Terminal: the refresh token is dead server-side and only an interactive
+    /// sign-in brings the account back. Mutually exclusive with `error` — this
+    /// is not something to retry, so it is not phrased as a failure message, and
+    /// no response body is kept anywhere near it.
+    var needsSignIn = false
 
     /// Showing real numbers that are no longer being refreshed.
     var isStale: Bool { error != nil && snapshot != nil }
+
+    /// Nothing live is arriving, whatever the reason — the gauge goes hollow.
+    var isUnreachable: Bool { error != nil || needsSignIn }
+}
+
+/// What one attempt at an account came back with.
+enum FetchOutcome {
+    case success(UsageSnapshot)
+    case failure(message: String, kind: Backoff.Failure, retryAfter: Date?)
+    /// The refresh token is dead. Not a failure to retry — a state to fix.
+    case needsSignIn
 }
 
 @MainActor
@@ -70,7 +86,7 @@ final class AppState: ObservableObject {
             return BarCell(
                 character: account.character,
                 headroom: state?.snapshot?.headroom,
-                isUnreachable: state?.error != nil
+                isUnreachable: state?.isUnreachable == true
             )
         }
     }
@@ -119,9 +135,30 @@ final class AppState: ObservableObject {
     }
 
     private func isDue(_ account: Account, reason: RefreshReason, now: Date) -> Bool {
-        if retry[account.id]?.isBlocked(at: now) == true { return false }
+        Self.isDue(
+            needsSignIn: states[account.id]?.needsSignIn == true,
+            retry: retry[account.id],
+            lastAttempt: lastAttempt[account.id],
+            reason: reason,
+            now: now
+        )
+    }
+
+    /// Pure, so `--selftest` can prove the gates without a network or a clock.
+    /// A dead credential is not a schedule problem: no reason, not even a manual
+    /// refresh, may put it back on the wire, and the backoff ladder must not be
+    /// left churning on something that will never succeed.
+    nonisolated static func isDue(
+        needsSignIn: Bool,
+        retry: RetrySchedule?,
+        lastAttempt: Date?,
+        reason: RefreshReason,
+        now: Date
+    ) -> Bool {
+        if needsSignIn { return false }
+        if retry?.isBlocked(at: now) == true { return false }
         guard let maxAge = reason.maxAge else { return true }
-        guard let last = lastAttempt[account.id] else { return true }
+        guard let last = lastAttempt else { return true }
         return now.timeIntervalSince(last) >= maxAge
     }
 
@@ -136,13 +173,22 @@ final class AppState: ObservableObject {
         case .success(let snapshot):
             state.snapshot = snapshot
             state.error = nil
+            state.needsSignIn = false
             schedule.recordSuccess()
             lastUpdated = Date()
         case .failure(let message, let kind, let retryAfter):
             // The last good numbers stay exactly where they are; only the
             // verdict changes and the track goes hollow.
             state.error = message
+            state.needsSignIn = false
             schedule.recordFailure(kind, retryAfter: retryAfter)
+        case .needsSignIn:
+            // Terminal. No message, because there is nothing to wait out — and
+            // the ladder is wiped rather than climbed, so re-authenticating
+            // starts from a clean schedule.
+            state.error = nil
+            state.needsSignIn = true
+            schedule = RetrySchedule()
         }
         states[account.id] = state
         retry[account.id] = schedule
@@ -161,11 +207,6 @@ final class AppState: ObservableObject {
         Task { await refresh(reason: .opportunistic) }
     }
 
-    private enum FetchOutcome {
-        case success(UsageSnapshot)
-        case failure(message: String, kind: Backoff.Failure, retryAfter: Date?)
-    }
-
     private static func load(_ account: Account, vault: TokenVault) async -> FetchOutcome {
         do {
             let token = try await vault.accessToken(for: account)
@@ -175,7 +216,26 @@ final class AppState: ObservableObject {
                 let fresh = try await vault.accessToken(for: account, force: true)
                 return .success(try await UsageClient.fetch(accessToken: fresh))
             }
-        } catch let error as UsageError {
+        } catch {
+            return outcome(for: error)
+        }
+    }
+
+    /// Pure classification, so `--selftest` can assert that a 400 lands on the
+    /// terminal state and that no response body survives the trip.
+    /// The sign-in banner is still UI, so it gets the same treatment: a status
+    /// code, never a body.
+    nonisolated static func signInMessage(for error: Error) -> String {
+        if let error = error as? OAuthError { return error.displayText }
+        return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+
+    nonisolated static func outcome(for error: Error) -> FetchOutcome {
+        if let error = error as? OAuthError {
+            guard !error.isCredentialRejected else { return .needsSignIn }
+            return .failure(message: error.displayText, kind: .transient, retryAfter: nil)
+        }
+        if let error = error as? UsageError {
             // Only a 429 is a real rate limit; everything else backs off on the
             // gentler transient schedule, but everything backs off, so no
             // failure mode can spin the loop.
@@ -188,19 +248,29 @@ final class AppState: ObservableObject {
             return .failure(
                 message: error.errorDescription ?? "failed", kind: .transient, retryAfter: nil
             )
-        } catch let error as OAuthError {
-            return .failure(
-                message: error.errorDescription ?? "sign-in failed",
-                kind: .transient, retryAfter: nil
-            )
-        } catch {
-            return .failure(
-                message: error.localizedDescription, kind: .transient, retryAfter: nil
-            )
         }
+        return .failure(
+            message: error.localizedDescription, kind: .transient, retryAfter: nil
+        )
     }
 
     // MARK: Accounts
+    //
+    // Nothing here ever writes the in-memory array over the file. The array is
+    // a view of the accounts; the file is the authority on their refresh
+    // tokens, and a rotation that landed on disk a second ago must survive a
+    // rename, a reorder or a sign-out carrying a stale copy of it.
+
+    /// Applies a change to what is actually on disk. Never used for anything
+    /// that carries a credential — those paths throw so the failure is visible.
+    private func persistAccounts(_ body: @escaping (inout [Account]) -> Void) {
+        guard !isDemo else { return }
+        do {
+            try Store.mutate(body)
+        } catch {
+            NSLog("ClaudeUsageBar: failed to save accounts: \(error.localizedDescription)")
+        }
+    }
 
     func addAccount() {
         guard canAddAccount else { return }
@@ -209,14 +279,67 @@ final class AppState: ObservableObject {
         Task {
             do {
                 let (email, refreshToken) = try await OAuth.signIn()
-                var updated = accounts.filter { $0.email.caseInsensitiveCompare(email) != .orderedSame }
-                updated.append(Account(email: email, refreshToken: refreshToken))
-                accounts = updated
-                Store.save(updated)
+                let account = Account(email: email, refreshToken: refreshToken)
+                // Disk first: the token it carries exists nowhere else.
+                try Store.mutate { stored in
+                    stored.removeAll { $0.email.caseInsensitiveCompare(email) == .orderedSame }
+                    stored.append(account)
+                }
+                accounts = accounts.filter {
+                    $0.email.caseInsensitiveCompare(email) != .orderedSame
+                } + [account]
                 isSigningIn = false
                 await refresh(reason: .manual)
             } catch {
-                signInError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                signInError = Self.signInMessage(for: error)
+                isSigningIn = false
+            }
+        }
+    }
+
+    /// Re-authenticate an account whose refresh token the server has rejected.
+    /// The account keeps its id, nickname, label and place in the order — only
+    /// the credential underneath it is replaced.
+    func signInAgain(_ account: Account) {
+        guard !isDemo, !isSigningIn else { return }
+        isSigningIn = true
+        signInError = nil
+        let id = account.id
+        Task {
+            do {
+                // The new token goes to disk the instant it exists, under this
+                // account's own id, before the profile lookup that follows.
+                let (email, refreshToken) = try await OAuth.signIn(persistRefreshToken: { token in
+                    try Store.updateRefreshToken(id: id, to: token)
+                })
+                guard let index = accounts.firstIndex(where: { $0.id == id }) else {
+                    isSigningIn = false
+                    return
+                }
+                let clash = accounts.contains {
+                    $0.id != id && $0.email.caseInsensitiveCompare(email) == .orderedSame
+                }
+                guard !clash else {
+                    signInError = "\(email) is already signed in."
+                    isSigningIn = false
+                    return
+                }
+                try Store.mutate { stored in
+                    guard let idx = stored.firstIndex(where: { $0.id == id }) else { return }
+                    stored[idx].email = email
+                    stored[idx].refreshToken = refreshToken
+                }
+                accounts[index].email = email
+                accounts[index].refreshToken = refreshToken
+                states[id]?.needsSignIn = false
+                states[id]?.error = nil
+                retry[id] = nil
+                lastAttempt[id] = nil
+                await vault.reset(id)
+                isSigningIn = false
+                await refresh(reason: .manual)
+            } catch {
+                signInError = Self.signInMessage(for: error)
                 isSigningIn = false
             }
         }
@@ -228,7 +351,7 @@ final class AppState: ObservableObject {
         lastAttempt[account.id] = nil
         retry[account.id] = nil
         guard !isDemo else { return }
-        Store.save(accounts)
+        persistAccounts { $0.removeAll { $0.id == account.id } }
         Task { await vault.forget(account.id) }
     }
 
@@ -255,7 +378,10 @@ final class AppState: ObservableObject {
 
     private func applyOrder(_ reordered: [Account]) {
         accounts = reordered
-        if !isDemo { Store.save(accounts) }
+        let order = reordered.map(\.id)
+        persistAccounts { stored in
+            stored = AccountOrder.sorted(stored, by: order)
+        }
     }
 
     func setLabel(_ raw: String, for account: Account) {
@@ -263,7 +389,10 @@ final class AppState: ObservableObject {
               let idx = accounts.firstIndex(where: { $0.id == account.id }),
               accounts[idx].label != normalized else { return }
         accounts[idx].label = normalized
-        if !isDemo { Store.save(accounts) }
+        persistAccounts { stored in
+            guard let i = stored.firstIndex(where: { $0.id == account.id }) else { return }
+            stored[i].label = normalized
+        }
     }
 
     func setNickname(_ raw: String, for account: Account) {
@@ -271,24 +400,29 @@ final class AppState: ObservableObject {
         guard let idx = accounts.firstIndex(where: { $0.id == account.id }),
               accounts[idx].nickname != normalized else { return }
         accounts[idx].nickname = normalized
-        if !isDemo { Store.save(accounts) }
+        persistAccounts { stored in
+            guard let i = stored.firstIndex(where: { $0.id == account.id }) else { return }
+            stored[i].nickname = normalized
+        }
     }
 
     // MARK: Demo
 
-    /// `--demo`: three in-memory accounts covering every state worth looking at
+    /// `--demo`: four in-memory accounts covering every state worth looking at
     /// without signing in — blocked (dimmed letter, empty painted gauge), rate
-    /// limited but still showing its last known reading (hollow gauge), and
-    /// plain healthy monochrome. Plus a 100% row and a Fable bucket the API
-    /// never reported, which is the `0%` + `—` case.
+    /// limited but still showing its last known reading (hollow gauge), plain
+    /// healthy monochrome, and a dead credential waiting on a sign-in. Plus a
+    /// 100% row and a Fable bucket the API never reported, which is the `0%` +
+    /// `—` case.
     private static func demoData() -> (accounts: [Account], states: [UUID: AccountState]) {
         let specs: [(
             label: String, nickname: String, email: String,
-            five: Double, weekly: Double, fable: Double?, error: String?
+            five: Double, weekly: Double, fable: Double?, error: String?, needsSignIn: Bool
         )] = [
-            ("P", "Personal", "izu@personal.com", 100, 5, nil, nil),
-            ("W", "Work", "izu@work.example", 78, 20, 40, "rate limited"),
-            ("T", "Team", "izu@team.example", 15, 5, 10, nil)
+            ("P", "Personal", "izu@personal.com", 100, 5, nil, nil, false),
+            ("W", "Work", "izu@work.example", 78, 20, 40, "rate limited", false),
+            ("T", "Team", "izu@team.example", 15, 5, 10, nil, false),
+            ("I", "Iconic", "izu@iconic.example", 0, 0, nil, nil, true)
         ]
         var accounts: [Account] = []
         var states: [UUID: AccountState] = [:]
@@ -312,7 +446,12 @@ final class AppState: ObservableObject {
                 resetsAt: spec.fable == nil ? nil : Date().addingTimeInterval(273_600)
             )]
             accounts.append(account)
-            states[account.id] = AccountState(snapshot: snap, error: spec.error)
+            states[account.id] = AccountState(
+                // A rejected credential has nothing live behind it.
+                snapshot: spec.needsSignIn ? nil : snap,
+                error: spec.error,
+                needsSignIn: spec.needsSignIn
+            )
         }
         return (accounts, states)
     }

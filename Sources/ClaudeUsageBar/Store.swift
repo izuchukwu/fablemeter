@@ -82,6 +82,20 @@ enum AccountOrder {
         return out
     }
 
+    /// Re-order what is on disk to match the order the app is showing, without
+    /// carrying anything else across from it. Ids the file has and the order
+    /// does not (an account added by another instance) settle at the end.
+    static func sorted(_ accounts: [Account], by order: [UUID]) -> [Account] {
+        let rank = Dictionary(order.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        return accounts.enumerated()
+            .sorted { left, right in
+                let a = rank[left.element.id] ?? (order.count + left.offset)
+                let b = rank[right.element.id] ?? (order.count + right.offset)
+                return a < b
+            }
+            .map(\.element)
+    }
+
     /// Drop `id` into `targetID`'s slot; everything between it and its old slot
     /// shuffles along by one.
     static func moved(_ accounts: [Account], id: UUID, onto targetID: UUID) -> [Account]? {
@@ -95,9 +109,118 @@ enum AccountOrder {
     }
 }
 
+enum FileError: LocalizedError {
+    case syscall(String, Int32)
+
+    var errorDescription: String? {
+        switch self {
+        case .syscall(let op, let code):
+            return "\(op) failed: \(String(cString: strerror(code)))"
+        }
+    }
+}
+
+/// Write-then-rename with the bytes forced to the disk *before* the rename, so
+/// a process that dies at any instant leaves either the whole old file or the
+/// whole new one. `Data.write(options: .atomic)` renames but never flushes; a
+/// refresh token that only reached the page cache is a token that can be
+/// consumed server-side and then lost, which is exactly what bricks an account.
+enum AtomicFile {
+    static func write(_ data: Data, to url: URL, mode: mode_t = 0o600) throws {
+        let directory = url.deletingLastPathComponent()
+        let temporary = directory
+            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+
+        let fd = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL, mode)
+        guard fd >= 0 else { throw FileError.syscall("create", errno) }
+        var committed = false
+        defer { if !committed { unlink(temporary.path) } }
+
+        do {
+            guard fchmod(fd, mode) == 0 else { throw FileError.syscall("chmod", errno) }
+            try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                var offset = 0
+                while offset < raw.count {
+                    let written = Darwin.write(
+                        fd, raw.baseAddress!.advanced(by: offset), raw.count - offset
+                    )
+                    if written < 0 {
+                        if errno == EINTR { continue }
+                        throw FileError.syscall("write", errno)
+                    }
+                    offset += written
+                }
+            }
+            // F_FULLFSYNC pushes past the drive's own write cache; plain fsync
+            // only reaches it. Either is enough to survive a killed process.
+            if fcntl(fd, F_FULLFSYNC) != 0, fsync(fd) != 0 {
+                throw FileError.syscall("fsync", errno)
+            }
+        } catch {
+            close(fd)
+            throw error
+        }
+        close(fd)
+
+        guard rename(temporary.path, url.path) == 0 else {
+            throw FileError.syscall("rename", errno)
+        }
+        committed = true
+
+        // The rename is only durable once the directory entry itself is flushed.
+        let dir = open(directory.path, O_RDONLY)
+        if dir >= 0 {
+            _ = fsync(dir)
+            close(dir)
+        }
+    }
+}
+
+/// Cross-process guard on one account's refresh.
+///
+/// In-process single-flight cannot see a *second copy of the app* refreshing the
+/// same account, and a second copy is a second consumer of a token that only
+/// survives being spent once. `flock` is advisory but process-wide, and the
+/// kernel drops it when the holder dies — which is exactly the lifetime wanted
+/// here, since the holder dying is the case being defended against.
+final class RefreshLock: @unchecked Sendable {
+    private var descriptor: Int32
+
+    private init(descriptor: Int32) { self.descriptor = descriptor }
+
+    /// Throws `OAuthError.refreshBusy` when another process holds the lock.
+    /// Returns `nil` when locking is simply unavailable — a lock file that
+    /// cannot be created must never stop the app refreshing.
+    static func acquire(for id: UUID, in directory: URL) throws -> RefreshLock? {
+        let path = directory.appendingPathComponent(".refresh-\(id.uuidString).lock").path
+        let descriptor = open(path, O_CREAT | O_RDWR, 0o600)
+        guard descriptor >= 0 else { return nil }
+        if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            let busy = errno == EWOULDBLOCK
+            close(descriptor)
+            if busy { throw OAuthError.refreshBusy }
+            return nil
+        }
+        return RefreshLock(descriptor: descriptor)
+    }
+
+    func release() {
+        guard descriptor >= 0 else { return }
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+        descriptor = -1
+    }
+}
+
 /// Plaintext-on-disk account store. Deliberately not the Keychain: this app is
 /// ad-hoc signed, so every rebuild changes the signature and macOS would prompt
 /// for keychain access on each launch.
+///
+/// Disk — not the in-memory account array — is the authority on refresh tokens.
+/// Every mutation is therefore a load-modify-save against the file (`mutate`),
+/// never a blind write of a snapshot some other part of the app has been holding
+/// on to: a rotated token that landed on disk a second ago must not be undone by
+/// a rename or a reorder carrying a stale copy of it.
 enum Store {
     static let maxAccounts = 3
 
@@ -121,33 +244,43 @@ enum Store {
         return (try? dec.decode([Account].self, from: data)) ?? []
     }
 
-    static func save(_ accounts: [Account]) {
+    /// Full write. Throws rather than logging: every caller here is persisting a
+    /// credential, and a swallowed failure is an account nobody can recover.
+    static func save(_ accounts: [Account]) throws {
         let fm = FileManager.default
-        do {
-            try fm.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        try fm.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
 
-            let enc = JSONEncoder()
-            enc.dateEncodingStrategy = .iso8601
-            enc.outputFormatting = [.prettyPrinted]
-            let data = try enc.encode(accounts)
-            try data.write(to: file, options: [.atomic])
-            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-        } catch {
-            NSLog("ClaudeUsageBar: failed to save accounts: \(error.localizedDescription)")
-        }
+        let enc = JSONEncoder()
+        enc.dateEncodingStrategy = .iso8601
+        enc.outputFormatting = [.prettyPrinted]
+        try AtomicFile.write(try enc.encode(accounts), to: file, mode: 0o600)
     }
 
-    /// Persist a rotated refresh token immediately — losing it bricks the account.
-    static func updateRefreshToken(id: UUID, to token: String) {
+    /// The only way anything mutates the file: read what is actually there,
+    /// change it, write it back.
+    static func mutate(_ body: (inout [Account]) -> Void) throws {
         var accounts = load()
-        guard let idx = accounts.firstIndex(where: { $0.id == id }) else { return }
-        guard accounts[idx].refreshToken != token else { return }
-        accounts[idx].refreshToken = token
-        save(accounts)
+        let before = accounts
+        body(&accounts)
+        guard accounts != before else { return }
+        try save(accounts)
+    }
+
+    /// Persist a rotated refresh token immediately — losing it bricks the
+    /// account. `replacing` makes it a compare-and-swap: a rotation is only
+    /// written while the token it replaces is still the one on disk, so a
+    /// straggling refresh can never stamp on a token an interactive sign-in put
+    /// there in the meantime.
+    static func updateRefreshToken(id: UUID, to token: String, replacing expected: String? = nil) throws {
+        try mutate { accounts in
+            guard let idx = accounts.firstIndex(where: { $0.id == id }) else { return }
+            if let expected, accounts[idx].refreshToken != expected { return }
+            accounts[idx].refreshToken = token
+        }
     }
 }

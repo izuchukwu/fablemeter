@@ -70,9 +70,10 @@ signature and macOS would prompt for Keychain access on each launch.
 
 | Flag | What it does |
 | --- | --- |
-| `--selftest` | Decodes an embedded usage fixture and asserts the parsed values. |
+| `--selftest` | Decodes an embedded usage fixture, walks the polling and backoff schedules, and exercises token rotation — single-flight refresh, persist-before-return, and the terminal `needs sign-in` state — with no network. |
 | `--probe` | Reads Claude Code's existing access token read-only and prints live parsed buckets. Never writes or refreshes it. |
-| `--demo` | Three fake in-memory accounts, for looking at the drawing. |
+| `--demo` | Four fake in-memory accounts, for looking at the drawing: blocked, rate limited, healthy, and one whose credential the server has rejected. |
+| `--render-popover <dir>` | Writes the popover itself in both appearances, without a menu bar or a click. |
 | `--render <dir>` | Writes the menu bar image for every state in both appearances. The real menu bar takes its appearance from the desktop picture behind it, so a dark wallpaper otherwise makes the light case impossible to see on screen. |
 
 ## Caveat

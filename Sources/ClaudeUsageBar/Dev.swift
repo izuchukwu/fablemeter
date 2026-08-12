@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SwiftUI
 
 // MARK: - Fixture
 
@@ -441,10 +442,10 @@ enum SelfTest {
         let sandbox = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("ClaudeUsageBarSelfTest-\(UUID().uuidString)", isDirectory: true)
         Store.directoryOverride = sandbox
-        Store.save(list)
+        try? Store.save(list)
         check("store round-trips order", labels(Store.load()) == "PWT", "got \(labels(Store.load()))")
         if let reordered = AccountOrder.moved(list, id: t.id, onto: p.id) {
-            Store.save(reordered)
+            try? Store.save(reordered)
         }
         let reloaded = Store.load()
         check("reorder round-trips order", labels(reloaded) == "TPW", "got \(labels(reloaded))")
@@ -455,12 +456,370 @@ enum SelfTest {
         let mode = (try? FileManager.default.attributesOfItem(atPath: Store.file.path)[.posixPermissions])
             .flatMap { $0 as? NSNumber }?.intValue
         check("accounts.json stays 0600", mode == 0o600, "got \(mode.map { String($0, radix: 8) } ?? "nil")")
+        // A refresh token that rotated onto disk must survive every *other*
+        // write the app makes. A rename or a reorder carrying an in-memory copy
+        // of the old token used to stamp straight over it — which consumes the
+        // token server-side and loses it, i.e. bricks the account.
+        Store.directoryOverride = sandbox
+        try? Store.save(list)
+        try? Store.updateRefreshToken(id: w.id, to: "rotated-1")
+        check("rotation lands on disk",
+              Store.load().first { $0.id == w.id }?.refreshToken == "rotated-1")
+        // `list` is the stale in-memory array, still holding "x" for w.
+        try? Store.mutate { stored in
+            stored = AccountOrder.sorted(stored, by: [t.id, p.id, w.id])
+            if let i = stored.firstIndex(where: { $0.id == p.id }) { stored[i].nickname = "Renamed" }
+        }
+        let afterEdit = Store.load()
+        check("a reorder + rename cannot undo a rotated token",
+              afterEdit.first { $0.id == w.id }?.refreshToken == "rotated-1",
+              "got \(afterEdit.first { $0.id == w.id }?.refreshToken.prefix(4).description ?? "nil")")
+        check("…while the reorder and rename still applied",
+              labels(afterEdit) == "TPW" && afterEdit.first { $0.id == p.id }?.nickname == "Renamed")
+        // Compare-and-swap: a straggling refresh cannot stand on a token an
+        // interactive sign-in has since written.
+        try? Store.updateRefreshToken(id: w.id, to: "stale-rotation", replacing: "x")
+        check("a rotation of a superseded token is refused",
+              Store.load().first { $0.id == w.id }?.refreshToken == "rotated-1")
+        try? Store.updateRefreshToken(id: w.id, to: "rotated-2", replacing: "rotated-1")
+        check("a rotation of the current token is written",
+              Store.load().first { $0.id == w.id }?.refreshToken == "rotated-2")
+        let modeAfter = (try? FileManager.default.attributesOfItem(atPath: Store.file.path)[.posixPermissions])
+            .flatMap { $0 as? NSNumber }?.intValue
+        check("the durable write stays 0600", modeAfter == 0o600,
+              "got \(modeAfter.map { String($0, radix: 8) } ?? "nil")")
+        // A write that cannot land has to be an error, not a shrug: a rotated
+        // token that never reached disk is a dead account.
+        Store.directoryOverride = URL(fileURLWithPath: "/dev/null/nowhere")
+        var surfaced = false
+        do { try Store.save(list) } catch { surfaced = true }
+        check("an impossible write throws rather than being swallowed", surfaced)
+        Store.directoryOverride = sandbox
+
         try? FileManager.default.removeItem(at: sandbox)
         Store.directoryOverride = nil
         check("selftest sandbox cleaned up", !FileManager.default.fileExists(atPath: sandbox.path))
 
+        // MARK: Token rotation
+        //
+        // Anthropic rotates the refresh token on every refresh: the old one is
+        // consumed the instant the server answers, and presenting it again
+        // returns 400 invalid_grant forever. Everything below exists because
+        // both halves of that — refreshing twice at once, and returning before
+        // the replacement is on disk — cost the user all three accounts.
+
+        check("a 400 is a dead credential, not a blip",
+              OAuthError.tokenExchange(400, #"{"error":"invalid_grant"}"#).isCredentialRejected)
+        check("so is a 401", OAuthError.tokenExchange(401, "").isCredentialRejected)
+        check("invalid_grant is terminal whatever the status",
+              OAuthError.tokenExchange(500, #"{"error":"invalid_grant"}"#).isCredentialRejected)
+        check("a 5xx is still worth retrying",
+              !OAuthError.tokenExchange(503, "upstream").isCredentialRejected)
+        check("a timeout is still worth retrying", !OAuthError.timedOut.isCredentialRejected)
+
+        // Concurrency. N callers, one network refresh — the poll tick, the
+        // popover opening and a manual refresh routinely overlap.
+        let single = TokenFake(bundle: TokenFake.bundle(refresh: "rotated"), delay: 0.05)
+        let vault = TokenVault(
+            refresher: single.refresh, storedToken: { _ in "stored" },
+            persist: single.persist, lock: { _ in nil }
+        )
+        let subject = Account(email: "c@example.com", refreshToken: "stored")
+        let tokens = Blocking.run {
+            await withTaskGroup(of: String?.self) { group in
+                for _ in 0..<12 {
+                    group.addTask { try? await vault.accessToken(for: subject) }
+                }
+                var out: [String?] = []
+                for await token in group { out.append(token) }
+                return out
+            }
+        }
+        check("12 concurrent callers refresh exactly once", single.refreshes == 1,
+              "\(single.refreshes) refreshes")
+        check("…and every one of them gets the token", tokens.allSatisfy { $0 == "access" },
+              "\(tokens.compactMap { $0 }.count)/12 served")
+        check("…and the rotation is persisted exactly once", single.persists == 1,
+              "\(single.persists) writes")
+        check("the rotated token is the one persisted",
+              single.persisted.last?.token == "rotated" && single.persisted.last?.expected == "stored")
+        // A cached access token costs nothing at all.
+        _ = Blocking.run { try? await vault.accessToken(for: subject) }
+        check("a live access token is served from memory", single.refreshes == 1)
+
+        // Ordering. The persist has to happen before any caller can act on the
+        // bundle — a process killed in that gap loses a token the server has
+        // already rotated.
+        let ordered = TokenFake(bundle: TokenFake.bundle(refresh: "rotated"), delay: 0)
+        let orderedVault = TokenVault(
+            refresher: ordered.refresh, storedToken: { _ in "stored" },
+            persist: ordered.persist, lock: { _ in nil }
+        )
+        _ = Blocking.run { try? await orderedVault.accessToken(for: subject) }
+        ordered.log.append("returned")
+        check("rotation is persisted before the bundle is returned",
+              ordered.log == ["refreshed", "persisted", "returned"], "got \(ordered.log)")
+
+        // And a persist that fails is a failure, not a silently dead account.
+        let unwritable = TokenFake(bundle: TokenFake.bundle(refresh: "rotated"), delay: 0)
+        unwritable.persistError = FileError.syscall("write", EIO)
+        let unwritableVault = TokenVault(
+            refresher: unwritable.refresh, storedToken: { _ in "stored" },
+            persist: unwritable.persist, lock: { _ in nil }
+        )
+        let failed: Bool = Blocking.run {
+            do { _ = try await unwritableVault.accessToken(for: subject); return false }
+            catch { return true }
+        }
+        check("a failed persist surfaces as an error", failed)
+        let served = Blocking.run { try? await unwritableVault.accessToken(for: subject) }
+        check("…and the unpersisted token is never cached and served",
+              served == nil, "got \(served ?? "nil")")
+
+        // A rejected credential stops dead: no second request, and the raw
+        // response body never leaves the vault.
+        let dead = TokenFake(
+            bundle: TokenFake.bundle(refresh: nil), delay: 0,
+            error: OAuthError.tokenExchange(400, #"{"error":"invalid_grant","error_descript"#)
+        )
+        let deadVault = TokenVault(
+            refresher: dead.refresh, storedToken: { _ in "consumed" },
+            persist: dead.persist, lock: { _ in nil }
+        )
+        let rejection: Rejection = Blocking.run {
+            do {
+                _ = try await deadVault.accessToken(for: subject)
+                return Rejection(isExpired: false, description: "no error at all")
+            } catch {
+                return Rejection(
+                    isExpired: (error as? OAuthError) == .credentialExpired,
+                    description: (error as? LocalizedError)?.errorDescription ?? "\(error)"
+                )
+            }
+        }
+        check("a rejected refresh surfaces as the sanitized error", rejection.isExpired,
+              "got \(rejection.description)")
+        check("no response body escapes the vault",
+              !rejection.description.contains("invalid_grant")
+              && !rejection.description.contains("{"),
+              "got \(rejection.description)")
+        _ = Blocking.run { try? await deadVault.accessToken(for: subject) }
+        check("a rejected account never hits the network again", dead.refreshes == 1,
+              "\(dead.refreshes) refreshes")
+        check("…until a sign-in revives it", Blocking.run {
+            await deadVault.reset(subject.id)
+            return await deadVault.isRejected(subject.id) == false
+        })
+
+        // A second copy of the app is a second consumer of the same rotated
+        // token, and in-process single-flight cannot see it. The account is
+        // skipped rather than raced — and skipping is transient, never terminal.
+        let contended = TokenFake(bundle: TokenFake.bundle(refresh: "rotated"), delay: 0)
+        let contendedVault = TokenVault(
+            refresher: contended.refresh, storedToken: { _ in "stored" },
+            persist: contended.persist, lock: { _ in throw OAuthError.refreshBusy }
+        )
+        let busy: Rejection = Blocking.run {
+            do {
+                _ = try await contendedVault.accessToken(for: subject)
+                return Rejection(isExpired: false, description: "no error at all")
+            } catch {
+                return Rejection(
+                    isExpired: (error as? OAuthError) == .refreshBusy,
+                    description: (error as? LocalizedError)?.errorDescription ?? "\(error)"
+                )
+            }
+        }
+        check("a refresh held by another process is refused", busy.isExpired,
+              "got \(busy.description)")
+        check("…without spending the token", contended.refreshes == 0 && contended.persists == 0)
+        check("…and reads as transient, never as a dead credential",
+              !OAuthError.refreshBusy.isCredentialRejected
+              && !AppState.outcome(for: OAuthError.refreshBusy).isNeedsSignIn)
+
+        // And the real lock: exclusive across descriptors, released on demand.
+        let lockDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClaudeUsageBarLock-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
+        let lockID = UUID()
+        let firstLock = try? RefreshLock.acquire(for: lockID, in: lockDirectory)
+        check("the refresh lock is taken", firstLock != nil)
+        var contendedLock = false
+        do { _ = try RefreshLock.acquire(for: lockID, in: lockDirectory) }
+        catch { contendedLock = (error as? OAuthError) == .refreshBusy }
+        check("a held refresh lock refuses a second holder", contendedLock)
+        firstLock?.release()
+        let reacquired = try? RefreshLock.acquire(for: lockID, in: lockDirectory)
+        check("releasing it lets the next holder in", reacquired != nil)
+        reacquired?.release()
+        // A directory that cannot hold a lock file must never stop a refresh.
+        let unlockable = try? RefreshLock.acquire(
+            for: lockID, in: URL(fileURLWithPath: "/dev/null/nowhere")
+        )
+        check("an impossible lock fails open rather than shut", unlockable == nil)
+        try? FileManager.default.removeItem(at: lockDirectory)
+
+        // The state that failure maps to, and what the loop then does with it.
+        check("a rejected credential maps to needsSignIn",
+              AppState.outcome(for: OAuthError.credentialExpired).isNeedsSignIn)
+        check("a raw 400 maps to needsSignIn too",
+              AppState.outcome(for: OAuthError.tokenExchange(400, "{\"e")).isNeedsSignIn)
+        check("a rate limit is still an ordinary failure",
+              !AppState.outcome(for: UsageError.rateLimited(retryAfter: nil)).isNeedsSignIn)
+        check("needsSignIn carries no message to leak",
+              AppState.outcome(for: OAuthError.tokenExchange(400, "{\"e")).message == nil)
+        check("a transient failure still carries one",
+              AppState.outcome(for: UsageError.http(503)).message == "HTTP 503")
+
+        // Nothing that can carry a response body may reach the screen — not the
+        // verdict slot, not the sign-in banner. `Token exchange failed (400):
+        // {"e...` is exactly what this forbids.
+        let bodies = [
+            OAuthError.tokenExchange(400, #"{"error":"invalid_grant"}"#),
+            OAuthError.tokenExchange(503, #"{"error":"overloaded_error"}"#),
+            OAuthError.denied(#"{"error":"access_denied"}"#),
+            OAuthError.credentialExpired,
+            OAuthError.malformed,
+            OAuthError.timedOut
+        ]
+        check("no OAuth failure puts a body on screen",
+              bodies.allSatisfy { !$0.displayText.contains("{") && !$0.displayText.contains("\"") },
+              "got \(bodies.map(\.displayText))")
+        check("a transient token exchange still shows its status, not its body",
+              AppState.outcome(for: OAuthError.tokenExchange(503, #"{"error":"x"}"#)).message
+              == "sign-in failed (503)")
+        check("the sign-in banner is sanitized too",
+              AppState.signInMessage(for: OAuthError.tokenExchange(400, #"{"e"#))
+              == "sign-in failed (400)")
+        check("…while the log still gets the whole body",
+              OAuthError.tokenExchange(400, #"{"error":"invalid_grant"}"#)
+                  .errorDescription?.contains("invalid_grant") == true)
+
+        let never = Date(timeIntervalSince1970: 0)
+        var blocked = RetrySchedule()
+        blocked.recordFailure(.rateLimited, now: epoch) { _ in 0 }
+        check("the poll loop skips an account that needs signing in",
+              !AppState.isDue(
+                  needsSignIn: true, retry: nil, lastAttempt: nil,
+                  reason: .scheduled, now: epoch
+              ))
+        check("…and a manual refresh cannot force one either",
+              !AppState.isDue(
+                  needsSignIn: true, retry: nil, lastAttempt: never,
+                  reason: .manual, now: epoch
+              ))
+        check("a healthy account is still due",
+              AppState.isDue(
+                  needsSignIn: false, retry: nil, lastAttempt: nil,
+                  reason: .scheduled, now: epoch
+              ))
+        check("backoff still gates everything else",
+              !AppState.isDue(
+                  needsSignIn: false, retry: blocked, lastAttempt: nil,
+                  reason: .manual, now: epoch
+              ))
+
+        // On screen it is a state, not an error string.
+        let rejectedState = AccountState(snapshot: nil, error: nil, needsSignIn: true)
+        check("needsSignIn holds no error text", rejectedState.error == nil)
+        check("…and still reads as unreachable, so the gauge stays hollow",
+              rejectedState.isUnreachable && !rejectedState.isStale)
+        check("a hollow, empty gauge is the never-loaded treatment",
+              BarCell(character: "I", headroom: nil, isUnreachable: true)
+              == BarCell(character: "I", headroom: rejectedState.snapshot?.headroom,
+                         isUnreachable: rejectedState.isUnreachable))
+
         print(failures == 0 ? "\nselftest: all checks passed" : "\nselftest: \(failures) failure(s)")
         return failures == 0 ? 0 : 1
+    }
+}
+
+// MARK: - Self test support
+
+struct Rejection: Sendable {
+    let isExpired: Bool
+    let description: String
+}
+
+extension FetchOutcome {
+    var isNeedsSignIn: Bool {
+        if case .needsSignIn = self { return true }
+        return false
+    }
+
+    /// What would reach the popover. `nil` for anything that has no business
+    /// putting a string on screen.
+    var message: String? {
+        if case .failure(let message, _, _) = self { return message }
+        return nil
+    }
+}
+
+/// A `TokenVault` collaborator with no network behind it: it counts refreshes,
+/// records the order things happened in, and can be told to fail its write.
+final class TokenFake: @unchecked Sendable {
+    private let lock = NSLock()
+    private let bundle: TokenBundle
+    private let delay: TimeInterval
+    private let error: Error?
+    var persistError: Error?
+
+    private(set) var refreshes = 0
+    private(set) var persists = 0
+    private(set) var persisted: [(token: String, expected: String)] = []
+    var log: [String] = []
+
+    init(bundle: TokenBundle, delay: TimeInterval, error: Error? = nil) {
+        self.bundle = bundle
+        self.delay = delay
+        self.error = error
+    }
+
+    static func bundle(refresh: String?) -> TokenBundle {
+        TokenBundle(
+            accessToken: "access", refreshToken: refresh,
+            expiresAt: Date().addingTimeInterval(3600), email: nil
+        )
+    }
+
+    var refresh: TokenVault.Refresher {
+        { [self] _ in
+            lock.withLock { refreshes += 1 }
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            if let error { throw error }
+            lock.withLock { log.append("refreshed") }
+            return bundle
+        }
+    }
+
+    var persist: TokenVault.Persister {
+        { [self] _, token, expected in
+            if let persistError { throw persistError }
+            lock.withLock {
+                persists += 1
+                persisted.append((token, expected))
+                log.append("persisted")
+            }
+        }
+    }
+}
+
+/// Runs an async body from the synchronous self test. `--selftest` is a
+/// command-line pass with no run loop, so blocking the caller is fine.
+enum Blocking {
+    static func run<T: Sendable>(_ body: @escaping @Sendable () async -> T) -> T {
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = Box<T>()
+        Task {
+            box.value = await body()
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return box.value!
+    }
+
+    private final class Box<T>: @unchecked Sendable {
+        var value: T?
     }
 }
 
@@ -521,6 +880,57 @@ enum RenderStates {
                 try? png.write(to: file)
                 print("wrote \(file.path)")
             }
+        }
+        return 0
+    }
+}
+
+// MARK: - Popover render
+
+/// Draws the popover itself, in both appearances, without a menu bar or a
+/// click. Same reason as `RenderStates`: the states worth judging are not all
+/// reachable on the machine doing the judging.
+@MainActor
+enum RenderPopover {
+    static func run(into directory: String) -> Int32 {
+        let url = URL(fileURLWithPath: directory, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+
+        for (name, backdrop) in [
+            (NSAppearance.Name.aqua, NSColor(white: 0.96, alpha: 1)),
+            (NSAppearance.Name.darkAqua, NSColor(white: 0.13, alpha: 1))
+        ] {
+            guard let appearance = NSAppearance(named: name) else { continue }
+            let state = AppState(demo: true)
+            let host = NSHostingView(rootView: PopoverView(state: state))
+            host.appearance = appearance
+            // The popover's own material is opaque; without a backdrop the
+            // capture is white-on-transparent and the dark case reads as blank.
+            host.wantsLayer = true
+            host.layer?.backgroundColor = backdrop.cgColor
+            let size = host.fittingSize
+            host.frame = NSRect(origin: .zero, size: size)
+
+            let window = NSWindow(
+                contentRect: host.frame, styleMask: [.borderless],
+                backing: .buffered, defer: false
+            )
+            window.appearance = appearance
+            window.backgroundColor = backdrop
+            window.contentView = host
+            window.orderFront(nil)
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.7))
+            host.layoutSubtreeIfNeeded()
+
+            guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { continue }
+            host.cacheDisplay(in: host.bounds, to: rep)
+            let file = url.appendingPathComponent("popover-\(name.rawValue).png")
+            if let png = rep.representation(using: .png, properties: [:]) {
+                try? png.write(to: file)
+                print("wrote \(file.path)  \(Int(size.width))x\(Int(size.height))")
+            }
+            window.orderOut(nil)
         }
         return 0
     }

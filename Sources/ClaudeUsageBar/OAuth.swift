@@ -20,13 +20,19 @@ enum Constants {
     static let signInTimeout: TimeInterval = 300
 }
 
-enum OAuthError: LocalizedError {
+enum OAuthError: LocalizedError, Equatable {
     case noPort
     case timedOut
     case stateMismatch
     case denied(String)
     case tokenExchange(Int, String)
     case malformed
+    /// The refresh token is gone for good — sanitized, so no response body ever
+    /// travels past the vault.
+    case credentialExpired
+    /// Another process is already refreshing this account. Transient by
+    /// definition: whatever it rotates to will be on disk by the next tick.
+    case refreshBusy
 
     var errorDescription: String? {
         switch self {
@@ -36,6 +42,41 @@ enum OAuthError: LocalizedError {
         case .denied(let s): return "Authorization denied: \(s)"
         case .tokenExchange(let c, let s): return "Token exchange failed (\(c)): \(s)"
         case .malformed: return "Unexpected token response."
+        case .credentialExpired: return "Sign-in expired."
+        case .refreshBusy: return "busy"
+        }
+    }
+
+    /// The only form of these that may reach the screen. `errorDescription`
+    /// carries the response body for the log; a body has no business in the
+    /// popover, where it arrives truncated to `{"e...` and says nothing.
+    var displayText: String {
+        switch self {
+        case .noPort: return "no callback port"
+        case .timedOut: return "sign-in timed out"
+        case .stateMismatch: return "sign-in aborted"
+        case .denied: return "authorization denied"
+        case .tokenExchange(let code, _): return "sign-in failed (\(code))"
+        case .malformed: return "unexpected response"
+        case .credentialExpired: return "signed out"
+        case .refreshBusy: return "busy"
+        }
+    }
+
+    /// Terminal, not transient. Anthropic rotates the refresh token on every
+    /// refresh, so a consumed or revoked one comes back `400 invalid_grant` and
+    /// will do so forever — retrying is pointless, and the ladder churning on it
+    /// is pure noise. Only an interactive sign-in clears it.
+    var isCredentialRejected: Bool {
+        switch self {
+        case .credentialExpired:
+            return true
+        case .tokenExchange(let code, let body):
+            if code == 400 || code == 401 { return true }
+            let lowered = body.lowercased()
+            return lowered.contains("invalid_grant") || lowered.contains("invalid_request")
+        default:
+            return false
         }
     }
 }
@@ -205,7 +246,15 @@ struct TokenBundle {
 
 enum OAuth {
     /// Full interactive PKCE sign-in. Returns the account email and a refresh token.
-    static func signIn() async throws -> (email: String, refreshToken: String) {
+    ///
+    /// - Parameter persistRefreshToken: called the instant the token exists and
+    ///   before anything else is awaited, so re-authentication cannot lose a
+    ///   freshly issued token to the profile lookup that follows it. Throwing
+    ///   from it fails the sign-in, which is the honest outcome: an unpersisted
+    ///   refresh token is a dead account.
+    static func signIn(
+        persistRefreshToken: ((String) throws -> Void)? = nil
+    ) async throws -> (email: String, refreshToken: String) {
         let verifier = PKCE.randomBase64URL(bytes: 64)
         let challenge = PKCE.challenge(for: verifier)
         let state = PKCE.randomBase64URL(bytes: 32)
@@ -254,6 +303,7 @@ enum OAuth {
 
         let bundle = try await exchange(code: code, verifier: verifier, redirectURI: redirectURI, state: state)
         guard let refresh = bundle.refreshToken else { throw OAuthError.malformed }
+        try persistRefreshToken?(refresh)
         var email = bundle.email
         if email == nil || email?.isEmpty == true {
             email = try? await fetchProfileEmail(accessToken: bundle.accessToken)
@@ -323,24 +373,153 @@ enum OAuth {
 
 /// Holds access tokens in memory only, refreshing them 5 minutes before expiry
 /// and persisting rotated refresh tokens straight away.
+///
+/// Two invariants, both of which were learned the hard way — breaking either one
+/// destroys the account permanently, because Anthropic **rotates** the refresh
+/// token on every refresh and a consumed one is dead forever:
+///
+///   1. **One refresh per account at a time.** Being an actor is not enough:
+///      `await`ing the network suspends and lets a second caller in, and that
+///      caller would read the same not-yet-rotated token from disk and spend it
+///      a second time. So the cache check and the in-flight registration happen
+///      in one synchronous step, and any caller that finds a refresh already
+///      running joins it instead of starting its own.
+///   2. **The rotation is on disk before anyone sees the bundle.** The moment
+///      the response arrives the old token is already spent, so the new one is
+///      written — durably — before the bundle is returned and before any other
+///      await. A failed write is an error, never a shrug.
 actor TokenVault {
+    typealias Refresher = @Sendable (String) async throws -> TokenBundle
+    typealias StoredTokenReader = @Sendable (UUID) -> String?
+    /// `(account, rotated token, the token it replaces)`.
+    typealias Persister = @Sendable (UUID, String, String) throws -> Void
+    /// Throws when another process holds the account; `nil` when locking is
+    /// unavailable, which must never block a refresh.
+    typealias Locker = @Sendable (UUID) throws -> RefreshLock?
+
+    /// A refresh already running, and the generation it belongs to.
+    private struct Pending {
+        let task: Task<TokenBundle, Error>
+        let generation: Int
+    }
+
     private var cache: [UUID: TokenBundle] = [:]
+    private var inFlight: [UUID: Pending] = [:]
+    /// Accounts the server has refused outright. They never reach the network
+    /// again until an interactive sign-in clears them.
+    private var rejected: Set<UUID> = []
+    /// Bumped by `forget`, so a refresh still in flight from before a sign-in
+    /// cannot apply its verdict to the account that replaced it.
+    private var generation: [UUID: Int] = [:]
     private let skew: TimeInterval = 300
 
+    private let refresher: Refresher
+    private let storedToken: StoredTokenReader
+    private let persist: Persister
+    private let lock: Locker
+
+    init(
+        refresher: @escaping Refresher = { try await OAuth.refresh(refreshToken: $0) },
+        storedToken: @escaping StoredTokenReader = { id in
+            Store.load().first { $0.id == id }?.refreshToken
+        },
+        persist: @escaping Persister = { id, token, expected in
+            try Store.updateRefreshToken(id: id, to: token, replacing: expected)
+        },
+        lock: @escaping Locker = { id in try RefreshLock.acquire(for: id, in: Store.directory) }
+    ) {
+        self.refresher = refresher
+        self.storedToken = storedToken
+        self.persist = persist
+        self.lock = lock
+    }
+
     func accessToken(for account: Account, force: Bool = false) async throws -> String {
+        if rejected.contains(account.id) { throw OAuthError.credentialExpired }
         if !force, let cached = cache[account.id], cached.expiresAt.timeIntervalSinceNow > skew {
             return cached.accessToken
         }
-        let stored = Store.load().first { $0.id == account.id }?.refreshToken ?? account.refreshToken
-        let bundle = try await OAuth.refresh(refreshToken: stored)
-        cache[account.id] = bundle
-        if let rotated = bundle.refreshToken, rotated != stored {
-            Store.updateRefreshToken(id: account.id, to: rotated)
+        // No `await` between the miss above and the registration inside, or the
+        // race simply moves to this line.
+        let pending = refreshTask(for: account)
+        do {
+            let bundle = try await pending.task.value
+            complete(account.id, pending: pending, bundle: bundle)
+            return bundle.accessToken
+        } catch {
+            complete(account.id, pending: pending, error: error)
+            // The response body dies here. Nothing downstream ever sees it.
+            if (error as? OAuthError)?.isCredentialRejected == true {
+                throw OAuthError.credentialExpired
+            }
+            throw error
         }
-        return bundle.accessToken
     }
 
+    /// Synchronous by construction: it either hands back the refresh already
+    /// running for this account or registers a new one, with no suspension in
+    /// between.
+    private func refreshTask(for account: Account) -> Pending {
+        if let existing = inFlight[account.id] { return existing }
+
+        let id = account.id
+        let fallback = account.refreshToken
+        let refresher = self.refresher
+        let storedToken = self.storedToken
+        let persist = self.persist
+        let lock = self.lock
+
+        let task = Task<TokenBundle, Error> {
+            // Held across the whole read-refresh-persist, so a second instance
+            // of the app cannot read the same token and spend it too.
+            let guardLock = try lock(id)
+            defer { guardLock?.release() }
+
+            let stored = storedToken(id) ?? fallback
+            let bundle = try await refresher(stored)
+            // The server rotated the moment it answered. Persist before the
+            // bundle reaches a caller and before any other await — the gap
+            // between "consumed" and "written" is the gap that bricks accounts.
+            if let rotated = bundle.refreshToken, rotated != stored {
+                try persist(id, rotated, stored)
+            }
+            return bundle
+        }
+        let pending = Pending(task: task, generation: generation[id, default: 0])
+        inFlight[id] = pending
+        return pending
+    }
+
+    private func complete(
+        _ id: UUID,
+        pending: Pending,
+        bundle: TokenBundle? = nil,
+        error: Error? = nil
+    ) {
+        // A refresh that belongs to a superseded generation — the account was
+        // signed out or signed in again while it was in the air — has no say.
+        guard pending.generation == generation[id, default: 0] else { return }
+        if let bundle { cache[id] = bundle }
+        if (error as? OAuthError)?.isCredentialRejected == true {
+            rejected.insert(id)
+            cache[id] = nil
+        }
+        if inFlight[id]?.task == pending.task { inFlight[id] = nil }
+    }
+
+    /// Never cancels a refresh in flight: cancelling one that has already had
+    /// its token rotated server-side would lose the replacement. The straggler
+    /// is orphaned instead, and its compare-and-swap persist keeps it from
+    /// standing on whatever replaced it.
     func forget(_ id: UUID) {
         cache[id] = nil
+        rejected.remove(id)
+        inFlight[id] = nil
+        generation[id, default: 0] += 1
     }
+
+    /// After an interactive sign-in: the account is live again.
+    func reset(_ id: UUID) { forget(id) }
+
+    func isRejected(_ id: UUID) -> Bool { rejected.contains(id) }
 }

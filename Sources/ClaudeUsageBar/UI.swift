@@ -252,6 +252,7 @@ struct AccountRow: View {
     let setNickname: (String) -> Void
     let moveUp: () -> Void
     let moveDown: () -> Void
+    let signIn: () -> Void
     let signOut: () -> Void
 
     @State private var editingLabel = false
@@ -261,11 +262,16 @@ struct AccountRow: View {
     @FocusState private var focus: Field?
 
     private var headroom: Double? { state?.snapshot?.headroom }
-    private var isUnreachable: Bool { state?.error != nil }
+    private var isUnreachable: Bool { state?.isUnreachable == true }
+    private var needsSignIn: Bool { state?.needsSignIn == true }
+    /// A rejected credential with nothing behind it has no numbers to show —
+    /// three rows of `0%  —` would only be noise around the one thing to do.
+    private var showsMetrics: Bool { !(needsSignIn && state?.snapshot == nil) }
 
     /// The failure replaces the verdict word rather than the numbers: the row
     /// still shows the last reading that arrived, and this says why it may be
-    /// old. That is the whole message — no sentence underneath it.
+    /// old. That is the whole message — no sentence underneath it. A dead
+    /// credential takes the same slot, as the action itself rather than a word.
     private var verdict: (text: String, color: Color) {
         if let error = state?.error { return (error, .orange) }
         guard state?.snapshot != nil else { return ("—", .secondary) }
@@ -298,10 +304,18 @@ struct AccountRow: View {
                             .onTapGesture(count: 2, perform: beginNameEdit)
                     }
                     Spacer(minLength: 6)
-                    Text(verdict.text)
-                        .font(.system(size: 11))
-                        .foregroundStyle(verdict.color)
-                        .lineLimit(1)
+                    if needsSignIn {
+                        Button("Sign In", action: signIn)
+                            .buttonStyle(PressableButtonStyle())
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.accentColor)
+                            .focusable(false)
+                    } else {
+                        Text(verdict.text)
+                            .font(.system(size: 11))
+                            .foregroundStyle(verdict.color)
+                            .lineLimit(1)
+                    }
                 }
 
                 Text(account.email)
@@ -310,31 +324,38 @@ struct AccountRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
 
-                VStack(alignment: .leading, spacing: 3) {
-                    MetricRow(
-                        title: "5-hour", bucket: state?.snapshot?.fiveHour,
-                        now: now, isUnreachable: isUnreachable
-                    )
-                    MetricRow(
-                        title: "Weekly", bucket: state?.snapshot?.weekly,
-                        now: now, isUnreachable: isUnreachable
-                    )
-                    MetricRow(
-                        title: "Fable", bucket: state?.snapshot?.fable,
-                        now: now, isUnreachable: isUnreachable
-                    )
+                if showsMetrics {
+                    VStack(alignment: .leading, spacing: 3) {
+                        MetricRow(
+                            title: "5-hour", bucket: state?.snapshot?.fiveHour,
+                            now: now, isUnreachable: isUnreachable
+                        )
+                        MetricRow(
+                            title: "Weekly", bucket: state?.snapshot?.weekly,
+                            now: now, isUnreachable: isUnreachable
+                        )
+                        MetricRow(
+                            title: "Fable", bucket: state?.snapshot?.fable,
+                            now: now, isUnreachable: isUnreachable
+                        )
+                    }
+                    .padding(.top, 5)
                 }
-                .padding(.top, 5)
             }
         }
         .padding(.horizontal, 14)
         // Asymmetric on purpose: the block starts with cap-height text and ends
         // with a descender's worth of slack, so equal padding would leave every
-        // divider hugging the metrics above it.
+        // divider hugging the metrics above it. A row with no metrics under it
+        // already ends on a text baseline, so it takes the balanced pair.
         .padding(.top, 11)
-        .padding(.bottom, 14)
+        .padding(.bottom, showsMetrics ? 14 : 12)
         .contentShape(Rectangle())
         .contextMenu {
+            if needsSignIn {
+                Button("Sign In Again…", action: signIn)
+                Divider()
+            }
             Button("Set Label…", action: beginLabelEdit)
             Button("Rename…", action: beginNameEdit)
             Divider()
@@ -490,6 +511,7 @@ struct PopoverView: View {
                             setNickname: { state.setNickname($0, for: account) },
                             moveUp: { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: -1) } },
                             moveDown: { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: 1) } },
+                            signIn: { state.signInAgain(account) },
                             signOut: { state.remove(account) }
                         )
                         .modifier(LiftEffect(isLifted: draggingID == account.id))
