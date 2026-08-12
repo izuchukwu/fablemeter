@@ -213,10 +213,11 @@ enum SelfTest {
         check("the dim is visible but clearly recessed",
               BarRenderer.blockedGlyphAlpha > 0.3 && BarRenderer.blockedGlyphAlpha < 0.5)
 
-        // The letter's colour says *which* limit is being measured, and nothing
-        // else. It is orthogonal to the dimming, which says whether the account
-        // can be used at all — so the two compose into a dimmed yellow rather
-        // than one overriding the other.
+        // The letter's colour says *which* limit is being measured, and it only
+        // has that to say while a limit is left: yellow points at the windows
+        // the gauge switched to, so an account with nothing in those windows
+        // either has no yellow to show — it goes back to the plain dimmed
+        // letter that every blocked account wears.
         // Resolved against a real appearance, because a dynamic colour says
         // nothing until it is — and the menu bar's own appearance follows the
         // desktop picture, so both cases happen on the same machine.
@@ -278,13 +279,9 @@ enum SelfTest {
         check("plain systemYellow would have vanished on a light menu bar",
               contrast(.systemYellow, alpha: 1, in: .aqua) < 1.5,
               String(format: "%.2f:1", contrast(NSColor.systemYellow, alpha: 1, in: .aqua)))
-        let dim = Double(BarRenderer.blockedGlyphAlpha)
-        check("a dimmed yellow letter is still visible on a dark menu bar",
-              contrast(yellowInk, alpha: dim, in: .darkAqua) >= 1.5,
-              String(format: "%.2f:1", contrast(yellowInk, alpha: dim, in: .darkAqua)))
-        check("…and on a light one",
-              contrast(yellowInk, alpha: dim, in: .aqua) >= 1.5,
-              String(format: "%.2f:1", contrast(yellowInk, alpha: dim, in: .aqua)))
+        // Full strength is the only legibility yellow has to hold, because the
+        // one state that would have dimmed it is the one state that no longer
+        // takes it — see the four-way rule below.
         // The letter's yellow and the gauge's orange are two different signals
         // sitting a couple of points apart, so they have to be two different
         // colours — in whichever appearance the menu bar happens to be in.
@@ -300,38 +297,99 @@ enum SelfTest {
               BarRenderer.warningColor(for: 20) == .systemOrange
               && BarRenderer.warningColor(for: 5) == .systemRed
               && BarRenderer.warningColor(for: 70) == nil)
-        check("colour and dimming compose rather than replace each other",
-              BarRenderer.glyphColor(colored: true, fableExhausted: true) === BarRenderer.fableYellow
-              && BarRenderer.glyphAlpha(headroom: 0) == BarRenderer.blockedGlyphAlpha
+        // The four-way rule the letter follows. Yellow is a *redirection* —
+        // "Fable is gone, the gauge is measuring what's left" — so it lasts
+        // exactly as long as there is something left to redirect to. Once the
+        // effective headroom is 0 the account is simply blocked, and blocked has
+        // one look: dimmed label ink, the same as it wore before yellow existed.
+        let dim = BarRenderer.blockedGlyphAlpha
+        func letterInk(_ headroom: Double?, fableExhausted: Bool) -> NSColor {
+            BarRenderer.glyphColor(
+                colored: true, fableExhausted: fableExhausted, headroom: headroom
+            )
+        }
+        func fableCellImage(_ headroom: Double?, exhausted: Bool) -> NSImage {
+            BarRenderer.image(for: [
+                BarCell(character: "E", headroom: headroom,
+                        isUnreachable: false, isFableExhausted: exhausted)
+            ])
+        }
+        check("Fable spent with room left is yellow, full strength",
+              letterInk(70, fableExhausted: true) === BarRenderer.fableYellow
               && BarRenderer.glyphAlpha(headroom: 70) == 1)
-        // A template image is flattened to the system's own tint, which would
-        // swallow the yellow whole — so a yellow letter has to force real
-        // colour exactly the way a warning level does.
+        check("Fable spent and fully blocked is label ink, dimmed — no yellow",
+              letterInk(0, fableExhausted: true) == .labelColor
+              && letterInk(0, fableExhausted: true) !== BarRenderer.fableYellow
+              && BarRenderer.glyphAlpha(headroom: 0) == dim,
+              "got \(letterInk(0, fableExhausted: true))")
+        check("blocked without Fable exhaustion is that same dimmed label ink",
+              letterInk(0, fableExhausted: false) == .labelColor
+              && letterInk(0, fableExhausted: false) == letterInk(0, fableExhausted: true)
+              && BarRenderer.glyphAlpha(headroom: 0) == dim)
+        check("everything else is label ink at full strength",
+              letterInk(70, fableExhausted: false) == .labelColor
+              && BarRenderer.glyphAlpha(headroom: 70) == 1)
+        check("the two blocked cases are indistinguishable in the cluster too",
+              fableCellImage(0, exhausted: true).tiffRepresentation
+              == fableCellImage(0, exhausted: false).tiffRepresentation)
+        // Driven through the snapshots that produce the numbers, because it is
+        // the *effective* headroom the rule turns on — the one the gauge draws
+        // and the popover's verdict already reads.
+        check("a spent Fable over a spent session takes the blocked letter",
+              spentAndBlocked.headroom == 0 && spentAndBlocked.isFableExhausted
+              && letterInk(spentAndBlocked.headroom, fableExhausted: true) == .labelColor)
+        check("…while the same spent Fable over a live session stays yellow",
+              fableSpent.headroom == 70
+              && letterInk(fableSpent.headroom, fableExhausted: true)
+              === BarRenderer.fableYellow)
+        // A reading that never arrived is not a blocked one. Nothing has said
+        // the remaining windows are spent, so the redirection still stands.
+        check("a spent Fable with no other reading at all keeps its yellow",
+              onlyFable.headroom == nil
+              && letterInk(onlyFable.headroom, fableExhausted: true) === BarRenderer.fableYellow)
+        // Template mode is the menu bar's own treatment — the system tints and
+        // inverts the image with everything else up there — so leaving it has to
+        // buy something. Real ink on the page buys it; a colour tier nothing is
+        // drawn in does not. So the test is exactly "is any colour laid down".
         let yellowCluster = [
             BarCell(character: "Y", headroom: 70, isUnreachable: false, isFableExhausted: true)
         ]
         let plainCluster = [BarCell(character: "Y", headroom: 70, isUnreachable: false)]
+        let blockedYellowCluster = [
+            BarCell(character: "B", headroom: 0, isUnreachable: false, isFableExhausted: true)
+        ]
+        let blockedCluster = [BarCell(character: "B", headroom: 0, isUnreachable: false)]
+        let warningCluster = [BarCell(character: "W", headroom: 8, isUnreachable: false)]
         check("a Fable-exhausted cell forces real colour",
               BarRenderer.forcesColor(yellowCluster)
               && BarRenderer.image(for: yellowCluster).isTemplate == false)
         check("…while an ordinary healthy cluster stays a template",
               !BarRenderer.forcesColor(plainCluster)
               && BarRenderer.image(for: plainCluster).isTemplate)
-        func fableCell(_ headroom: Double?, exhausted: Bool) -> NSImage {
-            BarRenderer.image(for: [
-                BarCell(character: "E", headroom: headroom,
-                        isUnreachable: false, isFableExhausted: exhausted)
-            ])
-        }
+        check("a fully blocked Fable-exhausted cluster goes back to a template",
+              !BarRenderer.forcesColor(blockedYellowCluster)
+              && BarRenderer.image(for: blockedYellowCluster).isTemplate)
+        check("…and so does a plain blocked one, whose red is never painted",
+              !BarRenderer.forcesColor(blockedCluster)
+              && BarRenderer.image(for: blockedCluster).isTemplate
+              && BarRenderer.levelColor(for: blockedCluster[0]) == nil
+              && BarRenderer.warningColor(for: 0) == .systemRed)
+        check("a painted warning level still forces colour",
+              BarRenderer.levelColor(for: warningCluster[0]) == .systemRed
+              && BarRenderer.forcesColor(warningCluster)
+              && BarRenderer.image(for: warningCluster).isTemplate == false)
+        // And one blocked account among live ones changes nothing about it: the
+        // cluster is coloured by its neighbour, and the blocked letter is the
+        // label ink that colouring makes available, still dimmed.
+        check("a blocked cell alongside a yellow one is still not yellow itself",
+              BarRenderer.forcesColor(blockedYellowCluster + yellowCluster)
+              && letterInk(0, fableExhausted: true) == .labelColor)
         check("a yellow letter draws differently from the same reading in white",
-              fableCell(70, exhausted: true).tiffRepresentation
-              != fableCell(70, exhausted: false).tiffRepresentation)
-        check("a dimmed yellow draws differently from a full-strength one",
-              fableCell(0, exhausted: true).tiffRepresentation
-              != fableCell(70, exhausted: true).tiffRepresentation)
-        check("…and from a dimmed white one",
-              fableCell(0, exhausted: true).tiffRepresentation
-              != fableCell(0, exhausted: false).tiffRepresentation)
+              fableCellImage(70, exhausted: true).tiffRepresentation
+              != fableCellImage(70, exhausted: false).tiffRepresentation)
+        check("a blocked letter draws differently from a full-strength yellow",
+              fableCellImage(0, exhausted: true).tiffRepresentation
+              != fableCellImage(70, exhausted: true).tiffRepresentation)
         // The status item only redraws when the cluster changes, so the flip in
         // and out of exhaustion has to be part of what "changed" means.
         check("flipping to Fable-exhausted changes the cell",
@@ -1180,7 +1238,8 @@ enum RenderStates {
             // Fable spent: the letter goes yellow and the gauge measures what is
             // left of the session and the week…
             BarCell(character: "Y", headroom: 70, isUnreachable: false, isFableExhausted: true),
-            // …and dims on top of that when the account is out of those too.
+            // …and gives the yellow back once there is nothing left to point at,
+            // because then it is just another blocked account.
             BarCell(character: "B", headroom: 0, isUnreachable: false, isFableExhausted: true)
         ]
         let url = URL(fileURLWithPath: directory, isDirectory: true)

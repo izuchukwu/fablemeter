@@ -78,12 +78,41 @@ enum BarRenderer {
         return nil
     }
 
-    /// Whether anything in the cluster is drawn in a real colour — a warning
-    /// level, or a letter measuring the non-Fable windows. That is what takes
-    /// the whole image out of template mode, because a template image is
-    /// flattened to the system's own tint and would swallow both.
+    /// The warning colour **as actually painted** — `nil` when the level is
+    /// monochrome, and equally when there is no level to paint at all. A blocked
+    /// account is red by tier and empty by fill, and an empty gauge inks nothing:
+    /// asking for the colour of a bar that isn't drawn is what used to take a
+    /// whole cluster out of template mode for no visible colour.
+    static func levelColor(for cell: BarCell) -> NSColor? {
+        guard fillHeight(headroom: cell.headroom ?? 0) > 0 else { return nil }
+        return warningColor(for: cell.headroom)
+    }
+
+    /// Whether the letter is yellow: Fable is spent **and there is somewhere
+    /// else to go**. Yellow is a redirection, not an alarm — it says the gauge
+    /// beside it has stopped counting Fable and is measuring what remains. Once
+    /// nothing remains there is no redirection left to offer, so a fully blocked
+    /// account drops back to the ordinary blocked treatment: dimmed label ink,
+    /// exactly as it read before yellow existed.
+    static func showsFableYellow(headroom: Double?, fableExhausted: Bool) -> Bool {
+        guard fableExhausted else { return false }
+        guard let headroom else { return true }
+        return headroom > 0
+    }
+
+    /// Whether anything in the cluster is drawn in a real colour — a painted
+    /// warning level, or a yellow letter. That is what takes the whole image out
+    /// of template mode, because a template image is flattened to the system's
+    /// own tint and would swallow both. Nothing else earns it: an image that
+    /// leaves template mode stops inverting with the menu bar, so the test is
+    /// ink that is actually laid down, not a tier that happens to be reached.
     static func forcesColor(_ cells: [BarCell]) -> Bool {
-        cells.contains { warningColor(for: $0.headroom) != nil || $0.isFableExhausted }
+        cells.contains { cell in
+            levelColor(for: cell) != nil
+                || showsFableYellow(
+                    headroom: cell.headroom, fableExhausted: cell.isFableExhausted
+                )
+        }
     }
 
     /// The ink everything that isn't coloured is drawn in — the track, and every
@@ -99,12 +128,13 @@ enum BarRenderer {
     ///
     /// `systemYellow` is a *fill* colour, and it only works against a dark menu
     /// bar. Measured against the bar itself, an 8pt glyph drawn in it reaches
-    /// 11.7:1 on a dark bar but **1.3:1 on a light one** — and 1.1:1 once the
-    /// blocked dim is applied, which is not a signal, it is a smudge. So the ink
-    /// resolves against the appearance exactly the way every other letter does,
-    /// black on light and white on dark: `systemYellow` on a dark bar, and a
-    /// darker yellow of the same hue on a light one, which measures 4.1:1 (1.6:1
-    /// dimmed) instead. Both are far from the gauge's orange either way.
+    /// 11.7:1 on a dark bar but **1.3:1 on a light one**, which is not a signal,
+    /// it is a smudge. So the ink resolves against the appearance exactly the
+    /// way every other letter does, black on light and white on dark:
+    /// `systemYellow` on a dark bar, and a darker yellow of the same hue on a
+    /// light one, which measures 4.1:1 instead. Both are far from the gauge's
+    /// orange either way. Yellow is always drawn at full strength — the one
+    /// state that would have dimmed it is the one state that no longer uses it.
     static let fableYellow = NSColor(name: "fableYellow") { appearance in
         appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
             ? .systemYellow
@@ -113,11 +143,23 @@ enum BarRenderer {
 
     /// Characters never carry the *warning* colour — the letters stay uniform
     /// and only the gauge level goes orange/red. The one thing a letter does say
-    /// in colour is which limit its gauge is measuring: yellow once Fable is
-    /// exhausted and the gauge has dropped it from the minimum, ordinary label
-    /// ink while every window still counts.
-    static func glyphColor(colored: Bool, fableExhausted: Bool = false) -> NSColor {
-        fableExhausted ? fableYellow : neutralColor(colored: colored)
+    /// in colour is which limit its gauge is measuring, and it only has that to
+    /// say while there is a limit left worth measuring:
+    ///
+    ///   Fable spent, room elsewhere  → yellow, full strength
+    ///   Fable spent, nothing left    → label ink, dimmed  (blocked)
+    ///   Fable fine, nothing left     → label ink, dimmed  (blocked)
+    ///   otherwise                    → label ink, full strength
+    ///
+    /// So yellow and the blocked dim never meet. They used to compose into a
+    /// dimmed yellow, which said "go use another model" about an account that
+    /// has no other model to go to — the dim is the whole story there.
+    static func glyphColor(
+        colored: Bool, fableExhausted: Bool = false, headroom: Double? = nil
+    ) -> NSColor {
+        showsFableYellow(headroom: headroom, fableExhausted: fableExhausted)
+            ? fableYellow
+            : neutralColor(colored: colored)
     }
 
     /// …but a letter does dim when its account is out, which is the one thing
@@ -165,7 +207,7 @@ enum BarRenderer {
                 for (index, cell) in cells.enumerated() {
                     // Like the battery icon: the track and the character stay
                     // monochrome, only the level goes orange/red.
-                    let level: NSColor = warningColor(for: cell.headroom) ?? neutral
+                    let level: NSColor = levelColor(for: cell) ?? neutral
 
                     let cellX = outerPadding + CGFloat(index) * (cellWidth + cellSpacing)
                     let barRect = NSRect(
@@ -212,12 +254,15 @@ enum BarRenderer {
                         NSGraphicsContext.restoreGraphicsState()
                     }
 
-                    // Colour and dimming are separate signals and compose: the
-                    // colour says which limit the gauge is measuring, the alpha
-                    // says whether the account can be used at all. A blocked,
-                    // Fable-exhausted account is therefore a dimmed yellow.
+                    // Colour says which limit the gauge is measuring; the alpha
+                    // says whether the account can be used at all — and the
+                    // second answer can retire the first. A blocked account has
+                    // no limit left to point at, so it takes the plain dimmed
+                    // letter whether or not its Fable week is gone.
                     let glyphInk = glyphColor(
-                        colored: colored, fableExhausted: cell.isFableExhausted
+                        colored: colored,
+                        fableExhausted: cell.isFableExhausted,
+                        headroom: cell.headroom
                     )
                     let glyph = String(cell.character) as NSString
                     let attributes: [NSAttributedString.Key: Any] = [
@@ -282,6 +327,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     private let popover = NSPopover()
     private var cancellable: AnyCancellable?
     private var renderedCells: [BarCell]?
+    /// Live only while the popover is open. See `installOutsideClickMonitor`.
+    private var outsideClickMonitor: Any?
 
     init(state: AppState) {
         self.state = state
@@ -305,6 +352,15 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         cancellable = state.objectWillChange.sink { [weak self] _ in
             // objectWillChange fires *before* the mutation lands.
             Task { @MainActor in self?.redraw() }
+        }
+        // Switching to another application — ⌘-tab, clicking its window, the
+        // browser the sign-in opens — takes the popover with it. `.transient`
+        // already does this one; keeping it explicit costs nothing and makes
+        // the rule the code states the same rule it relies on.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.closeIfShown() }
         }
         redraw(force: true)
     }
@@ -343,5 +399,56 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+        installOutsideClickMonitor()
+    }
+
+    /// Closes the popover on the first click that lands anywhere outside this
+    /// process, which is the half of "clicking away" that `.transient` misses.
+    ///
+    /// `.transient` is documented as closing when the user interacts with
+    /// anything outside the popover, but what it actually watches is focus:
+    /// the app resigning active, or the popover's window resigning key. For a
+    /// menu bar app there is a whole class of click that does neither —
+    /// **clicking the desktop**, its widgets, or the wallpaper simply activates
+    /// nothing. Traced with a build that logged every notification: a click on
+    /// another app's window produced `resignKey` + `resignActive` and the
+    /// popover closed; a click on the desktop produced *neither*, and the
+    /// popover stayed up with the app still active. So the missing dismissal is
+    /// not a focus change at all, and nothing that listens for one can fix it.
+    ///
+    /// A global monitor sees exactly the right events and no others, and that
+    /// is what keeps the status item's own toggle intact: the button lives in
+    /// this process, so clicking it is a *local* event this handler never sees.
+    /// Nothing here can therefore race the button's action into the
+    /// close-then-reopen flicker — the button remains the only thing that
+    /// closes the popover when you click the thing that opened it. Clicks
+    /// inside the popover, in its context menus, and in the label field are
+    /// local for the same reason, and so is the sign-in flow's own UI; the
+    /// browser it opens belongs to another process, which closes the popover on
+    /// purpose while the sign-in — a task on the app state, not on the view —
+    /// carries on regardless.
+    private func installOutsideClickMonitor() {
+        guard outsideClickMonitor == nil else { return }
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.closeIfShown() }
+        }
+    }
+
+    private func removeOutsideClickMonitor() {
+        if let monitor = outsideClickMonitor { NSEvent.removeMonitor(monitor) }
+        outsideClickMonitor = nil
+    }
+
+    private func closeIfShown() {
+        guard popover.isShown else { return }
+        popover.performClose(nil)
+    }
+
+    /// However the popover went away — this, `.transient`, Escape — the monitor
+    /// goes with it. It is the one thing here that costs anything while idle.
+    func popoverDidClose(_ notification: Notification) {
+        removeOutsideClickMonitor()
     }
 }
