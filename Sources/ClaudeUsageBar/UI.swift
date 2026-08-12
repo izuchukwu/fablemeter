@@ -252,6 +252,9 @@ struct AccountRow: View {
     let setNickname: (String) -> Void
     let moveUp: () -> Void
     let moveDown: () -> Void
+    /// A sign-in is already in the air. Only one can be, so the item says so by
+    /// dimming rather than by accepting a click it would silently drop.
+    let isSigningIn: Bool
     let signIn: () -> Void
     let signOut: () -> Void
 
@@ -310,6 +313,7 @@ struct AccountRow: View {
                             .font(.system(size: 11))
                             .foregroundStyle(Color.accentColor)
                             .focusable(false)
+                            .disabled(isSigningIn)
                     } else {
                         Text(verdict.text)
                             .font(.system(size: 11))
@@ -352,7 +356,7 @@ struct AccountRow: View {
         .padding(.bottom, showsMetrics ? 14 : 12)
         .contentShape(Rectangle())
         .contextMenu {
-            Button("Reconnect Account…", action: signIn)
+            Button("Reconnect Account…", action: signIn).disabled(isSigningIn)
             Divider()
             Button("Set Label…", action: beginLabelEdit)
             Button("Rename…", action: beginNameEdit)
@@ -509,6 +513,7 @@ struct PopoverView: View {
                             setNickname: { state.setNickname($0, for: account) },
                             moveUp: { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: -1) } },
                             moveDown: { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: 1) } },
+                            isSigningIn: state.isSigningIn,
                             signIn: { state.signInAgain(account) },
                             signOut: { state.remove(account) }
                         )

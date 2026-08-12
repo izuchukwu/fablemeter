@@ -18,6 +18,11 @@ if let index = CommandLine.arguments.firstIndex(of: "--render-popover") {
     exit(MainActor.assumeIsolated { RenderPopover.run(into: directory) })
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--callback-loop") {
+    let rest = CommandLine.arguments.dropFirst(index + 1).compactMap(Int.init)
+    exit(CallbackLoop.run(cycles: rest.first ?? 3, delayMilliseconds: rest.dropFirst().first ?? 0))
+}
+
 if arguments.contains("--probe") {
     let semaphore = DispatchSemaphore(value: 0)
     var status: Int32 = 1

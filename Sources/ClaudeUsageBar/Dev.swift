@@ -729,6 +729,16 @@ enum SelfTest {
               == BarCell(character: "I", headroom: rejectedState.snapshot?.headroom,
                          isUnreachable: rejectedState.isUnreachable))
 
+        // MARK: Sign-in loopback
+        //
+        // Reconnecting a second account without quitting first. The listener is
+        // the only piece of the sign-in that can be exercised without a browser
+        // — and it was the piece that broke: an abandoned flow parked forever on
+        // a continuation that ignored cancellation, so `signIn` never returned,
+        // never released port 8317, and never cleared "Signing in…". Every later
+        // reconnect was then a silent no-op until the app was relaunched.
+        CallbackLoop.audit(cycles: 3, delayMilliseconds: 0, check: check)
+
         print(failures == 0 ? "\nselftest: all checks passed" : "\nselftest: \(failures) failure(s)")
         return failures == 0 ? 0 : 1
     }
@@ -991,5 +1001,148 @@ enum Probe {
               let token = oauth["accessToken"] as? String, !token.isEmpty
         else { return nil }
         return token
+    }
+}
+
+// MARK: - Callback loop
+
+/// Exercises the loopback half of the sign-in flow, repeatedly, in one process
+/// — everything `OAuth.signIn` does with the listener, minus the browser and
+/// the credentials. The point is what a *single* run can never show: whether a
+/// finished flow, or an abandoned one, leaves anything behind that the next
+/// reconnect trips over.
+enum CallbackLoop {
+    /// One listen → redirect → resolve → stop cycle, structured exactly the way
+    /// `OAuth.signIn` structures it. `deliver: false` abandons the flow, which
+    /// is what a closed tab or a browser the user walks away from looks like.
+    @discardableResult
+    static func cycle(
+        nonce: String, timeout: TimeInterval = 3, deliver: Bool = true
+    ) async throws -> UInt16 {
+        try await LoopbackCallback.withServer(ports: Constants.callbackPorts) { server in
+            let url = URL(string: "http://127.0.0.1:\(server.port)/callback?code=\(nonce)&state=\(nonce)")!
+            let hit = Task.detached {
+                guard deliver else { return }
+                var request = URLRequest(url: url)
+                request.timeoutInterval = timeout
+                _ = try? await URLSession.shared.data(for: request)
+            }
+            defer { hit.cancel() }
+
+            let params = try await OAuth.firstOf(timeout: timeout) {
+                try await server.awaitCallback()
+            }
+            guard params["code"] == nonce else { throw OAuthError.stateMismatch }
+            return server.port
+        }
+    }
+
+    /// Runs `body` on its own task and refuses to wait forever for it — the
+    /// harness cannot use a task group here, because a task group is the very
+    /// thing being tested for hanging.
+    private static func bounded(
+        seconds: Double, _ body: @escaping @Sendable () async -> String
+    ) -> String? {
+        final class Box: @unchecked Sendable { var value: String? }
+        let box = Box()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached { box.value = await body(); semaphore.signal() }
+        guard semaphore.wait(timeout: .now() + seconds) == .success else { return nil }
+        return box.value
+    }
+
+    private static func outcome(_ error: Error?) -> String {
+        guard let error else { return "resolved" }
+        return (error as? OAuthError)?.displayText ?? "\(error)"
+    }
+
+    static func run(cycles: Int, delayMilliseconds: Int) -> Int32 {
+        var failures = 0
+        audit(cycles: cycles, delayMilliseconds: delayMilliseconds) { name, ok, detail in
+            print("\(ok ? "PASS" : "FAIL")  \(name)\(detail.isEmpty ? "" : "  \(detail)")")
+            if !ok { failures += 1 }
+        }
+        print(failures == 0 ? "\ncallback-loop: all checks passed" : "\ncallback-loop: \(failures) failure(s)")
+        return failures == 0 ? 0 : 1
+    }
+
+    /// Synchronous, so `--selftest` — a command-line pass with no run loop —
+    /// can run exactly the same checks as `--callback-loop`.
+    static func audit(
+        cycles: Int, delayMilliseconds: Int, check: (String, Bool, String) -> Void
+    ) {
+        // 1. Back-to-back reconnects.
+        for i in 1...cycles {
+            if i > 1, delayMilliseconds > 0 { usleep(UInt32(delayMilliseconds) * 1000) }
+            let started = Date()
+            let result = bounded(seconds: 12) {
+                do { return "port \(try await cycle(nonce: "n\(i)"))" }
+                catch { return outcome(error) }
+            }
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
+            check("cycle \(i) delivers its callback",
+                  result?.hasPrefix("port") == true, "\(result ?? "HUNG") \(ms)ms")
+        }
+
+        // 2. An abandoned flow — no callback ever arrives. It has to give up at
+        // the timeout and hand back an error. Hanging here is not a slow
+        // sign-in: it is a sign-in that never ends, holding the port and the
+        // "signing in" flag until the app is relaunched.
+        let started = Date()
+        let abandoned = bounded(seconds: 12) {
+            do { _ = try await cycle(nonce: "abandoned", deliver: false); return "resolved" }
+            catch { return outcome(error) }
+        }
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+        check("an abandoned sign-in times out instead of hanging",
+              abandoned == "sign-in timed out", "\(abandoned ?? "HUNG") \(ms)ms")
+
+        // 3. …and having abandoned one, the next reconnect still works. This is
+        // the user-visible bug: the second reconnect in a session.
+        let after = bounded(seconds: 12) {
+            do { return "port \(try await cycle(nonce: "after"))" }
+            catch { return outcome(error) }
+        }
+        check("a reconnect after an abandoned one still works",
+              after == "port \(Constants.callbackPorts[0])", after ?? "HUNG")
+
+        // 4. A listener left running cannot swallow the next flow's callback.
+        let stranded = bounded(seconds: 12) {
+            guard (try? await LoopbackCallback.start(ports: Constants.callbackPorts)) != nil
+            else { return "no port" }
+            do { return "port \(try await cycle(nonce: "beside"))" }
+            catch { return outcome(error) }
+        }
+        check("a still-running listener cannot swallow the next callback",
+              stranded == "port \(Constants.callbackPorts[0])", stranded ?? "HUNG")
+
+        // 5. A browser opens more sockets than it sends requests on (preconnect,
+        // Happy Eyeballs). An accepted connection nobody closed keeps the port
+        // alive after the listener is cancelled, and the next flow then binds a
+        // port the authorize request was never told about.
+        let idle = bounded(seconds: 12) {
+            guard let first = try? await LoopbackCallback.start(ports: Constants.callbackPorts)
+            else { return "no port" }
+            let socketHandle = socket(AF_INET, SOCK_STREAM, 0)
+            var address = sockaddr_in()
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = first.port.bigEndian
+            address.sin_addr.s_addr = inet_addr("127.0.0.1")
+            _ = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    connect(socketHandle, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            await first.stop()
+            defer { close(socketHandle) }
+            guard let next = try? await LoopbackCallback.start(ports: Constants.callbackPorts)
+            else { return "no port" }
+            let port = next.port
+            await next.stop()
+            return "port \(port)"
+        }
+        check("an idle browser socket does not cost the next flow its port",
+              idle == "port \(Constants.callbackPorts[0])", idle ?? "HUNG")
     }
 }

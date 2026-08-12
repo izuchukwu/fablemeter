@@ -74,7 +74,8 @@ signature and macOS would prompt for Keychain access on each launch.
 
 | Flag | What it does |
 | --- | --- |
-| `--selftest` | Decodes an embedded usage fixture, walks the polling and backoff schedules, and exercises token rotation — single-flight refresh, persist-before-return, and the terminal `needs sign-in` state — with no network. |
+| `--selftest` | Decodes an embedded usage fixture, walks the polling and backoff schedules, and exercises token rotation — single-flight refresh, persist-before-return, and the terminal `needs sign-in` state — with no network. Also runs the callback-loop checks below, so consecutive reconnects stay covered. |
+| `--callback-loop [cycles] [delayMs]` | Runs the sign-in's loopback listener over and over in one process — bind, receive the redirect, tear down — plus an abandoned flow that never gets a redirect. No browser, no credentials. This is the second reconnect in a session, on its own. |
 | `--probe` | Reads Claude Code's existing access token read-only and prints live parsed buckets. Never writes or refreshes it. |
 | `--demo` | Four fake in-memory accounts, for looking at the drawing: blocked, rate limited, healthy, and one whose credential the server has rejected. |
 | `--render-popover <dir>` | Writes the popover itself in both appearances, without a menu bar or a click. |

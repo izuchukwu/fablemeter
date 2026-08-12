@@ -2,6 +2,7 @@ import AppKit
 import CryptoKit
 import Foundation
 import Network
+import os
 
 enum Constants {
     static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -107,14 +108,36 @@ enum PKCE {
 // MARK: - Loopback callback server
 
 /// Single-shot HTTP listener on 127.0.0.1 that captures the OAuth redirect.
+///
+/// Two rules hold it together, and both exist because breaking them stranded a
+/// sign-in for the rest of the app's life:
+///
+///   1. **Teardown is awaited, never assumed.** `NWListener.cancel()` is
+///      asynchronous, and the endpoint is deliberately reusable, so a listener
+///      that has merely been *asked* to stop can still be bound — and can still
+///      accept the redirect meant for the flow that replaced it. `stop()` does
+///      not return until the socket is actually gone.
+///   2. **One listener at a time, process-wide.** `start` retires whatever came
+///      before it, so the situation in rule 1 cannot arise in the first place;
+///      and a listener that is no longer the current one refuses to answer a
+///      callback at all, which is the belt to that braces.
 final class LoopbackCallback: @unchecked Sendable {
+    /// The listener the live flow owns. Unfair-lock rather than an actor so it
+    /// can be read from `NWListener`'s own queue without hopping.
+    private static let current = OSAllocatedUnfairLock<LoopbackCallback?>(initialState: nil)
+
     let port: UInt16
     private let listener: NWListener
     private let queue = DispatchQueue(label: "com.izu.claudeusagebar.callback")
     private var readyCont: CheckedContinuation<Void, Error>?
     private var resultCont: CheckedContinuation<[String: String], Error>?
+    /// Everyone waiting for the socket to actually be gone.
+    private var cancelConts: [CheckedContinuation<Void, Never>] = []
+    /// Accepted connections, so none of them outlives the listener.
+    private var connections: [NWConnection] = []
     private var settled = false
     private var stopped = false
+    private var cancelled = false
 
     private init(port: UInt16) throws {
         self.port = port
@@ -128,22 +151,63 @@ final class LoopbackCallback: @unchecked Sendable {
         self.listener = try NWListener(using: params)
     }
 
+    /// Runs `body` with a listener that is guaranteed to be torn down before
+    /// this returns — on the happy path, on a throw, and on cancellation alike.
+    /// `defer` cannot await, and "cancel and hope" is exactly what left a socket
+    /// holding 8317 for the rest of the session.
+    static func withServer<T>(
+        ports: [UInt16], _ body: (LoopbackCallback) async throws -> T
+    ) async throws -> T {
+        let server = try await start(ports: ports)
+        do {
+            let value = try await body(server)
+            await server.stop()
+            return value
+        } catch {
+            await server.stop()
+            throw error
+        }
+    }
+
     static func start(ports: [UInt16]) async throws -> LoopbackCallback {
+        // Whatever the last flow was doing, it is over. Waiting for its socket
+        // here is what lets this one bind the port it advertised last time,
+        // rather than sliding down the ladder to one the authorize request was
+        // never told about.
+        await retireActive()
         for p in ports {
             guard let candidate = try? LoopbackCallback(port: p) else { continue }
             do {
                 try await candidate.waitUntilReady()
+                candidate.becomeActive()
                 return candidate
             } catch {
-                candidate.stop()
+                await candidate.stop()
             }
         }
         throw OAuthError.noPort
     }
 
+    private static func retireActive() async {
+        await current.withLock { $0 }?.stop()
+    }
+
+    private func becomeActive() {
+        Self.current.withLock { $0 = self }
+    }
+
+    /// A listener the current flow does not own has no business answering for
+    /// it, however it came to still be bound.
+    private var isCurrent: Bool {
+        Self.current.withLock { $0 === self }
+    }
+
     private func waitUntilReady() async throws {
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             queue.async {
+                // Stopped before it ever started: resume here or this waits for
+                // a state change that is never coming.
+                if self.stopped { c.resume(throwing: OAuthError.noPort); return }
                 self.readyCont = c
                 self.listener.stateUpdateHandler = { [weak self] state in
                     guard let self else { return }
@@ -167,31 +231,77 @@ final class LoopbackCallback: @unchecked Sendable {
     }
 
     /// Resolves with the query parameters of the first `/callback` request.
+    ///
+    /// **Cancellable, and it has to be.** A plain `withCheckedContinuation`
+    /// ignores cancellation, so a caller racing this against a deadline could
+    /// win the race and still never finish: a task group waits for every child
+    /// on the way out, and a child parked here forever never lets it out. That
+    /// is what turned a timed-out sign-in into a permanently wedged app.
     func awaitCallback() async throws -> [String: String] {
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<[String: String], Error>) in
-            queue.async {
-                if self.settled { c.resume(throwing: OAuthError.timedOut); return }
-                self.resultCont = c
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<[String: String], Error>) in
+                queue.async {
+                    if self.settled { c.resume(throwing: OAuthError.timedOut); return }
+                    self.resultCont = c
+                }
             }
-        }
-    }
-
-    func stop() {
-        queue.async {
-            guard !self.stopped else { return }
-            self.stopped = true
-            self.listener.stateUpdateHandler = nil
-            self.listener.newConnectionHandler = nil
-            self.listener.cancel()
-            if !self.settled {
+        } onCancel: {
+            queue.async {
+                guard !self.settled else { return }
                 self.settled = true
-                self.resultCont?.resume(throwing: OAuthError.timedOut)
+                self.resultCont?.resume(throwing: CancellationError())
                 self.resultCont = nil
             }
         }
     }
 
+    /// Returns only once the socket is genuinely released, so the next flow can
+    /// count on the port rather than race it. Bounded, because teardown must not
+    /// become its own way to hang a sign-in.
+    func stop() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            queue.async {
+                if self.cancelled { c.resume(); return }
+                self.cancelConts.append(c)
+                guard !self.stopped else { return }
+                self.stopped = true
+
+                Self.current.withLock { if $0 === self { $0 = nil } }
+
+                self.listener.newConnectionHandler = nil
+                self.listener.stateUpdateHandler = { [weak self] state in
+                    guard let self, case .cancelled = state else { return }
+                    self.finishCancel()
+                }
+                // An accepted connection outliving its listener keeps the port
+                // alive just as effectively as the listener would.
+                for conn in self.connections { conn.cancel() }
+                self.connections.removeAll()
+                self.listener.cancel()
+
+                self.readyCont?.resume(throwing: OAuthError.noPort)
+                self.readyCont = nil
+                if !self.settled {
+                    self.settled = true
+                    self.resultCont?.resume(throwing: OAuthError.timedOut)
+                    self.resultCont = nil
+                }
+                self.queue.asyncAfter(deadline: .now() + 2) { self.finishCancel() }
+            }
+        }
+    }
+
+    /// Always on `queue`.
+    private func finishCancel() {
+        guard !cancelled else { return }
+        cancelled = true
+        let waiting = cancelConts
+        cancelConts.removeAll()
+        for c in waiting { c.resume() }
+    }
+
     private func handle(_ conn: NWConnection) {
+        connections.append(conn)
         conn.start(queue: queue)
         var buffer = Data()
         func receive() {
@@ -209,10 +319,19 @@ final class LoopbackCallback: @unchecked Sendable {
         receive()
     }
 
+    /// Always on `queue`.
+    private func forget(_ conn: NWConnection) {
+        connections.removeAll { $0 === conn }
+        conn.cancel()
+    }
+
     private func respond(_ conn: NWConnection, requestHead: String) {
         let line = requestHead.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? ""
         let target = line.split(separator: " ").dropFirst().first.map(String.init) ?? ""
-        let isCallback = target.hasPrefix("/callback")
+        // A listener from a finished flow may briefly still be bound, and the
+        // kernel is free to hand it a connection. It answers as a stranger
+        // rather than claiming a sign-in it cannot deliver to anyone.
+        let isCallback = target.hasPrefix("/callback") && isCurrent
 
         let body = isCallback
             ? "<!doctype html><meta charset=utf-8><title>Signed in</title><body style=\"font:15px -apple-system,sans-serif;display:grid;place-items:center;height:100vh;margin:0\">Signed in — you can close this tab.</body>"
@@ -220,8 +339,9 @@ final class LoopbackCallback: @unchecked Sendable {
         let status = isCallback ? "200 OK" : "404 Not Found"
         let response = "HTTP/1.1 \(status)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
 
-        conn.send(content: Data(response.utf8), completion: .contentProcessed { _ in
-            conn.cancel()
+        conn.send(content: Data(response.utf8), completion: .contentProcessed { [weak self] _ in
+            guard let self else { conn.cancel(); return }
+            self.queue.async { self.forget(conn) }
         })
 
         guard isCallback, !settled else { return }
@@ -245,6 +365,24 @@ struct TokenBundle {
 }
 
 enum OAuth {
+    /// Runs `body` against a deadline, and — the part that matters — gets out
+    /// either way. A task group awaits every child as it unwinds, so the loser
+    /// of the race has to be genuinely cancellable; `LoopbackCallback` is.
+    static func firstOf<T: Sendable>(
+        timeout: TimeInterval, _ body: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await body() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw OAuthError.timedOut
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else { throw OAuthError.timedOut }
+            return first
+        }
+    }
+
     /// Full interactive PKCE sign-in. Returns the account email and a refresh token.
     ///
     /// - Parameter persistRefreshToken: called the instant the token exists and
@@ -259,33 +397,30 @@ enum OAuth {
         let challenge = PKCE.challenge(for: verifier)
         let state = PKCE.randomBase64URL(bytes: 32)
 
-        let server = try await LoopbackCallback.start(ports: Constants.callbackPorts)
-        defer { server.stop() }
-
-        let redirectURI = "http://localhost:\(server.port)/callback"
-        var comps = URLComponents(string: Constants.authorizeURL)!
-        comps.queryItems = [
-            URLQueryItem(name: "code", value: "true"),
-            URLQueryItem(name: "client_id", value: Constants.clientID),
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "redirect_uri", value: redirectURI),
-            URLQueryItem(name: "scope", value: Constants.scope),
-            URLQueryItem(name: "code_challenge", value: challenge),
-            URLQueryItem(name: "code_challenge_method", value: "S256"),
-            URLQueryItem(name: "state", value: state)
-        ]
-        guard let authURL = comps.url else { throw OAuthError.malformed }
-        NSWorkspace.shared.open(authURL)
-
-        let params = try await withThrowingTaskGroup(of: [String: String].self) { group in
-            group.addTask { try await server.awaitCallback() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(Constants.signInTimeout * 1_000_000_000))
-                throw OAuthError.timedOut
+        // The listener is torn down before this returns, whatever happens
+        // inside — including a timeout. An abandoned sign-in that keeps its
+        // socket is a sign-in every later one has to work around.
+        let (redirectURI, params) = try await LoopbackCallback.withServer(
+            ports: Constants.callbackPorts
+        ) { server -> (String, [String: String]) in
+            let redirectURI = "http://localhost:\(server.port)/callback"
+            var comps = URLComponents(string: Constants.authorizeURL)!
+            comps.queryItems = [
+                URLQueryItem(name: "code", value: "true"),
+                URLQueryItem(name: "client_id", value: Constants.clientID),
+                URLQueryItem(name: "response_type", value: "code"),
+                URLQueryItem(name: "redirect_uri", value: redirectURI),
+                URLQueryItem(name: "scope", value: Constants.scope),
+                URLQueryItem(name: "code_challenge", value: challenge),
+                URLQueryItem(name: "code_challenge_method", value: "S256"),
+                URLQueryItem(name: "state", value: state)
+            ]
+            guard let authURL = comps.url else { throw OAuthError.malformed }
+            NSWorkspace.shared.open(authURL)
+            let params = try await firstOf(timeout: Constants.signInTimeout) {
+                try await server.awaitCallback()
             }
-            defer { group.cancelAll() }
-            guard let first = try await group.next() else { throw OAuthError.timedOut }
-            return first
+            return (redirectURI, params)
         }
 
         if let err = params["error"] {
