@@ -16,9 +16,11 @@ struct BarCell: Equatable {
 enum BarRenderer {
     static let barWidth: CGFloat = 3.5
     static let barHeight: CGFloat = 11
-    static let cellWidth: CGFloat = 11
-    static let cellSpacing: CGFloat = 5
-    static let outerPadding: CGFloat = 3
+    /// Just wide enough for the glyph; the cells read as one cluster, not as
+    /// three separate menu bar items.
+    static let cellWidth: CGFloat = 9
+    static let cellSpacing: CGFloat = 3
+    static let outerPadding: CGFloat = 2.5
     static let gap: CGFloat = 1.5
     static let fontSize: CGFloat = 8
     static let imageHeight: CGFloat = 22

@@ -4,7 +4,46 @@ import SwiftUI
 // MARK: - Formatting
 
 enum Format {
-    /// Compact countdown: `3d 04h`, `1h 08m`, `12m`, `now`.
+    /// When a limit comes back, as a wall clock reading rather than a countdown:
+    /// `5:03 PM` today, `Tue 4 PM` (nearest hour) on a later day. The 12/24-hour
+    /// choice follows the user's locale via the `j` template symbol.
+    static func resetStamp(
+        _ date: Date?,
+        from now: Date = Date(),
+        locale: Locale = .current,
+        timeZone: TimeZone = .current
+    ) -> String {
+        guard let date else { return "—" }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = locale
+        calendar.timeZone = timeZone
+
+        let today = calendar.isDate(date, inSameDayAs: now)
+        // A later day only needs the hour, so round to the nearest one — a
+        // "Tue 3:57 PM" is false precision for something a week out.
+        let subject = today
+            ? date
+            : Date(timeIntervalSinceReferenceDate:
+                (date.timeIntervalSinceReferenceDate / 3600).rounded() * 3600)
+
+        let template = today ? "jmm" : "Ej"
+        var pattern = DateFormatter.dateFormat(fromTemplate: template, options: 0, locale: locale)
+            ?? (today ? "h:mm a" : "ccc h a")
+        if !today {
+            // `Ej` comes back as "ccc, h a"; the comma is noise in a narrow
+            // column. Drop it but keep the locale's own ordering.
+            pattern = pattern.replacingOccurrences(of: ",", with: "")
+                .replacingOccurrences(of: "  ", with: " ")
+        }
+        let formatter = DateFormatter()
+        formatter.locale = locale
+        formatter.timeZone = timeZone
+        formatter.dateFormat = pattern
+        return formatter.string(from: subject)
+    }
+
+    /// Compact countdown: `3d 04h`, `1h 08m`, `12m`, `now`. Only `--probe`
+    /// prints this now; the popover shows the reset stamp instead.
     static func countdown(to date: Date?, from now: Date = Date()) -> String {
         guard let date else { return "—" }
         let seconds = Int(date.timeIntervalSince(now).rounded())
@@ -108,11 +147,11 @@ struct MetricRow: View {
                 .foregroundStyle(present ? tint : Color.secondary)
                 .frame(width: 32, alignment: .trailing)
 
-            Text(present ? Format.countdown(to: bucket?.resetsAt, from: now) : "—")
+            Text(present ? Format.resetStamp(bucket?.resetsAt, from: now) : "—")
                 .font(.system(size: 11))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-                .frame(width: 46, alignment: .trailing)
+                .frame(width: 58, alignment: .trailing)
         }
     }
 }
@@ -158,6 +197,9 @@ struct AccountRow: View {
     let account: Account
     let state: AccountState?
     let now: Date
+    /// Bumped when something outside the row is clicked — the cue to commit any
+    /// in-place edit and give up focus.
+    let dismissToken: Int
     let setLabel: (String) -> Void
     let setNickname: (String) -> Void
     let remove: () -> Void
@@ -223,7 +265,11 @@ struct AccountRow: View {
             }
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 9)
+        // Asymmetric on purpose: the block starts with cap-height text and ends
+        // with a descender's worth of slack, so equal padding would leave every
+        // divider hugging the metrics above it.
+        .padding(.top, 11)
+        .padding(.bottom, 14)
         .contentShape(Rectangle())
         .contextMenu {
             Button("Set Label…", action: beginLabelEdit)
@@ -234,6 +280,17 @@ struct AccountRow: View {
         .onChange(of: focus) { old, _ in
             if old == .label { commitLabel() }
             if old == .name { commitName() }
+        }
+        .onChange(of: dismissToken) { _, _ in
+            commitLabel()
+            commitName()
+            focus = nil
+        }
+        // The popover can go away mid-edit (Escape, a click on another app);
+        // the character typed still counts.
+        .onDisappear {
+            commitLabel()
+            commitName()
         }
     }
 
@@ -268,6 +325,10 @@ struct AccountRow: View {
 
 struct PopoverView: View {
     @ObservedObject var state: AppState
+    /// Incremented on every click in the popover; rows watch it to commit and
+    /// drop focus.
+    @State private var dismissToken = 0
+    @State private var clickMonitor: Any?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -279,6 +340,7 @@ struct PopoverView: View {
                             account: account,
                             state: state.state(for: account),
                             now: context.date,
+                            dismissToken: dismissToken,
                             setLabel: { state.setLabel($0, for: account) },
                             setNickname: { state.setNickname($0, for: account) },
                             remove: { state.remove(account) }
@@ -300,42 +362,74 @@ struct PopoverView: View {
             footer
         }
         .frame(width: 300)
-        .onAppear { state.refreshIfStale() }
+        .onAppear {
+            state.refreshIfStale()
+            installClickMonitor()
+        }
+        .onDisappear(perform: removeClickMonitor)
+    }
+
+    /// A transparent hit target behind the rows never sees these clicks — the
+    /// rows' own content shape and context menu swallow them first. Watching the
+    /// window's mouse-*down* instead catches every click, and because a
+    /// `TapGesture` only fires on mouse-*up* it can't race the label token:
+    /// clicking the token commits whatever was open, then starts its edit.
+    private func installClickMonitor() {
+        guard clickMonitor == nil else { return }
+        clickMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { event in
+            dismissToken &+= 1
+            return event
+        }
+    }
+
+    private func removeClickMonitor() {
+        if let monitor = clickMonitor { NSEvent.removeMonitor(monitor) }
+        clickMonitor = nil
     }
 
     private var footer: some View {
-        HStack(spacing: 10) {
-            if !state.accounts.isEmpty {
-                Text(state.isSigningIn ? "Signing in…" : "Updated \(Format.relative(state.lastUpdated))")
+        ZStack {
+            // With no accounts the popover is nothing but this footer, so the
+            // one thing to do here has to be visible rather than hidden in ⋯.
+            if state.accounts.isEmpty {
+                Button("Add Account…") { state.addAccount() }
+                    .buttonStyle(PressableButtonStyle())
                     .font(.system(size: 11))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
+                    .focusable(false)
+                    .disabled(!state.canAddAccount)
             }
 
-            Spacer(minLength: 4)
+            HStack(spacing: 10) {
+                if !state.accounts.isEmpty {
+                    Text(state.isSigningIn ? "Signing in…" : "Updated \(Format.relative(state.lastUpdated))")
+                        .font(.system(size: 11))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
 
-            Button("Add Account…") { state.addAccount() }
-                .buttonStyle(PressableButtonStyle())
-                .font(.system(size: 11))
+                Spacer(minLength: 4)
+
+                Menu {
+                    Button("Add Account…") { state.addAccount() }
+                        .disabled(!state.canAddAccount)
+                    Button("Refresh") { state.manualRefresh() }
+                    Divider()
+                    Button("Quit") { NSApplication.shared.terminate(nil) }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
                 .focusable(false)
-                .disabled(!state.canAddAccount)
-
-            Menu {
-                Button("Refresh") { state.manualRefresh() }
-                Divider()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 11, weight: .semibold))
+                .frame(width: 16)
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .focusable(false)
-            .frame(width: 16)
         }
         .controlSize(.small)
         .focusEffectDisabled()
         .padding(.horizontal, 14)
-        .padding(.vertical, 8)
+        .padding(.vertical, 10)
     }
 }

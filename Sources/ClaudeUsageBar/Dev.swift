@@ -107,10 +107,47 @@ enum SelfTest {
         check("flat fallback 5-hour == 63", flat?.fiveHour?.percent == 63)
         check("flat fallback weekly == 9", flat?.weekly?.percent == 9)
 
+        // Countdown survives only for `--probe`'s output; the popover shows stamps.
         check("countdown days", Format.countdown(to: Date().addingTimeInterval(3 * 86400 + 4 * 3600 + 60)) == "3d 04h")
         check("countdown hours", Format.countdown(to: Date().addingTimeInterval(3600 + 8 * 60 + 1)) == "1h 08m")
         check("countdown minutes", Format.countdown(to: Date().addingTimeInterval(12 * 60 + 1)) == "12m")
         check("countdown nil", Format.countdown(to: nil) == "—")
+
+        // Reset stamps. Fixed locale + zone so the expectations are stable
+        // wherever this runs; 2026-08-11 is a Tuesday, 2026-08-13 a Thursday.
+        let zone = TimeZone(identifier: "America/Chicago")!
+        var fixed = Calendar(identifier: .gregorian)
+        fixed.timeZone = zone
+        func at(_ month: Int, _ day: Int, _ hour: Int, _ minute: Int) -> Date {
+            fixed.date(from: DateComponents(
+                year: 2026, month: month, day: day, hour: hour, minute: minute
+            ))!
+        }
+        func reset(_ date: Date?, _ identifier: String, from: Date) -> String {
+            // ICU separates the AM/PM marker with a narrow no-break space —
+            // right on screen, but not something to hardcode into a literal.
+            Format.resetStamp(date, from: from, locale: Locale(identifier: identifier), timeZone: zone)
+                .replacingOccurrences(of: "\u{202F}", with: " ")
+                .replacingOccurrences(of: "\u{00A0}", with: " ")
+        }
+        let noon = at(8, 11, 12, 0)
+
+        let todayStamp = reset(at(8, 11, 17, 3), "en_US", from: noon)
+        check("reset today -> clock time", todayStamp == "5:03 PM", "got \(todayStamp)")
+        let midnightish = reset(at(8, 11, 0, 7), "en_US", from: noon)
+        check("reset earlier today keeps the day", midnightish == "12:07 AM", "got \(midnightish)")
+        let laterUp = reset(at(8, 13, 16, 40), "en_US", from: noon)
+        check("later day rounds up to the hour", laterUp == "Thu 5 PM", "got \(laterUp)")
+        let laterDown = reset(at(8, 13, 16, 20), "en_US", from: noon)
+        check("later day rounds down to the hour", laterDown == "Thu 4 PM", "got \(laterDown)")
+        let tomorrow = reset(at(8, 12, 1, 40), "en_US", from: noon)
+        check("tomorrow is never a bare clock time", tomorrow == "Wed 2 AM", "got \(tomorrow)")
+        // 12/24-hour follows the locale rather than being hardcoded.
+        let today24 = reset(at(8, 11, 17, 3), "en_GB", from: noon)
+        check("24-hour locale, today", today24 == "17:03", "got \(today24)")
+        let later24 = reset(at(8, 13, 16, 40), "en_GB", from: noon)
+        check("24-hour locale, later day", later24 == "Thu 17", "got \(later24)")
+        check("reset stamp nil", Format.resetStamp(nil) == "—")
 
         print(failures == 0 ? "\nselftest: all checks passed" : "\nselftest: \(failures) failure(s)")
         return failures == 0 ? 0 : 1
