@@ -89,7 +89,11 @@ final class AppState: ObservableObject {
             return BarCell(
                 character: account.character,
                 headroom: state?.snapshot?.headroom,
-                isUnreachable: state?.isUnreachable == true
+                isUnreachable: state?.isUnreachable == true,
+                // Derived from the snapshot on every draw, so an account flips
+                // to yellow the moment Fable hits 100% and back the moment its
+                // week resets — no relaunch, and per account.
+                isFableExhausted: state?.snapshot?.isFableExhausted == true
             )
         }
     }
@@ -271,7 +275,7 @@ final class AppState: ObservableObject {
         do {
             try Store.mutate(body)
         } catch {
-            NSLog("ClaudeUsageBar: failed to save accounts: \(error.localizedDescription)")
+            NSLog("ClaudeBattery: failed to save accounts: \(error.localizedDescription)")
         }
     }
 
@@ -412,12 +416,13 @@ final class AppState: ObservableObject {
 
     // MARK: Demo
 
-    /// `--demo`: four in-memory accounts covering every state worth looking at
+    /// `--demo`: six in-memory accounts covering every state worth looking at
     /// without signing in — blocked (dimmed letter, empty painted gauge), rate
     /// limited but still showing its last known reading (hollow gauge), plain
-    /// healthy monochrome, and a dead credential waiting on a sign-in. Plus a
-    /// 100% row and a Fable bucket the API never reported, which is the `0%` +
-    /// `—` case.
+    /// healthy monochrome, a dead credential waiting on a sign-in, Fable spent
+    /// with room left everywhere else (yellow letter), and Fable spent on an
+    /// account that is blocked anyway (dimmed yellow). Plus a 100% row and a
+    /// Fable bucket the API never reported, which is the `0%` + `—` case.
     private static func demoData() -> (accounts: [Account], states: [UUID: AccountState]) {
         let specs: [(
             label: String, nickname: String, email: String,
@@ -426,7 +431,9 @@ final class AppState: ObservableObject {
             ("P", "Personal", "izu@personal.com", 100, 5, nil, nil, false),
             ("W", "Work", "izu@work.example", 78, 20, 40, "rate limited", false),
             ("T", "Team", "izu@team.example", 15, 5, 10, nil, false),
-            ("I", "Iconic", "izu@iconic.example", 0, 0, nil, nil, true)
+            ("I", "Iconic", "izu@iconic.example", 0, 0, nil, nil, true),
+            ("F", "Fable spent", "izu@fable.example", 30, 20, 100, nil, false),
+            ("B", "Fable spent, blocked", "izu@both.example", 100, 45, 100, nil, false)
         ]
         var accounts: [Account] = []
         var states: [UUID: AccountState] = [:]

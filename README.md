@@ -1,4 +1,4 @@
-# Claude Usage Bar
+# Claude Battery
 
 A macOS menu bar app that tracks the 5-hour, weekly, and Fable weekly usage
 windows for up to three Claude accounts at once.
@@ -14,6 +14,37 @@ headroom = min(100 − 5-hour%, 100 − weekly%, 100 − Fable weekly%)
 Monochrome above 25% headroom, orange at or below 25%, red at or below 10%.
 An account with no headroom left dims its letter and empties its gauge.
 Click the gauges for per-window percentages and reset countdowns.
+
+## Fable
+
+Once an account's Fable week is spent, Fable stops being a limit worth measuring
+and drops out of the minimum:
+
+```
+headroom = min(100 − 5-hour%, 100 − weekly%)
+```
+
+and the letter turns yellow to say so. Yellow is not a warning — the gauge keeps
+its own orange and red tiers, computed from whichever headroom is in effect —
+it is the answer to "what is this gauge measuring?". White means every window
+counts; yellow means Fable is gone and what is left is the non-Fable headroom.
+An account whose letter is yellow can still be perfectly usable, and reads
+`Available` in the popover rather than `Blocked`.
+
+Spent means the Fable bucket is **there and at 100%**. The API nulls these keys
+routinely, and a bucket it did not report is unknown rather than spent, so it
+keeps the ordinary white treatment. The state is per account and flips back on
+its own the moment Fable resets.
+
+A yellow letter still dims when its account is out of everything else, so
+Fable-spent *and* blocked is a dimmed yellow: colour says what is measured,
+dimming says whether the account can be used at all.
+
+The yellow follows the menu bar's appearance the same way the letters
+themselves do. `systemYellow` is a fill colour: an 8pt glyph drawn in it
+measures 11.7:1 against a dark menu bar but 1.3:1 against a light one, which is
+not a signal. So a dark bar gets `systemYellow` and a light bar gets a darker
+yellow of the same hue, at 4.1:1. `--selftest` measures both.
 
 ## Polling
 
@@ -39,8 +70,8 @@ a hollow gauge, which is what tells you it is no longer live.
 ## Build
 
 ```sh
-./build.sh          # swift build -c release + dist/ClaudeUsageBar.app
-open dist/ClaudeUsageBar.app
+./build.sh          # swift build -c release + "dist/Claude Battery.app"
+open "dist/Claude Battery.app"
 ```
 
 Swift 5.9+, macOS 14+, no third-party dependencies, no Xcode project.
@@ -66,7 +97,11 @@ relaunch without a separate index to keep in sync.
 ## Storage
 
 Accounts live in `~/Library/Application Support/ClaudeUsageBar/accounts.json`
-(directory 0700, file 0600). Refresh tokens are stored there in plaintext rather
+(directory 0700, file 0600). That directory keeps the old name on purpose: it is
+invisible to the user, it holds the only copy of each account's refresh token,
+and moving it would be a migration with nothing to gain. The bundle identifier
+(`com.izu.claudeusagebar`) is unchanged for the same reason — it is the app's
+identity to LaunchServices, not a label anyone reads. Refresh tokens are stored there in plaintext rather
 than the Keychain: the app is ad-hoc signed, so every rebuild changes its
 signature and macOS would prompt for Keychain access on each launch.
 
@@ -77,7 +112,7 @@ signature and macOS would prompt for Keychain access on each launch.
 | `--selftest` | Decodes an embedded usage fixture, walks the polling and backoff schedules, and exercises token rotation — single-flight refresh, persist-before-return, and the terminal `needs sign-in` state — with no network. Also runs the callback-loop checks below, so consecutive reconnects stay covered. |
 | `--callback-loop [cycles] [delayMs]` | Runs the sign-in's loopback listener over and over in one process — bind, receive the redirect, tear down — plus an abandoned flow that never gets a redirect. No browser, no credentials. This is the second reconnect in a session, on its own. |
 | `--probe` | Reads Claude Code's existing access token read-only and prints live parsed buckets. Never writes or refreshes it. |
-| `--demo` | Four fake in-memory accounts, for looking at the drawing: blocked, rate limited, healthy, and one whose credential the server has rejected. |
+| `--demo` | Six fake in-memory accounts, for looking at the drawing: blocked, rate limited, healthy, one whose credential the server has rejected, one with Fable spent, and one with Fable spent *and* nothing else left. |
 | `--render-popover <dir>` | Writes the popover itself in both appearances, without a menu bar or a click. |
 | `--render <dir>` | Writes the menu bar image for every state in both appearances. The real menu bar takes its appearance from the desktop picture behind it, so a dark wallpaper otherwise makes the light case impossible to see on screen. |
 

@@ -32,12 +32,32 @@ struct UsageSnapshot {
 
     var fable: UsageBucket? { scoped(named: "Fable") }
 
+    /// Fable's week is spent — the bucket is *there* and it is at 100%.
+    ///
+    /// The distinction that matters is exhausted versus unknown. The API nulls
+    /// these keys routinely, and a bucket it did not report says nothing about
+    /// whether Fable is available: it is simply not a reading. So an absent
+    /// bucket, and the `0% / no reset` sentinel that stands for one, are both
+    /// *not* exhaustion — only a present bucket that has used everything is.
+    var isFableExhausted: Bool {
+        guard let fable, fable.hasData else { return false }
+        return fable.percent >= 100
+    }
+
     /// The single number the menu bar draws: how much room is left before the
-    /// tightest of the three windows blocks you. A bucket the API did not report
-    /// is not a constraint, so it is skipped rather than counted as 0 or 100.
-    /// `nil` means nothing resolved at all — an unknown state, not "full".
+    /// tightest window still worth measuring blocks you. A bucket the API did
+    /// not report is not a constraint, so it is skipped rather than counted as 0
+    /// or 100. `nil` means nothing resolved at all — an unknown state, not
+    /// "full".
+    ///
+    /// Once Fable is exhausted it stops being a constraint too, and drops out of
+    /// the minimum entirely: an account with no Fable left but a whole session
+    /// and a whole week in hand is not blocked, it is a non-Fable account, and
+    /// this is the number that says so. The letter's colour is what carries
+    /// *which* of the two this is — see `BarRenderer.glyphColor`.
     var headroom: Double? {
-        let remaining = [fiveHour, weekly, fable]
+        let measured = isFableExhausted ? [fiveHour, weekly] : [fiveHour, weekly, fable]
+        let remaining = measured
             .compactMap { $0 }
             .filter(\.hasData)
             .map { 100 - $0.percent }

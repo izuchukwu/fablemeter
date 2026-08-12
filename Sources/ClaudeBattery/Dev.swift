@@ -77,6 +77,83 @@ enum SelfTest {
         check("absent buckets skipped", partial.headroom == 10, "got \(partial.headroom.map { String($0) } ?? "nil")")
         check("nothing resolved -> nil headroom", UsageSnapshot().headroom == nil)
 
+        // MARK: Fable exhaustion
+        //
+        // Exhausted means the Fable bucket is *there* and has used everything.
+        // The API nulls these keys routinely, so an absent bucket says nothing
+        // about Fable at all — treating "unknown" as "spent" would turn a quiet
+        // week yellow and quietly stop measuring Fable for accounts that still
+        // have it.
+
+        func fableBucket(_ percent: Double, reported: Bool = true) -> UsageBucket {
+            UsageBucket(
+                id: "scoped:Fable", label: "Fable", percent: percent,
+                resetsAt: reported ? Date() : nil
+            )
+        }
+        func snapshot(five: Double = 30, weekly: Double = 20, fable: UsageBucket?) -> UsageSnapshot {
+            var out = UsageSnapshot()
+            out.fiveHour = UsageBucket(id: "session", label: "5-hour", percent: five, resetsAt: Date())
+            out.weekly = UsageBucket(id: "weekly", label: "Weekly", percent: weekly, resetsAt: Date())
+            if let fable { out.scoped = [fable] }
+            return out
+        }
+
+        let fableSpent = snapshot(fable: fableBucket(100))
+        let fablePartial = snapshot(fable: fableBucket(25))
+        let fableSentinel = snapshot(fable: fableBucket(0, reported: false))
+        let fableMissing = snapshot(fable: nil)
+
+        check("Fable present and at 100% is exhausted", fableSpent.isFableExhausted)
+        check("a partly used Fable is not exhausted", !fablePartial.isFableExhausted)
+        check("a Fable just short of 100% is not exhausted",
+              !snapshot(fable: fableBucket(99.5)).isFableExhausted)
+        check("an unreported Fable is unknown, not exhausted", !fableSentinel.isFableExhausted)
+        check("a missing Fable bucket is unknown, not exhausted", !fableMissing.isFableExhausted)
+        check("a snapshot with nothing in it is not exhausted", !UsageSnapshot().isFableExhausted)
+        check("the live fixture's 25% Fable is not exhausted", !snap.isFableExhausted)
+        // A real zero — reported, with a window — is present, so it is a
+        // constraint of 100% headroom, and nowhere near exhausted.
+        check("a reported, unused Fable is present and not exhausted",
+              snapshot(fable: fableBucket(0)).isFableExhausted == false
+              && snapshot(fable: fableBucket(0)).fable?.hasData == true)
+
+        // What the gauge then measures.
+        check("an exhausted Fable drops out of the minimum",
+              fableSpent.headroom == 70, "got \(fableSpent.headroom.map { String($0) } ?? "nil")")
+        check("a live Fable is still the tightest window it can be",
+              snapshot(fable: fableBucket(95)).headroom == 5,
+              "got \(snapshot(fable: fableBucket(95)).headroom.map { String($0) } ?? "nil")")
+        check("a partly used Fable stays in the minimum",
+              fablePartial.headroom == 70 && snapshot(fable: fableBucket(90)).headroom == 10)
+        check("an unreported Fable is skipped without counting as exhaustion",
+              fableSentinel.headroom == 70 && fableMissing.headroom == 70)
+        // Dropping Fable is not a reprieve: the windows that are left still say
+        // what they say.
+        let spentAndBlocked = snapshot(five: 100, weekly: 45, fable: fableBucket(100))
+        check("an exhausted Fable cannot unblock a spent session",
+              spentAndBlocked.headroom == 0 && spentAndBlocked.isFableExhausted)
+        var onlyFable = UsageSnapshot()
+        onlyFable.scoped = [fableBucket(100)]
+        check("an exhausted Fable with nothing else reported measures nothing",
+              onlyFable.headroom == nil && onlyFable.isFableExhausted)
+
+        // The popover reads the same number the gauge does, so an account with
+        // Fable gone and a whole session in hand must not say "Blocked".
+        let spentState = AccountState(snapshot: fableSpent, error: nil)
+        check("the verdict follows the effective headroom",
+              Verdict.word(headroom: spentState.snapshot?.headroom) == "Available",
+              "got \(Verdict.word(headroom: spentState.snapshot?.headroom))")
+        check("…and still says Blocked when the rest is genuinely spent",
+              Verdict.word(headroom: spentAndBlocked.headroom) == "Blocked")
+        check("…while a Fable that is nearly, but not, spent still sets the word",
+              Verdict.word(headroom: fablePartial.headroom) == "Available"
+              && Verdict.word(headroom: snapshot(fable: fableBucket(96)).headroom) == "Almost out")
+        // The row itself still reads as exhausted — 100%, with its window.
+        check("the exhausted Fable row prints 100%",
+              MetricDisplay.percentText(fableSpent.fable) == "100%"
+              && MetricDisplay.resetText(fableSpent.fable) != "—")
+
         // Menu bar colour tiers.
         check("headroom 85 is monochrome", BarRenderer.warningColor(for: 85) == nil)
         check("headroom 30 is monochrome", BarRenderer.warningColor(for: 30) == nil)
@@ -101,12 +178,12 @@ enum SelfTest {
 
         // Characters are uniform: only the level ever takes a warning colour.
         check("letters are never warning-coloured",
-              BarRenderer.glyphColor(anyWarning: true) == .labelColor
-              && BarRenderer.glyphColor(anyWarning: true) != .systemRed
-              && BarRenderer.glyphColor(anyWarning: true) != .systemOrange)
+              BarRenderer.glyphColor(colored: true) == .labelColor
+              && BarRenderer.glyphColor(colored: true) != .systemRed
+              && BarRenderer.glyphColor(colored: true) != .systemOrange)
         check("letters follow the menu bar's own label colour",
-              BarRenderer.glyphColor(anyWarning: true)
-              == BarRenderer.neutralColor(anyWarning: true))
+              BarRenderer.glyphColor(colored: true)
+              == BarRenderer.neutralColor(colored: true))
 
         // …and that colour has to be resolved against the menu bar, not baked
         // in. Hard white would vanish on a light menu bar, so the letters are
@@ -114,7 +191,7 @@ enum SelfTest {
         func glyphBrightness(_ name: NSAppearance.Name) -> CGFloat {
             var value: CGFloat = -1
             NSAppearance(named: name)?.performAsCurrentDrawingAppearance {
-                value = BarRenderer.glyphColor(anyWarning: true)
+                value = BarRenderer.glyphColor(colored: true)
                     .usingColorSpace(.sRGB)?.brightnessComponent ?? -1
             }
             return value
@@ -135,6 +212,134 @@ enum SelfTest {
         check("unresolved letter stays full strength", BarRenderer.glyphAlpha(headroom: nil) == 1)
         check("the dim is visible but clearly recessed",
               BarRenderer.blockedGlyphAlpha > 0.3 && BarRenderer.blockedGlyphAlpha < 0.5)
+
+        // The letter's colour says *which* limit is being measured, and nothing
+        // else. It is orthogonal to the dimming, which says whether the account
+        // can be used at all — so the two compose into a dimmed yellow rather
+        // than one overriding the other.
+        // Resolved against a real appearance, because a dynamic colour says
+        // nothing until it is — and the menu bar's own appearance follows the
+        // desktop picture, so both cases happen on the same machine.
+        func rgb(_ color: NSColor, in name: NSAppearance.Name) -> (r: Double, g: Double, b: Double) {
+            var out = (r: -1.0, g: -1.0, b: -1.0)
+            NSAppearance(named: name)?.performAsCurrentDrawingAppearance {
+                if let resolved = color.usingColorSpace(.sRGB) {
+                    out = (Double(resolved.redComponent),
+                           Double(resolved.greenComponent),
+                           Double(resolved.blueComponent))
+                }
+            }
+            return out
+        }
+        func luminance(_ c: (r: Double, g: Double, b: Double)) -> Double {
+            func linear(_ v: Double) -> Double {
+                v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * linear(c.r) + 0.7152 * linear(c.g) + 0.0722 * linear(c.b)
+        }
+        /// The glyph composited onto the bar it is drawn on, measured against
+        /// that bar. `bar` is the same backdrop `--render` paints.
+        func contrast(_ ink: NSColor, alpha: Double, in name: NSAppearance.Name) -> Double {
+            let bar = name == .darkAqua ? 0.12 : 0.94
+            let c = rgb(ink, in: name)
+            let composited = (r: alpha * c.r + (1 - alpha) * bar,
+                              g: alpha * c.g + (1 - alpha) * bar,
+                              b: alpha * c.b + (1 - alpha) * bar)
+            let a = luminance(composited) + 0.05
+            let b = luminance((bar, bar, bar)) + 0.05
+            return max(a, b) / min(a, b)
+        }
+        func separation(_ one: NSColor, _ other: NSColor, in name: NSAppearance.Name) -> Double {
+            let a = rgb(one, in: name), b = rgb(other, in: name)
+            return max(abs(a.r - b.r), abs(a.g - b.g), abs(a.b - b.b))
+        }
+
+        let yellowInk = BarRenderer.glyphColor(colored: true, fableExhausted: true)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let ink = rgb(yellowInk, in: appearance)
+            check("the Fable-exhausted letter reads as yellow on \(appearance.rawValue)",
+                  ink.r > ink.g && ink.g > ink.b && ink.b < 0.15 && ink.g > 0.5 * ink.r,
+                  "rgb \(ink)")
+        }
+        check("on a dark menu bar it is systemYellow itself",
+              rgb(yellowInk, in: .darkAqua) == rgb(.systemYellow, in: .darkAqua),
+              "got \(rgb(yellowInk, in: .darkAqua))")
+        check("…and an ordinary letter is not yellow at all",
+              rgb(BarRenderer.glyphColor(colored: true), in: .darkAqua)
+              != rgb(yellowInk, in: .darkAqua))
+        // Legibility, measured rather than eyeballed. Plain systemYellow on a
+        // light menu bar is 1.3:1 — which is why the ink darkens there.
+        check("the yellow letter is legible on a dark menu bar",
+              contrast(yellowInk, alpha: 1, in: .darkAqua) >= 3.5,
+              String(format: "%.2f:1", contrast(yellowInk, alpha: 1, in: .darkAqua)))
+        check("…and on a light one",
+              contrast(yellowInk, alpha: 1, in: .aqua) >= 3.5,
+              String(format: "%.2f:1", contrast(yellowInk, alpha: 1, in: .aqua)))
+        check("plain systemYellow would have vanished on a light menu bar",
+              contrast(.systemYellow, alpha: 1, in: .aqua) < 1.5,
+              String(format: "%.2f:1", contrast(NSColor.systemYellow, alpha: 1, in: .aqua)))
+        let dim = Double(BarRenderer.blockedGlyphAlpha)
+        check("a dimmed yellow letter is still visible on a dark menu bar",
+              contrast(yellowInk, alpha: dim, in: .darkAqua) >= 1.5,
+              String(format: "%.2f:1", contrast(yellowInk, alpha: dim, in: .darkAqua)))
+        check("…and on a light one",
+              contrast(yellowInk, alpha: dim, in: .aqua) >= 1.5,
+              String(format: "%.2f:1", contrast(yellowInk, alpha: dim, in: .aqua)))
+        // The letter's yellow and the gauge's orange are two different signals
+        // sitting a couple of points apart, so they have to be two different
+        // colours — in whichever appearance the menu bar happens to be in.
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            check("yellow is nothing like the gauge's orange on \(appearance.rawValue)",
+                  separation(yellowInk, .systemOrange, in: appearance) > 0.15,
+                  String(format: "%.2f apart", separation(yellowInk, .systemOrange, in: appearance)))
+            check("…nor like its red on \(appearance.rawValue)",
+                  separation(yellowInk, .systemRed, in: appearance) > 0.15,
+                  String(format: "%.2f apart", separation(yellowInk, .systemRed, in: appearance)))
+        }
+        check("the gauge keeps its own tiers and never goes yellow",
+              BarRenderer.warningColor(for: 20) == .systemOrange
+              && BarRenderer.warningColor(for: 5) == .systemRed
+              && BarRenderer.warningColor(for: 70) == nil)
+        check("colour and dimming compose rather than replace each other",
+              BarRenderer.glyphColor(colored: true, fableExhausted: true) === BarRenderer.fableYellow
+              && BarRenderer.glyphAlpha(headroom: 0) == BarRenderer.blockedGlyphAlpha
+              && BarRenderer.glyphAlpha(headroom: 70) == 1)
+        // A template image is flattened to the system's own tint, which would
+        // swallow the yellow whole — so a yellow letter has to force real
+        // colour exactly the way a warning level does.
+        let yellowCluster = [
+            BarCell(character: "Y", headroom: 70, isUnreachable: false, isFableExhausted: true)
+        ]
+        let plainCluster = [BarCell(character: "Y", headroom: 70, isUnreachable: false)]
+        check("a Fable-exhausted cell forces real colour",
+              BarRenderer.forcesColor(yellowCluster)
+              && BarRenderer.image(for: yellowCluster).isTemplate == false)
+        check("…while an ordinary healthy cluster stays a template",
+              !BarRenderer.forcesColor(plainCluster)
+              && BarRenderer.image(for: plainCluster).isTemplate)
+        func fableCell(_ headroom: Double?, exhausted: Bool) -> NSImage {
+            BarRenderer.image(for: [
+                BarCell(character: "E", headroom: headroom,
+                        isUnreachable: false, isFableExhausted: exhausted)
+            ])
+        }
+        check("a yellow letter draws differently from the same reading in white",
+              fableCell(70, exhausted: true).tiffRepresentation
+              != fableCell(70, exhausted: false).tiffRepresentation)
+        check("a dimmed yellow draws differently from a full-strength one",
+              fableCell(0, exhausted: true).tiffRepresentation
+              != fableCell(70, exhausted: true).tiffRepresentation)
+        check("…and from a dimmed white one",
+              fableCell(0, exhausted: true).tiffRepresentation
+              != fableCell(0, exhausted: false).tiffRepresentation)
+        // The status item only redraws when the cluster changes, so the flip in
+        // and out of exhaustion has to be part of what "changed" means.
+        check("flipping to Fable-exhausted changes the cell",
+              BarCell(character: "F", headroom: 70, isUnreachable: false, isFableExhausted: true)
+              != BarCell(character: "F", headroom: 70, isUnreachable: false))
+        check("…and flipping back restores the original cell",
+              BarCell(character: "F", headroom: 70, isUnreachable: false, isFableExhausted: false)
+              == BarCell(character: "F", headroom: 70, isUnreachable: false))
 
         // Hollow means "no data", painted-but-empty means "the data says zero".
         // The two must therefore never render identically.
@@ -508,12 +713,42 @@ enum SelfTest {
         check("reorder keeps every account",
               Set(AccountOrder.moved(list, id: t.id, onto: p.id)?.map(\.id) ?? []) == Set(list.map(\.id)))
 
+        // MARK: The store did not move
+        //
+        // The app is called Claude Battery now; its storage directory is still
+        // `ClaudeUsageBar`, and deliberately so — the path is invisible to the
+        // user, and the accounts sitting in it are the only copy of their
+        // refresh tokens. A rename here would be a migration with nothing to
+        // gain, so these two checks are the ones that fail if anyone ever tries
+        // it without writing one.
+        Store.directoryOverride = nil
+        check("the store still lives in the ClaudeUsageBar directory",
+              Store.directory.lastPathComponent == "ClaudeUsageBar",
+              "got \(Store.directory.lastPathComponent)")
+        check("…at Application Support/ClaudeUsageBar/accounts.json",
+              Store.file.path.hasSuffix("Application Support/ClaudeUsageBar/accounts.json"),
+              "got \(Store.file.path)")
+
         // The order has to survive the trip through disk, since that is the only
         // thing carrying it across a relaunch. Runs against a temporary
-        // directory so the user's own accounts.json is never touched.
-        let sandbox = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("ClaudeUsageBarSelfTest-\(UUID().uuidString)", isDirectory: true)
+        // directory — shaped like the real one, so what is exercised is the path
+        // an existing store actually sits at — so the user's own accounts.json
+        // is never touched.
+        let sandboxRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClaudeBatterySelfTest-\(UUID().uuidString)", isDirectory: true)
+        let sandbox = sandboxRoot
+            .appendingPathComponent("Library/Application Support/ClaudeUsageBar", isDirectory: true)
         Store.directoryOverride = sandbox
+        // A store written before the rename is the same file the renamed app
+        // opens: same directory name, same reader, same three accounts.
+        try? Store.save(list)
+        check("a store written under the old app name is still found",
+              Store.load().map(\.id) == list.map(\.id)
+              && Store.file.path.hasSuffix("Application Support/ClaudeUsageBar/accounts.json"),
+              "got \(labels(Store.load()))")
+        check("…with its labels and nicknames intact",
+              Store.load().map(\.label) == ["P", "W", "T"]
+              && Store.load().map(\.nickname) == ["Personal", "Work", "Team"])
         try? Store.save(list)
         check("store round-trips order", labels(Store.load()) == "PWT", "got \(labels(Store.load()))")
         if let reordered = AccountOrder.moved(list, id: t.id, onto: p.id) {
@@ -568,9 +803,9 @@ enum SelfTest {
         check("an impossible write throws rather than being swallowed", surfaced)
         Store.directoryOverride = sandbox
 
-        try? FileManager.default.removeItem(at: sandbox)
+        try? FileManager.default.removeItem(at: sandboxRoot)
         Store.directoryOverride = nil
-        check("selftest sandbox cleaned up", !FileManager.default.fileExists(atPath: sandbox.path))
+        check("selftest sandbox cleaned up", !FileManager.default.fileExists(atPath: sandboxRoot.path))
 
         // MARK: Token rotation
         //
@@ -711,7 +946,7 @@ enum SelfTest {
 
         // And the real lock: exclusive across descriptors, released on demand.
         let lockDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("ClaudeUsageBarLock-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("ClaudeBatteryLock-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
         let lockID = UUID()
         let firstLock = try? RefreshLock.acquire(for: lockID, in: lockDirectory)
@@ -941,7 +1176,12 @@ enum RenderStates {
             BarCell(character: "W", headroom: 22, isUnreachable: true),    // stale
             BarCell(character: "T", headroom: 85, isUnreachable: false),   // healthy
             BarCell(character: "X", headroom: nil, isUnreachable: true),   // never loaded
-            BarCell(character: "F", headroom: 100, isUnreachable: false)   // full
+            BarCell(character: "F", headroom: 100, isUnreachable: false),  // full
+            // Fable spent: the letter goes yellow and the gauge measures what is
+            // left of the session and the week…
+            BarCell(character: "Y", headroom: 70, isUnreachable: false, isFableExhausted: true),
+            // …and dims on top of that when the account is out of those too.
+            BarCell(character: "B", headroom: 0, isUnreachable: false, isFableExhausted: true)
         ]
         let url = URL(fileURLWithPath: directory, isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)

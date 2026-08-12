@@ -15,6 +15,23 @@ struct BarCell: Equatable {
     let headroom: Double?
     /// The newest attempt failed — rate limited, offline, errored.
     let isUnreachable: Bool
+    /// Fable's week is spent, so `headroom` is measuring the non-Fable windows
+    /// only. Independent of the other two: it says what is being *measured*,
+    /// where `headroom` says how much of it is left and `isUnreachable` says how
+    /// old that is.
+    let isFableExhausted: Bool
+
+    init(
+        character: Character,
+        headroom: Double?,
+        isUnreachable: Bool,
+        isFableExhausted: Bool = false
+    ) {
+        self.character = character
+        self.headroom = headroom
+        self.isUnreachable = isUnreachable
+        self.isFableExhausted = isFableExhausted
+    }
 }
 
 /// Draws the status item image by hand. `MenuBarExtra`'s SwiftUI label cannot
@@ -61,19 +78,46 @@ enum BarRenderer {
         return nil
     }
 
-    /// The ink everything that isn't a warning level is drawn in — the track,
-    /// and every character. `.black` is the template-image stand-in for
-    /// "whatever the system tints this to"; once any cell forces real colour,
-    /// the menu bar's own `labelColor` takes over, which is white on a dark
-    /// menu bar and black on a light one.
-    static func neutralColor(anyWarning: Bool) -> NSColor {
-        anyWarning ? .labelColor : .black
+    /// Whether anything in the cluster is drawn in a real colour — a warning
+    /// level, or a letter measuring the non-Fable windows. That is what takes
+    /// the whole image out of template mode, because a template image is
+    /// flattened to the system's own tint and would swallow both.
+    static func forcesColor(_ cells: [BarCell]) -> Bool {
+        cells.contains { warningColor(for: $0.headroom) != nil || $0.isFableExhausted }
     }
 
-    /// Characters never carry the warning colour: the letters stay uniform and
-    /// only the gauge level goes orange/red.
-    static func glyphColor(anyWarning: Bool) -> NSColor {
-        neutralColor(anyWarning: anyWarning)
+    /// The ink everything that isn't coloured is drawn in — the track, and every
+    /// ordinary character. `.black` is the template-image stand-in for "whatever
+    /// the system tints this to"; once any cell forces real colour, the menu
+    /// bar's own `labelColor` takes over, which is white on a dark menu bar and
+    /// black on a light one.
+    static func neutralColor(colored: Bool) -> NSColor {
+        colored ? .labelColor : .black
+    }
+
+    /// The yellow a letter takes once its gauge has dropped Fable.
+    ///
+    /// `systemYellow` is a *fill* colour, and it only works against a dark menu
+    /// bar. Measured against the bar itself, an 8pt glyph drawn in it reaches
+    /// 11.7:1 on a dark bar but **1.3:1 on a light one** — and 1.1:1 once the
+    /// blocked dim is applied, which is not a signal, it is a smudge. So the ink
+    /// resolves against the appearance exactly the way every other letter does,
+    /// black on light and white on dark: `systemYellow` on a dark bar, and a
+    /// darker yellow of the same hue on a light one, which measures 4.1:1 (1.6:1
+    /// dimmed) instead. Both are far from the gauge's orange either way.
+    static let fableYellow = NSColor(name: "fableYellow") { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? .systemYellow
+            : NSColor(srgbRed: 0.62, green: 0.41, blue: 0.02, alpha: 1)
+    }
+
+    /// Characters never carry the *warning* colour — the letters stay uniform
+    /// and only the gauge level goes orange/red. The one thing a letter does say
+    /// in colour is which limit its gauge is measuring: yellow once Fable is
+    /// exhausted and the gauge has dropped it from the minimum, ordinary label
+    /// ink while every window still counts.
+    static func glyphColor(colored: Bool, fableExhausted: Bool = false) -> NSColor {
+        fableExhausted ? fableYellow : neutralColor(colored: colored)
     }
 
     /// …but a letter does dim when its account is out, which is the one thing
@@ -101,7 +145,7 @@ enum BarRenderer {
     static func image(for cells: [BarCell], appearance: NSAppearance? = nil) -> NSImage {
         guard !cells.isEmpty else { return emptyImage() }
 
-        let anyWarning = cells.contains { warningColor(for: $0.headroom) != nil }
+        let colored = forcesColor(cells)
         let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
         let textHeight = ceil(font.ascender - font.descender)
         let contentHeight = barHeight + gap + textHeight
@@ -116,8 +160,7 @@ enum BarRenderer {
                 let baseY = ((imageHeight - contentHeight) / 2).rounded()
                 let barY = baseY + textHeight + gap
                 let radius = barWidth / 2
-                let neutral = neutralColor(anyWarning: anyWarning)
-                let glyphInk = glyphColor(anyWarning: anyWarning)
+                let neutral = neutralColor(colored: colored)
 
                 for (index, cell) in cells.enumerated() {
                     // Like the battery icon: the track and the character stay
@@ -169,6 +212,13 @@ enum BarRenderer {
                         NSGraphicsContext.restoreGraphicsState()
                     }
 
+                    // Colour and dimming are separate signals and compose: the
+                    // colour says which limit the gauge is measuring, the alpha
+                    // says whether the account can be used at all. A blocked,
+                    // Fable-exhausted account is therefore a dimmed yellow.
+                    let glyphInk = glyphColor(
+                        colored: colored, fableExhausted: cell.isFableExhausted
+                    )
                     let glyph = String(cell.character) as NSString
                     let attributes: [NSAttributedString.Key: Any] = [
                         .font: font,
@@ -190,7 +240,7 @@ enum BarRenderer {
             }
             return true
         }
-        image.isTemplate = !anyWarning
+        image.isTemplate = !colored
         // Never cached, so the handler above re-runs for every draw and resolves
         // `labelColor` against the appearance current at that moment. That is
         // what makes watching the button's appearance unnecessary — and the
@@ -203,13 +253,13 @@ enum BarRenderer {
         let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
         if let symbol = NSImage(
             systemSymbolName: "gauge.with.dots.needle.bottom.50percent",
-            accessibilityDescription: "Claude usage"
+            accessibilityDescription: "Claude Battery"
         )?.withSymbolConfiguration(config) {
             symbol.isTemplate = true
             return symbol
         }
         let font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        let text = "Claude" as NSString
+        let text = "Claude Battery" as NSString
         let size = text.size(withAttributes: [.font: font])
         let image = NSImage(
             size: NSSize(width: ceil(size.width) + 6, height: imageHeight), flipped: false
@@ -249,7 +299,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             button.target = self
             button.action = #selector(togglePopover)
             button.imagePosition = .imageOnly
-            button.toolTip = "Claude usage"
+            button.toolTip = "Claude Battery"
         }
 
         cancellable = state.objectWillChange.sink { [weak self] _ in
