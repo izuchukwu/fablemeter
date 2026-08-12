@@ -52,7 +52,11 @@ browser; it never touches Claude Code's own credentials, so signing in here does
 not sign you out of the CLI. Up to three accounts.
 
 Click an account's character token to change it. Double-click the name to rename
-it. Right-click a row for Set Label / Rename / Move Up / Move Down / Sign Out.
+it. Right-click a row for Reconnect Account / Set Label / Rename / Move Up /
+Move Down / Sign Out. **Reconnect Account…** runs the OAuth flow again and
+replaces that account's credential in place, keeping its name, label and
+position. It is offered on every account, not only a rejected one, which is also
+the **Reconnect** shown in place of the verdict when a credential has died.
 
 Drag an account block to reorder it. The menu bar draws the accounts in the
 popover's order, left to right, and rearranges as the drag crosses each row.

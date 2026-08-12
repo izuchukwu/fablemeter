@@ -305,7 +305,7 @@ struct AccountRow: View {
                     }
                     Spacer(minLength: 6)
                     if needsSignIn {
-                        Button("Sign In", action: signIn)
+                        Button("Reconnect", action: signIn)
                             .buttonStyle(PressableButtonStyle())
                             .font(.system(size: 11))
                             .foregroundStyle(Color.accentColor)
@@ -352,10 +352,8 @@ struct AccountRow: View {
         .padding(.bottom, showsMetrics ? 14 : 12)
         .contentShape(Rectangle())
         .contextMenu {
-            if needsSignIn {
-                Button("Sign In Again…", action: signIn)
-                Divider()
-            }
+            Button("Reconnect Account…", action: signIn)
+            Divider()
             Button("Set Label…", action: beginLabelEdit)
             Button("Rename…", action: beginNameEdit)
             Divider()

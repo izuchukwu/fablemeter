@@ -297,9 +297,10 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Re-authenticate an account whose refresh token the server has rejected.
-    /// The account keeps its id, nickname, label and place in the order — only
-    /// the credential underneath it is replaced.
+    /// Re-authenticate an account in place — offered on every account, not only
+    /// one whose refresh token the server has already rejected. The account
+    /// keeps its id, nickname, label and place in the order; only the
+    /// credential underneath it is replaced.
     func signInAgain(_ account: Account) {
         guard !isDemo, !isSigningIn else { return }
         isSigningIn = true
