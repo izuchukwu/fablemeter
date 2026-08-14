@@ -596,6 +596,68 @@ enum SelfTest {
               && transient[7] == Backoff.Failure.transient.cap,
               "got \(transient.map { Int($0) })")
 
+        // Offline: the request never leaves the machine, so it costs the API
+        // nothing and the ladder is allowed to stay tight — 15s, 30s, then a
+        // minute for as long as the outage lasts. Anything looser and the app
+        // stops recovering by itself when the Wi-Fi comes back.
+        let offline = (1...6).map { Backoff.delay(failures: $0, kind: .offline) }
+        check("offline retries at 15s, 30s, then a flat minute",
+              offline == [15, 30, 60, 60, 60, 60], "got \(offline.map { Int($0) })")
+        check("the offline ladder caps at a minute",
+              Backoff.Failure.offline.cap == 60
+              && Backoff.delay(failures: 500, kind: .offline) == 60)
+        check("offline starts tighter than every other failure",
+              Backoff.Failure.offline.base < Backoff.Failure.transient.base
+              && Backoff.Failure.offline.base < Backoff.Failure.rateLimited.base)
+        check("…and never climbs above where transient starts",
+              offline.allSatisfy { $0 <= Backoff.Failure.transient.base })
+        check("an hour offline is still a retry a minute, not a latch",
+              Backoff.delay(failures: 60, kind: .offline) == 60)
+        // The one ladder that must not have moved.
+        check("the 429 ladder is untouched by any of this",
+              (1...6).map { Backoff.delay(failures: $0, kind: .rateLimited) }
+              == [300, 600, 1200, 2400, 2700, 2700])
+
+        // Which errors count as offline, and what they say on screen.
+        let offlineErrors: [URLError.Code] = [
+            .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed,
+            .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed
+        ]
+        check("every offline URLError is recognised as one",
+              offlineErrors.allSatisfy { NetworkFailure.isOffline(URLError($0)) },
+              "\(offlineErrors.filter { !NetworkFailure.isOffline(URLError($0)) })")
+        check("a timeout is not offline — the request did leave",
+              !NetworkFailure.isOffline(URLError(.timedOut))
+              && !NetworkFailure.isOffline(URLError(.badServerResponse)))
+        // URLSession hands these back as an `NSError` in `NSURLErrorDomain`;
+        // only the bridge makes them a `URLError`. If that bridge ever stopped
+        // working the mapping would silently fall through to Foundation's own
+        // sentence, which is precisely the string this replaced.
+        check("an offline failure arriving as a bridged NSError still classifies",
+              NetworkFailure.isOffline(
+                  NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet)
+              ))
+        check("nor is anything that isn't a URLError",
+              !NetworkFailure.isOffline(UsageError.http(503))
+              && !NetworkFailure.isOffline(OAuthError.timedOut))
+        check("offline reads as 'No Internet', not as Foundation's sentence",
+              offlineErrors.allSatisfy {
+                  AppState.outcome(for: URLError($0)).message == "No Internet"
+              },
+              "got \(AppState.outcome(for: URLError(.notConnectedToInternet)).message ?? "nil")")
+        check("…and is short enough to sit in the verdict column unclipped",
+              NetworkFailure.offlineText.count <= 12,
+              NetworkFailure.offlineText)
+        check("offline lands on the offline ladder, not the transient one",
+              AppState.outcome(for: URLError(.notConnectedToInternet)).failureKind == .offline)
+        check("a timeout still lands on the transient ladder",
+              AppState.outcome(for: URLError(.timedOut)).failureKind == .transient)
+        check("a 429 still lands on the rate-limited ladder",
+              AppState.outcome(for: UsageError.rateLimited(retryAfter: nil)).failureKind
+              == .rateLimited)
+        check("offline is never mistaken for a dead credential",
+              !AppState.outcome(for: URLError(.notConnectedToInternet)).isNeedsSignIn)
+
         // Jitter keeps several accounts that failed together from coming back
         // in lockstep, but must never turn into a shorter wait than intended.
         let low = Backoff.jittered(failures: 1, kind: .rateLimited) { $0.lowerBound }
@@ -668,11 +730,33 @@ enum SelfTest {
         check("the ladder restarts from the base after a reset",
               schedule.blockedUntil == epoch.addingTimeInterval(300))
 
+        // The offline schedule, end to end: three failures in and it is still
+        // asking again inside a minute, and one success wipes it.
+        var outage = RetrySchedule()
+        check("a fresh schedule is not an offline one", !outage.isOffline)
+        for _ in 0..<3 { outage.recordFailure(.offline, now: epoch) { _ in 0 } }
+        check("three offline failures still retry within the minute",
+              outage.blockedUntil == epoch.addingTimeInterval(60),
+              "blocked until \(outage.blockedUntil.map { "\($0)" } ?? "nil")")
+        check("…and the schedule knows why it is waiting", outage.isOffline)
+        outage.recordSuccess()
+        check("the network coming back clears the offline schedule outright",
+              !outage.isOffline && outage.failures == 0 && outage.blockedUntil == nil)
+        // Going offline mid-429 must not walk the rate-limit ladder back down.
+        var mixed = RetrySchedule()
+        for _ in 0..<3 { mixed.recordFailure(.rateLimited, now: epoch) { _ in 0 } }
+        mixed.recordFailure(.offline, now: epoch) { _ in 0 }
+        mixed.recordFailure(.rateLimited, now: epoch) { _ in 0 }
+        check("an outage cannot be used to reset the 429 ladder",
+              mixed.failures == 5 && !mixed.isOffline
+              && mixed.blockedUntil == epoch.addingTimeInterval(2700),
+              "failures \(mixed.failures)")
+
         // Every failure has to push the next attempt *strictly* into the future.
         // A schedule that ever hands back "now" leaves the account due on the
         // very next tick, for ever, which is a poll loop with the brakes off.
         var futureFailures: [String] = []
-        for kind in [Backoff.Failure.rateLimited, .transient] {
+        for kind in [Backoff.Failure.rateLimited, .transient, .offline] {
             for failures in 1...24 {
                 for roll in [{ (r: ClosedRange<Double>) in r.lowerBound },
                              { (r: ClosedRange<Double>) in r.upperBound },
@@ -1107,6 +1191,42 @@ enum SelfTest {
               && AppState.isDue(needsSignIn: false, retry: blocked, lastAttempt: nil,
                                 reason: .scheduled, now: epoch.addingTimeInterval(301)))
 
+        // Offline is the one failure whose own ladder outranks the staleness
+        // gate. Without this the 15s rung is meaningless: the scheduled reason
+        // would still hold the account for a full five minutes, and the app
+        // would take minutes to notice the network had come back.
+        var offlineRetry = RetrySchedule()
+        offlineRetry.recordFailure(.offline, now: epoch) { _ in 0 }
+        check("an offline account is blocked for its own 15 seconds",
+              !AppState.isDue(needsSignIn: false, retry: offlineRetry, lastAttempt: epoch,
+                              reason: .scheduled, now: epoch.addingTimeInterval(14)))
+        check("…then due again immediately, without waiting out the interval",
+              AppState.isDue(needsSignIn: false, retry: offlineRetry, lastAttempt: epoch,
+                             reason: .scheduled, now: epoch.addingTimeInterval(16)))
+        // The 429 ladder gets no such exemption: with its block expired it still
+        // has to clear the staleness gate as well.
+        check("a rate-limited account is still held by the staleness gate too",
+              !AppState.isDue(
+                  needsSignIn: false, retry: blocked,
+                  lastAttempt: epoch.addingTimeInterval(200),
+                  reason: .scheduled, now: epoch.addingTimeInterval(301)
+              ))
+        // And an offline account that has been signed out is still terminal.
+        check("offline cannot resurrect a dead credential",
+              !AppState.isDue(needsSignIn: true, retry: offlineRetry, lastAttempt: nil,
+                              reason: .scheduled, now: epoch.addingTimeInterval(600)))
+
+        // The footer's reload control: seen for long enough to mean something,
+        // and never held up past what the refresh itself took.
+        check("the spinner is visible for at least a third of a second",
+              PollPolicy.minimumSpin >= 0.3 && PollPolicy.minimumSpin <= 1)
+        check("an instant refresh still shows a full spin",
+              PollPolicy.spinPadding(elapsed: 0) == PollPolicy.minimumSpin)
+        check("a slow refresh is not padded at all",
+              PollPolicy.spinPadding(elapsed: 5) == 0
+              && PollPolicy.spinPadding(elapsed: PollPolicy.minimumSpin) == 0)
+        check("padding never runs backwards", PollPolicy.spinPadding(elapsed: -1) >= 0)
+
         // On screen it is a state, not an error string.
         let rejectedState = AccountState(snapshot: nil, error: nil, needsSignIn: true)
         check("needsSignIn holds no error text", rejectedState.error == nil)
@@ -1149,6 +1269,12 @@ extension FetchOutcome {
     /// putting a string on screen.
     var message: String? {
         if case .failure(let message, _, _) = self { return message }
+        return nil
+    }
+
+    /// Which retry ladder this failure was routed onto.
+    var failureKind: Backoff.Failure? {
+        if case .failure(_, let kind, _) = self { return kind }
         return nil
     }
 }
@@ -1300,12 +1426,16 @@ enum RenderPopover {
         let url = URL(fileURLWithPath: directory, isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
 
-        for (name, backdrop) in [
-            (NSAppearance.Name.aqua, NSColor(white: 0.96, alpha: 1)),
-            (NSAppearance.Name.darkAqua, NSColor(white: 0.13, alpha: 1))
+        for (name, backdrop, spinning) in [
+            (NSAppearance.Name.aqua, NSColor(white: 0.96, alpha: 1), false),
+            (NSAppearance.Name.darkAqua, NSColor(white: 0.13, alpha: 1), false),
+            // The footer mid-refresh, which no still of the resting popover
+            // shows and which is exactly where a height change would be seen.
+            (NSAppearance.Name.aqua, NSColor(white: 0.96, alpha: 1), true)
         ] {
             guard let appearance = NSAppearance(named: name) else { continue }
             let state = AppState(demo: true)
+            if spinning { state.beginDemoSpin() }
             let host = NSHostingView(rootView: PopoverView(state: state))
             host.appearance = appearance
             // The popover's own material is opaque; without a backdrop the
@@ -1329,7 +1459,8 @@ enum RenderPopover {
 
             guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { continue }
             host.cacheDisplay(in: host.bounds, to: rep)
-            let file = url.appendingPathComponent("popover-\(name.rawValue).png")
+            let suffix = spinning ? "-refreshing" : ""
+            let file = url.appendingPathComponent("popover-\(name.rawValue)\(suffix).png")
             if let png = rep.representation(using: .png, properties: [:]) {
                 try? png.write(to: file)
                 print("wrote \(file.path)  \(Int(size.width))x\(Int(size.height))")

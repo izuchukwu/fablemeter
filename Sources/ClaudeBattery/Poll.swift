@@ -34,6 +34,46 @@ enum PollPolicy {
     /// Manual refresh ignores `freshness`, but is still debounced this far
     /// apart, and never escapes backoff.
     static let manualDebounce: TimeInterval = 5
+
+    /// Shortest time the footer's reload control stays a spinner. A cached or
+    /// instantly-failing refresh returns in a few milliseconds, and a spinner
+    /// that appears and vanishes inside one frame reads as a glitch rather than
+    /// as an answer.
+    static let minimumSpin: TimeInterval = 0.45
+
+    /// How much longer the spinner has to stay up after a refresh that took
+    /// `elapsed`. Pure, so `--selftest` can prove it never goes negative.
+    static func spinPadding(elapsed: TimeInterval) -> TimeInterval {
+        max(0, minimumSpin - elapsed)
+    }
+}
+
+/// Failures that mean the request never left this machine. They cost the API
+/// nothing — there is no server to rate limit and no packet to send — so they
+/// get their own, much tighter retry cadence, and their own words on screen.
+enum NetworkFailure {
+    /// What the popover says instead of "The Internet connection appears to be
+    /// offline." — which truncates to "The Internet connection appe…" in the
+    /// verdict column and says less doing it.
+    static let offlineText = "No Internet"
+
+    /// Every `URLError` that means "this machine cannot currently reach the
+    /// network", including the DNS/host family: with no route out, a lookup for
+    /// the API host fails exactly like a pulled cable.
+    static let offlineCodes: Set<URLError.Code> = [
+        .notConnectedToInternet,
+        .networkConnectionLost,
+        .dataNotAllowed,
+        .cannotFindHost,
+        .cannotConnectToHost,
+        .dnsLookupFailed,
+        .internationalRoamingOff
+    ]
+
+    static func isOffline(_ error: Error) -> Bool {
+        guard let url = error as? URLError else { return false }
+        return offlineCodes.contains(url.code)
+    }
 }
 
 /// Per-account failure backoff. Kept pure and total so `--selftest` can walk
@@ -42,15 +82,22 @@ enum Backoff {
     enum Failure: Equatable {
         /// HTTP 429. Starts at the base poll interval and doubles from there.
         case rateLimited
-        /// 5xx, timeouts, offline, an unreadable payload. Cheaper to retry, so
-        /// it starts far lower — but it still backs off, because a flapping
-        /// connection would otherwise spin the loop.
+        /// 5xx, a timeout, an unreadable payload. Cheaper to retry, so it starts
+        /// far lower — but it still backs off, because a flapping connection
+        /// would otherwise spin the loop.
         case transient
+        /// The machine has no network. The request fails locally in
+        /// milliseconds without ever reaching Anthropic, so backing off for
+        /// fifteen minutes buys nothing and costs the whole point of the app:
+        /// coming back by itself the moment the Wi-Fi does. Tight but polite —
+        /// 15s, 30s, then a minute for as long as the outage lasts.
+        case offline
 
         var base: TimeInterval {
             switch self {
             case .rateLimited: return PollPolicy.interval
             case .transient: return 60
+            case .offline: return 15
             }
         }
 
@@ -58,6 +105,7 @@ enum Backoff {
             switch self {
             case .rateLimited: return 45 * 60
             case .transient: return 15 * 60
+            case .offline: return 60
             }
         }
     }
@@ -110,8 +158,17 @@ enum Backoff {
 struct RetrySchedule: Equatable {
     private(set) var failures = 0
     private(set) var blockedUntil: Date?
+    /// What the newest failure was. Only the offline case is read back — the
+    /// schedule it writes is the one allowed to outrank the staleness gate.
+    private(set) var lastFailure: Backoff.Failure?
 
     var isBackedOff: Bool { failures > 0 }
+
+    /// This account is failing for want of a network. The retry it has already
+    /// scheduled is the whole schedule: nothing about how fresh the numbers on
+    /// screen are should hold it back, because they are not being refreshed at
+    /// all and the attempt costs the API nothing.
+    var isOffline: Bool { failures > 0 && lastFailure == .offline }
 
     func isBlocked(at now: Date = Date()) -> Bool {
         guard let blockedUntil else { return false }
@@ -122,6 +179,7 @@ struct RetrySchedule: Equatable {
     mutating func recordSuccess() {
         failures = 0
         blockedUntil = nil
+        lastFailure = nil
     }
 
     mutating func recordFailure(
@@ -130,6 +188,10 @@ struct RetrySchedule: Equatable {
         now: Date = Date(),
         roll: (ClosedRange<Double>) -> Double = { Double.random(in: $0) }
     ) {
+        // The counter is deliberately *not* reset when the kind changes: a 429
+        // that arrives after an outage keeps the depth it had, so nothing about
+        // going offline can be used to walk the rate-limit ladder back down.
+        lastFailure = kind
         failures += 1
         blockedUntil = Backoff.nextAttempt(
             failures: failures, kind: kind, retryAfter: retryAfter, now: now, roll: roll

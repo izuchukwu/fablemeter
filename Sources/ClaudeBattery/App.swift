@@ -36,6 +36,11 @@ final class AppState: ObservableObject {
     @Published private(set) var states: [UUID: AccountState] = [:]
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var isRefreshing = false
+    /// True only while a refresh the *user* asked for is in flight. The footer's
+    /// reload control spins on this and nothing else: a scheduled pass runs
+    /// every five minutes behind the popover and must not make the footer twitch
+    /// while it is open.
+    @Published private(set) var isManualRefreshing = false
     @Published var isSigningIn = false
     @Published var signInError: String?
 
@@ -164,6 +169,13 @@ final class AppState: ObservableObject {
     ) -> Bool {
         if needsSignIn { return false }
         if retry?.isBlocked(at: now) == true { return false }
+        // An account that is failing offline has already had its next attempt
+        // chosen for it, on a ladder that caps at a minute. The staleness gate
+        // exists to stop the app spending requests on numbers that are still
+        // fresh; these numbers are not being refreshed at all, and the attempt
+        // costs the API nothing, so the ladder is the only gate it needs. Every
+        // other failure — the 429 ladder above all — still waits for both.
+        if retry?.isOffline == true { return true }
         guard let maxAge = reason.maxAge else { return true }
         guard let last = lastAttempt else { return true }
         return now.timeIntervalSince(last) >= maxAge
@@ -202,9 +214,32 @@ final class AppState: ObservableObject {
     }
 
     func manualRefresh() {
+        guard !isManualRefreshing else { return }
         guard Date().timeIntervalSince(lastManualRefresh) >= PollPolicy.manualDebounce else { return }
         lastManualRefresh = Date()
-        Task { await refresh(reason: .manual) }
+        isManualRefreshing = true
+        Task {
+            // Cleared on every path out, including a thrown-away pass that was
+            // never due — the control must never be left spinning.
+            defer { isManualRefreshing = false }
+            let started = Date()
+            await refresh(reason: .manual)
+            // A cached or instantly-failing pass returns in milliseconds; the
+            // spinner still has to be seen to mean anything.
+            let padding = PollPolicy.spinPadding(elapsed: Date().timeIntervalSince(started))
+            if padding > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(padding * 1_000_000_000))
+            }
+        }
+    }
+
+    /// `--render-popover` only, and only in a demo build: the spinning reload
+    /// control is a state worth eyeballing and a real refresh never lasts long
+    /// enough to photograph. Refused outright anywhere else, so nothing in the
+    /// shipping app can pin the control on.
+    func beginDemoSpin() {
+        guard isDemo else { return }
+        isManualRefreshing = true
     }
 
     /// Popover open and wake from sleep: worth a request only if what is on
@@ -238,6 +273,14 @@ final class AppState: ObservableObject {
     }
 
     nonisolated static func outcome(for error: Error) -> FetchOutcome {
+        // First, and once: a request that never left the machine is the same
+        // failure whether it died on the token refresh or on the usage call, and
+        // it has its own words and its own cadence.
+        if NetworkFailure.isOffline(error) {
+            return .failure(
+                message: NetworkFailure.offlineText, kind: .offline, retryAfter: nil
+            )
+        }
         if let error = error as? OAuthError {
             guard !error.isCredentialRejected else { return .needsSignIn }
             return .failure(message: error.displayText, kind: .transient, retryAfter: nil)

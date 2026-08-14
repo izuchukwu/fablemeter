@@ -100,6 +100,44 @@ struct PressableButtonStyle: ButtonStyle {
     }
 }
 
+/// The footer's reload control, sitting immediately left of `⋯` and drawn at the
+/// same weight so the two read as a pair. While a user-initiated refresh is in
+/// flight it becomes a spinner in the *same* 16pt box — the footer cannot change
+/// height between the two states — and stops taking clicks, so a second press
+/// cannot stack a second pass behind the first.
+struct ReloadButton: View {
+    let isRefreshing: Bool
+    let action: () -> Void
+
+    /// The `⋯` next to it is pinned to this too. Both states are laid out inside
+    /// it rather than sizing it, which is what keeps the footer still.
+    private static let side: CGFloat = 16
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                if isRefreshing {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+            }
+            .frame(width: Self.side, height: Self.side)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(PressableButtonStyle())
+        .focusable(false)
+        // Not `.disabled`: that dims the spinner to the point of looking broken.
+        // Clicks are refused instead, and `manualRefresh` refuses a second pass
+        // on its own anyway, so a double-click cannot stack one either way.
+        .allowsHitTesting(!isRefreshing)
+        .help("Refresh")
+        .accessibilityLabel(isRefreshing ? "Refreshing" : "Refresh")
+    }
+}
+
 /// Usage meter — filled means consumed, the inverse of the menu bar gauge, and
 /// carrying the same two-state track: painted while the reading is live, hollow
 /// once it isn't. An empty painted track is a real zero; an empty hollow track
@@ -352,8 +390,8 @@ struct AccountRow: View {
         // with a descender's worth of slack, so equal padding would leave every
         // divider hugging the metrics above it. A row with no metrics under it
         // already ends on a text baseline, so it takes the balanced pair.
-        .padding(.top, 11)
-        .padding(.bottom, showsMetrics ? 14 : 12)
+        .padding(.top, 16)
+        .padding(.bottom, showsMetrics ? 19 : 17)
         .contentShape(Rectangle())
         .contextMenu {
             Button("Reconnect Account…", action: signIn).disabled(isSigningIn)
@@ -601,20 +639,29 @@ struct PopoverView: View {
 
                 Spacer(minLength: 4)
 
-                Menu {
-                    Button("Add Account…") { state.addAccount() }
-                        .disabled(!state.canAddAccount)
-                    Button("Refresh") { state.manualRefresh() }
-                    Divider()
-                    Button("Quit") { NSApplication.shared.terminate(nil) }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 11, weight: .semibold))
+                // Two controls of the same weight sitting together, so the pair
+                // reads as one cluster rather than as a button bolted onto a
+                // menu.
+                HStack(spacing: 8) {
+                    ReloadButton(
+                        isRefreshing: state.isManualRefreshing,
+                        action: { state.manualRefresh() }
+                    )
+
+                    Menu {
+                        Button("Add Account…") { state.addAccount() }
+                            .disabled(!state.canAddAccount)
+                        Divider()
+                        Button("Quit") { NSApplication.shared.terminate(nil) }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .focusable(false)
+                    .frame(width: 16)
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .focusable(false)
-                .frame(width: 16)
             }
         }
         .controlSize(.small)
