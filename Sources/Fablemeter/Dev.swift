@@ -57,10 +57,14 @@ enum SelfTest {
         }
         print("PASS  fixture decodes")
 
-        check("5-hour == 74", snap.fiveHour?.percent == 74, "got \(snap.fiveHour.map { String($0.percent) } ?? "nil")")
-        check("weekly == 15", snap.weekly?.percent == 15, "got \(snap.weekly.map { String($0.percent) } ?? "nil")")
+        /// Every reading is optional now, so the failure detail has to be able
+        /// to print "the server sent nothing" as its own value.
+        func reading(_ value: Double?) -> String { value.map { String($0) } ?? "null" }
+
+        check("5-hour == 74", snap.fiveHour?.percent == 74, "got \(reading(snap.fiveHour?.percent))")
+        check("weekly == 15", snap.weekly?.percent == 15, "got \(reading(snap.weekly?.percent))")
         let fable = snap.scoped(named: "Fable")
-        check("Fable == 25", fable?.percent == 25, "got \(fable.map { String($0.percent) } ?? "nil")")
+        check("Fable == 25", fable?.percent == 25, "got \(reading(fable?.percent))")
         check("5-hour reset parsed", snap.fiveHour?.resetsAt != nil, snap.fiveHour?.resetsAt.map { "\($0)" } ?? "")
         check("weekly reset parsed", snap.weekly?.resetsAt != nil, snap.weekly?.resetsAt.map { "\($0)" } ?? "")
         check("Fable reset parsed", fable?.resetsAt != nil, fable?.resetsAt.map { "\($0)" } ?? "")
@@ -70,12 +74,129 @@ enum SelfTest {
         // headroom = min(100-74, 100-15, 100-25) = 26
         check("headroom == 26", snap.headroom == 26, "got \(snap.headroom.map { String($0) } ?? "nil")")
 
-        // Absent buckets must be skipped, not counted as 0 or 100.
+        // MARK: A null reading and a reported zero are different facts
+        //
+        // The one distinction this whole file turns on. `percent` is carried as
+        // an optional from decoding to drawing, because collapsing null into 0
+        // is what made an account the server had simply never reported on look
+        // exactly like an account it had reported as untouched — and then made
+        // both of them read "Unknown".
+
+        // Same id, same label, same absent window: the reading is the only thing
+        // that differs, which is exactly what used to be thrown away.
+        let unreported = UsageBucket(id: "b", label: "b", percent: nil, resetsAt: nil)
+        let reportedZero = UsageBucket(id: "b", label: "b", percent: 0, resetsAt: nil)
+        let zeroWithWindow = UsageBucket(id: "b", label: "b", percent: 0, resetsAt: Date())
+        check("a null percent is not a reading", unreported.hasData == false)
+        check("a reported zero is a reading, window or no window",
+              reportedZero.hasData && zeroWithWindow.hasData)
+        check("null and zero are not the same bucket", unreported != reportedZero)
+        check("a null percent survives decoding as null, not as 0",
+              unreported.percent == nil && reportedZero.percent == 0)
+
+        // Buckets with no reading must be skipped, not counted as 0 or 100.
         var partial = UsageSnapshot()
         partial.fiveHour = UsageBucket(id: "session", label: "5-hour", percent: 90, resetsAt: Date())
-        partial.scoped = [UsageBucket(id: "scoped:Fable", label: "Fable", percent: 0, resetsAt: nil)]
-        check("absent buckets skipped", partial.headroom == 10, "got \(partial.headroom.map { String($0) } ?? "nil")")
+        partial.scoped = [UsageBucket(id: "scoped:Fable", label: "Fable", percent: nil, resetsAt: nil)]
+        check("unreported buckets skipped", partial.headroom == 10, "got \(reading(partial.headroom))")
         check("nothing resolved -> nil headroom", UsageSnapshot().headroom == nil)
+
+        // …while a reported zero is a whole window in hand, so it is a real
+        // constraint of 100 — and an account reporting nothing but zeros is
+        // Available, which is the bug this fixes.
+        var untouched = UsageSnapshot()
+        untouched.fiveHour = UsageBucket(id: "session", label: "5-hour", percent: 0, resetsAt: nil)
+        untouched.weekly = UsageBucket(id: "weekly", label: "Weekly", percent: 0, resetsAt: nil)
+        untouched.scoped = [UsageBucket(id: "scoped:Fable", label: "Fable", percent: 0, resetsAt: nil)]
+        check("an account reporting all zeros has full headroom",
+              untouched.headroom == 100, "got \(reading(untouched.headroom))")
+        check("…and reads Available, not No data",
+              Verdict.word(headroom: untouched.headroom) == "Available",
+              "got \(Verdict.word(headroom: untouched.headroom))")
+        // The same three buckets with null readings instead: nothing resolves,
+        // and only *that* is the no-data state.
+        var reportedNothing = UsageSnapshot()
+        reportedNothing.fiveHour = UsageBucket(id: "session", label: "5-hour", percent: nil, resetsAt: nil)
+        reportedNothing.weekly = UsageBucket(id: "weekly", label: "Weekly", percent: nil, resetsAt: nil)
+        reportedNothing.scoped = [UsageBucket(id: "scoped:Fable", label: "Fable", percent: nil, resetsAt: nil)]
+        check("null readings resolve to no headroom at all",
+              reportedNothing.headroom == nil)
+        check("…which is the one state called No data",
+              Verdict.word(headroom: reportedNothing.headroom) == "No data",
+              "got \(Verdict.word(headroom: reportedNothing.headroom))")
+        // "Unknown" is gone: it named the app's own confusion, where every other
+        // word in this slot names something to do or to wait out.
+        check("no state is called Unknown any more",
+              [nil, 0, 8, 30, 85].allSatisfy { Verdict.word(headroom: $0) != "Unknown" })
+        // A zero payload and a null payload must not resolve to the same verdict
+        // — that equivalence *was* the bug.
+        check("all-zero and all-null do not read the same",
+              Verdict.word(headroom: untouched.headroom)
+              != Verdict.word(headroom: reportedNothing.headroom))
+        // One live bucket is enough to leave the no-data state, even if the
+        // others said nothing.
+        var oneReading = reportedNothing
+        oneReading.weekly = UsageBucket(id: "weekly", label: "Weekly", percent: 60, resetsAt: Date())
+        check("a single reading is enough to resolve", oneReading.headroom == 40,
+              "got \(reading(oneReading.headroom))")
+
+        // Decoding has to preserve the distinction end to end, not just the
+        // model: `"percent": null` and `"percent": 0` are different payloads.
+        let nullPayload = #"{"limits":[{"kind":"session","percent":null,"resets_at":null}]}"#
+        let zeroPayload = #"{"limits":[{"kind":"session","percent":0,"resets_at":null}]}"#
+        let decodedNull = try? UsageDecoder.decode(Data(nullPayload.utf8))
+        let decodedZero = try? UsageDecoder.decode(Data(zeroPayload.utf8))
+        check("a null percent decodes to null", decodedNull?.fiveHour?.percent == nil
+              && decodedNull?.fiveHour != nil)
+        check("a zero percent decodes to zero", decodedZero?.fiveHour?.percent == 0)
+        check("the two payloads produce different headroom",
+              decodedNull?.headroom == nil && decodedZero?.headroom == 100)
+
+        // MARK: The structural log line
+        //
+        // The line that makes this diagnosable next time without spending a
+        // refresh token on a live request. It has to carry the one distinction
+        // the decoded snapshot no longer shows on screen, stay a single line,
+        // and carry nothing from `accounts.json` but the menu bar label.
+        let fixtureLine = UsageLog.line(label: "C", snapshot: snap)
+        check("the log line names the kinds the payload actually carried",
+              fixtureLine.contains("kinds=session,weekly_all,weekly_scoped"),
+              fixtureLine)
+        check("…and the readings, with their windows",
+              fixtureLine.contains("5-hour=74/window")
+              && fixtureLine.contains("weekly=15/window")
+              && fixtureLine.contains("Fable=25/window"),
+              fixtureLine)
+        check("…and the headroom it resolved to", fixtureLine.contains("headroom=26"), fixtureLine)
+        check("the log line is one line", !fixtureLine.contains("\n"))
+        check("the log line carries no credential and no email",
+              !fixtureLine.lowercased().contains("token")
+              && !fixtureLine.contains("@")
+              && !fixtureLine.lowercased().contains("bearer"),
+              fixtureLine)
+
+        let nullLine = UsageLog.line(label: "C", snapshot: decodedNull ?? UsageSnapshot())
+        let zeroLine = UsageLog.line(label: "C", snapshot: decodedZero ?? UsageSnapshot())
+        check("a null reading logs as null", nullLine.contains("5-hour=null/no-window"), nullLine)
+        check("a reported zero logs as 0", zeroLine.contains("5-hour=0/no-window"), zeroLine)
+        check("the two payloads log differently — the whole point", nullLine != zeroLine)
+        check("a bucket that never arrived logs as absent",
+              nullLine.contains("weekly=absent") && nullLine.contains("scoped=none"),
+              nullLine)
+        check("no reading at all logs headroom=none, a full one logs a number",
+              nullLine.contains("headroom=none") && zeroLine.contains("headroom=100"),
+              zeroLine)
+        // Flat top-level keys instead of `limits[]` is itself a payload shape
+        // worth knowing about after the fact.
+        let flatLine = UsageLog.line(
+            label: "C",
+            snapshot: (try? UsageDecoder.decode(Data(
+                #"{"five_hour":{"utilization":5,"resets_at":null}}"#.utf8
+            ))) ?? UsageSnapshot()
+        )
+        check("a flat-key payload says so in the line",
+              flatLine.contains("kinds=none") && flatLine.contains("flat-keys"),
+              flatLine)
 
         // MARK: Fable exhaustion
         //
@@ -85,7 +206,8 @@ enum SelfTest {
         // week yellow and quietly stop measuring Fable for accounts that still
         // have it.
 
-        func fableBucket(_ percent: Double, reported: Bool = true) -> UsageBucket {
+        /// `percent: nil` is the bucket the server sent with nothing in it.
+        func fableBucket(_ percent: Double?, reported: Bool = true) -> UsageBucket {
             UsageBucket(
                 id: "scoped:Fable", label: "Fable", percent: percent,
                 resetsAt: reported ? Date() : nil
@@ -101,7 +223,7 @@ enum SelfTest {
 
         let fableSpent = snapshot(fable: fableBucket(100))
         let fablePartial = snapshot(fable: fableBucket(25))
-        let fableSentinel = snapshot(fable: fableBucket(0, reported: false))
+        let fableSentinel = snapshot(fable: fableBucket(nil, reported: false))
         let fableMissing = snapshot(fable: nil)
 
         check("Fable present and at 100% is exhausted", fableSpent.isFableExhausted)
@@ -112,11 +234,16 @@ enum SelfTest {
         check("a missing Fable bucket is unknown, not exhausted", !fableMissing.isFableExhausted)
         check("a snapshot with nothing in it is not exhausted", !UsageSnapshot().isFableExhausted)
         check("the live fixture's 25% Fable is not exhausted", !snap.isFableExhausted)
-        // A real zero — reported, with a window — is present, so it is a
-        // constraint of 100% headroom, and nowhere near exhausted.
+        // A real zero is present, so it is a constraint of 100% headroom, and
+        // nowhere near exhausted — with or without an open window, since a
+        // window that has not started is exactly what an untouched one looks
+        // like.
         check("a reported, unused Fable is present and not exhausted",
               snapshot(fable: fableBucket(0)).isFableExhausted == false
               && snapshot(fable: fableBucket(0)).fable?.hasData == true)
+        check("…and so is one reported as zero with no window yet",
+              snapshot(fable: fableBucket(0, reported: false)).fable?.hasData == true
+              && snapshot(fable: fableBucket(0, reported: false)).headroom == 70)
 
         // What the gauge then measures.
         check("an exhausted Fable drops out of the minimum",
@@ -412,11 +539,44 @@ enum SelfTest {
         check("unreachable outlines, healthy zero does not",
               cell(nil, unreachable: true).tiffRepresentation
               != cell(0, unreachable: false).tiffRepresentation)
-        // Nothing-yet and out-of-quota both draw an empty painted track, so the
-        // letter is the only thing telling them apart — and it has to.
-        check("nothing-yet reads differently from blocked",
+
+        // MARK: The track grammar
+        //
+        // Two axes, two marks. The track says whether there is a live reading;
+        // the level says how much of it is left:
+        //
+        //     painted + level  live data
+        //     painted + empty  blocked, and the server said so
+        //     outline + level  stale — the last reading, no longer refreshing
+        //     outline + empty  no reading
+        //
+        // No-reading used to fall on the *painted* side, because the predicate
+        // asked only whether the connection had failed. A fetch that succeeds
+        // and measures nothing has no error, so it drew a painted empty track —
+        // separated from blocked by nothing but the letter's alpha, and those
+        // are the two states most worth keeping apart. The predicate now asks
+        // about the data too, so the difference is the whole track.
+        check("no reading outlines even when the fetch worked",
+              BarCell(character: "E", headroom: nil, isUnreachable: false).isOutlined)
+        check("a failed fetch outlines whatever it last knew",
+              BarCell(character: "E", headroom: 60, isUnreachable: true).isOutlined)
+        check("blocked stays painted — the server said zero",
+              !BarCell(character: "E", headroom: 0, isUnreachable: false).isOutlined)
+        check("live data stays painted",
+              !BarCell(character: "E", headroom: 60, isUnreachable: false).isOutlined)
+        // And it is the drawing that has to differ, not just the predicate.
+        check("no-reading and blocked are now different pictures",
               cell(nil, unreachable: false).tiffRepresentation
               != cell(0, unreachable: false).tiffRepresentation)
+        check("…and no reading draws the same however it came about",
+              cell(nil, unreachable: false).tiffRepresentation
+              == cell(nil, unreachable: true).tiffRepresentation)
+        // The residual case must not disturb the normal ones: an account with a
+        // reading draws exactly as it did before.
+        check("a normal account is unaffected by the new predicate",
+              !BarCell(character: "E", headroom: 85, isUnreachable: false).isOutlined
+              && !BarCell(character: "E", headroom: 1, isUnreachable: false).isOutlined
+              && !BarCell(character: "E", headroom: 100, isUnreachable: false).isOutlined)
         // And a rate limited account keeps drawing the level it last knew,
         // which is the whole point of holding onto the snapshot.
         check("a stale reading is still drawn inside the hollow track",
@@ -450,24 +610,34 @@ enum SelfTest {
         check("default label", account.label == "I", "got \(account.label)")
         check("label normalizes", Account.normalizeLabel(" work ") == "W")
 
-        // "no data" sentinel: 0% with a null reset must not read as a real 0%.
-        let sentinel = UsageBucket(id: "x", label: "x", percent: 0, resetsAt: nil)
-        check("zero/null sentinel is absent", sentinel.hasData == false)
+        // MARK: What a row prints
+        //
+        // The row and the verdict have to agree. Three rows saying "you have
+        // used nothing" under a verdict saying "No data" is the app
+        // contradicting itself, and it is only avoidable because the null and
+        // the zero are still distinguishable this far down.
+        let noReading = UsageBucket(id: "x", label: "x", percent: nil, resetsAt: nil)
+        check("a bucket with no reading has no data", noReading.hasData == false)
         let realZero = UsageBucket(id: "y", label: "y", percent: 0, resetsAt: Date())
         check("zero with reset is present", realZero.hasData == true)
 
-        // …but on screen it still says 0%. Only the reset time becomes a dash,
-        // and the headroom maths above keeps skipping it.
-        check("absent bucket prints 0%", MetricDisplay.percentText(sentinel) == "0%",
-              "got \(MetricDisplay.percentText(sentinel))")
-        check("absent bucket's reset is a dash",
-              MetricDisplay.resetText(sentinel) == "—",
-              "got \(MetricDisplay.resetText(sentinel))")
-        check("missing bucket prints 0% and a dash",
-              MetricDisplay.percentText(nil) == "0%" && MetricDisplay.resetText(nil) == "—")
-        check("real zero prints 0% with its reset",
+        check("a row with no reading prints a dash, not 0%",
+              MetricDisplay.percentText(noReading) == "—",
+              "got \(MetricDisplay.percentText(noReading))")
+        check("…and a dash in its reset column too, so the row reads as one gap",
+              MetricDisplay.resetText(noReading) == "—",
+              "got \(MetricDisplay.resetText(noReading))")
+        check("a missing bucket prints two dashes",
+              MetricDisplay.percentText(nil) == "—" && MetricDisplay.resetText(nil) == "—")
+        check("a reported zero still prints 0% — the user asked for that",
               MetricDisplay.percentText(realZero) == "0%"
               && MetricDisplay.resetText(realZero) != "—")
+        let zeroNoWindow = UsageBucket(id: "y2", label: "y2", percent: 0, resetsAt: nil)
+        check("…including a zero with no window yet: 0% and a dash",
+              MetricDisplay.percentText(zeroNoWindow) == "0%"
+              && MetricDisplay.resetText(zeroNoWindow) == "—")
+        check("a reported zero and no reading never print alike",
+              MetricDisplay.percentText(zeroNoWindow) != MetricDisplay.percentText(noReading))
         let full = UsageBucket(id: "z", label: "z", percent: 100, resetsAt: Date())
         check("100 prints 100%", MetricDisplay.percentText(full) == "100%",
               "got \(MetricDisplay.percentText(full))")
@@ -476,21 +646,27 @@ enum SelfTest {
                   UsageBucket(id: "r", label: "r", percent: 99.6, resetsAt: Date())
               ) == "100%")
 
-        // The display rule must not leak into the maths: a 0%/no-reset bucket
-        // shows 0% and is still not a constraint.
+        // Display and maths read the same bit, so they cannot disagree: a bucket
+        // with no reading is skipped by the headroom *and* dashed on screen,
+        // while a reported zero counts as a whole window *and* prints 0%.
         var displayVsMaths = UsageSnapshot()
         displayVsMaths.fiveHour = UsageBucket(
-            id: "session", label: "5-hour", percent: 0, resetsAt: nil
+            id: "session", label: "5-hour", percent: nil, resetsAt: nil
         )
         displayVsMaths.weekly = UsageBucket(
             id: "weekly", label: "Weekly", percent: 40, resetsAt: Date()
         )
-        check("0%-shown bucket is still skipped by headroom",
-              displayVsMaths.headroom == 60,
-              "got \(displayVsMaths.headroom.map { String($0) } ?? "nil")")
-        check("…while still printing 0%",
-              MetricDisplay.percentText(displayVsMaths.fiveHour) == "0%"
-              && MetricDisplay.resetText(displayVsMaths.fiveHour) == "—")
+        check("a dashed row is the row headroom skipped",
+              displayVsMaths.headroom == 60
+              && MetricDisplay.percentText(displayVsMaths.fiveHour) == "—",
+              "got \(reading(displayVsMaths.headroom))")
+        displayVsMaths.fiveHour = UsageBucket(
+            id: "session", label: "5-hour", percent: 0, resetsAt: nil
+        )
+        check("…and a 0% row is a row headroom counted",
+              displayVsMaths.headroom == 60
+              && MetricDisplay.percentText(displayVsMaths.fiveHour) == "0%",
+              "got \(reading(displayVsMaths.headroom))")
 
         // String and Int percents must both coerce.
         check("string percent coerces", JSONScalar.number("42") == 42)
@@ -857,12 +1033,13 @@ enum SelfTest {
 
         // MARK: The store did not move
         //
-        // The app is called Claude Battery now; its storage directory is still
+        // The app is called Fablemeter now; its storage directory is still
         // `ClaudeUsageBar`, and deliberately so — the path is invisible to the
         // user, and the accounts sitting in it are the only copy of their
-        // refresh tokens. A rename here would be a migration with nothing to
-        // gain, so these two checks are the ones that fail if anyone ever tries
-        // it without writing one.
+        // refresh tokens, which are single-use and rotate. A rename here would
+        // be a migration with nothing to gain and orphaned accounts to lose, so
+        // these two checks are the ones that fail if anyone ever tries it
+        // without writing one.
         Store.directoryOverride = nil
         check("the store still lives in the ClaudeUsageBar directory",
               Store.directory.lastPathComponent == "ClaudeUsageBar",
@@ -877,7 +1054,7 @@ enum SelfTest {
         // an existing store actually sits at — so the user's own accounts.json
         // is never touched.
         let sandboxRoot = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("ClaudeBatterySelfTest-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("FablemeterSelfTest-\(UUID().uuidString)", isDirectory: true)
         let sandbox = sandboxRoot
             .appendingPathComponent("Library/Application Support/ClaudeUsageBar", isDirectory: true)
         Store.directoryOverride = sandbox
@@ -1088,7 +1265,7 @@ enum SelfTest {
 
         // And the real lock: exclusive across descriptors, released on demand.
         let lockDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("ClaudeBatteryLock-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("FablemeterLock-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
         let lockID = UUID()
         let firstLock = try? RefreshLock.acquire(for: lockID, in: lockDirectory)
@@ -1360,6 +1537,11 @@ enum RenderStates {
             BarCell(character: "W", headroom: 22, isUnreachable: true),    // stale
             BarCell(character: "T", headroom: 85, isUnreachable: false),   // healthy
             BarCell(character: "X", headroom: nil, isUnreachable: true),   // never loaded
+            // The residual case: the fetch worked and measured nothing. Rare
+            // now that a reported zero counts as a reading, but it has to be
+            // visible here, because it is the one that used to draw as a
+            // painted empty track — a blocked account with a brighter letter.
+            BarCell(character: "N", headroom: nil, isUnreachable: false),   // no reading
             BarCell(character: "F", headroom: 100, isUnreachable: false),  // full
             // Fable spent: the letter goes yellow and the gauge measures what is
             // left of the session and the week…
@@ -1500,12 +1682,13 @@ enum Probe {
     }
 
     private static func show(_ label: String, _ bucket: UsageBucket?) {
-        guard let bucket, bucket.hasData else {
-            print("  \(label.padding(toLength: 10, withPad: " ", startingAt: 0)) —")
+        let name = label.padding(toLength: 10, withPad: " ", startingAt: 0)
+        guard let bucket, let percent = bucket.percent else {
+            print("  \(name) —  \(bucket == nil ? "absent" : "null percent")")
             return
         }
         let reset = bucket.resetsAt.map { "resets \(Format.countdown(to: $0)) (\($0))" } ?? "no reset"
-        print("  \(label.padding(toLength: 10, withPad: " ", startingAt: 0)) \(Int(bucket.percent.rounded()))%  \(reset)")
+        print("  \(name) \(Int(percent.rounded()))%  \(reset)")
     }
 
     private static func keychainAccessToken() -> String? {

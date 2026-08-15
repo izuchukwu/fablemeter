@@ -68,8 +68,15 @@ enum Format {
 
 /// Plain-language reading of headroom — the verdict shown before any number.
 enum Verdict {
+    /// `nil` headroom means the fetch succeeded and reported no readings at all.
+    /// It is called "No data" rather than "Unknown" on purpose: every other word
+    /// this app puts in this slot names something you can act on or wait out —
+    /// "rate limited", "No Internet", "Reconnect" — and "Unknown" only names the
+    /// app's own confusion. "No data" says whose gap it is: the server sent
+    /// none. After the null-versus-zero fix this should be genuinely rare, since
+    /// an unused account now reports zeros and reads Available.
     static func word(headroom: Double?) -> String {
-        guard let headroom else { return "Unknown" }
+        guard let headroom else { return "No data" }
         if headroom > 40 { return "Available" }
         if headroom > 10 { return "Limited" }
         if headroom > 0 { return "Almost out" }
@@ -171,13 +178,19 @@ struct UsageMeter: View {
     }
 }
 
-/// What a metric row prints. A bucket the API did not report reads as a real
-/// `0%` — it has genuinely used nothing — and only its reset time is a dash,
-/// because there is no window to reset. The headroom maths still skips it
-/// (see `UsageSnapshot.headroom`); this is display only.
+/// What a metric row prints, and the two cases it must never merge.
+///
+/// A bucket the server reported as zero prints `0%` — it has genuinely used
+/// nothing — with a dash for its reset, because a window that has not started
+/// has nothing to reset. A bucket the server did not report prints a dash in
+/// *both* columns: printing `0%` there would be the row asserting "you have used
+/// nothing" while the verdict above it says "No data", and only one of those can
+/// be true. The dash is the same mark the reset column already uses for the same
+/// meaning.
 enum MetricDisplay {
     static func percentText(_ bucket: UsageBucket?) -> String {
-        "\(Int((bucket?.percent ?? 0).rounded()))%"
+        guard let percent = bucket?.percent else { return "—" }
+        return "\(Int(percent.rounded()))%"
     }
 
     static func resetText(

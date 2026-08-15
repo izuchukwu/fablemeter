@@ -1,5 +1,19 @@
 import AppKit
+import os
 import SwiftUI
+
+/// The app's own log, one subsystem so `log show --predicate 'subsystem ==
+/// "com.izu.fablemeter"'` returns this app's lines and nothing else.
+///
+/// Not `NSLog`: the unified log redacts a dynamic string argument as `<private>`
+/// unless the call site says otherwise, so an `NSLog("%@", line)` writes a
+/// perfectly formatted diagnostic that nobody can ever read back. `Logger` can
+/// mark the interpolation public, and it does not parse the string as a format,
+/// so a server-supplied bucket label cannot be read as one either.
+enum Log {
+    static let usage = Logger(subsystem: "com.izu.fablemeter", category: "usage")
+    static let store = Logger(subsystem: "com.izu.fablemeter", category: "store")
+}
 
 struct AccountState {
     /// The last reading that actually arrived. Deliberately kept across
@@ -195,6 +209,15 @@ final class AppState: ObservableObject {
             state.needsSignIn = false
             schedule.recordSuccess()
             lastUpdated = Date()
+            // The poll already happened, so the shape of what it decoded is
+            // free to record — and it is the only way to tell a null percent
+            // from a reported zero without spending another refresh token.
+            // Explicitly public: the usage payload carries no credential, and a
+            // line the log redacts is a line that never gets read.
+            if !isDemo {
+                let line = UsageLog.line(label: account.character, snapshot: snapshot)
+                Log.usage.notice("\(line, privacy: .public)")
+            }
         case .failure(let message, let kind, let retryAfter):
             // The last good numbers stay exactly where they are; only the
             // verdict changes and the track goes hollow.
@@ -318,7 +341,8 @@ final class AppState: ObservableObject {
         do {
             try Store.mutate(body)
         } catch {
-            NSLog("ClaudeBattery: failed to save accounts: \(error.localizedDescription)")
+            let reason = error.localizedDescription
+            Log.store.error("failed to save accounts: \(reason, privacy: .public)")
         }
     }
 
@@ -459,24 +483,30 @@ final class AppState: ObservableObject {
 
     // MARK: Demo
 
-    /// `--demo`: six in-memory accounts covering every state worth looking at
+    /// `--demo`: eight in-memory accounts covering every state worth looking at
     /// without signing in — blocked (dimmed letter, empty painted gauge), rate
     /// limited but still showing its last known reading (hollow gauge), plain
     /// healthy monochrome, a dead credential waiting on a sign-in, Fable spent
     /// with room left everywhere else (yellow letter), and Fable spent on an
-    /// account that is blocked anyway (dimmed yellow). Plus a 100% row and a
-    /// Fable bucket the API never reported, which is the `0%` + `—` case.
+    /// account that is blocked anyway (dimmed yellow).
+    ///
+    /// The last two are the pair that used to be one state: an account the
+    /// server reports as untouched (`0%` rows, a full gauge, `Available`) and an
+    /// account the server reports nothing about at all (dashes, a hollow gauge,
+    /// `No data`). Both used to read `Unknown` over three `0%` rows.
     private static func demoData() -> (accounts: [Account], states: [UUID: AccountState]) {
         let specs: [(
             label: String, nickname: String, email: String,
-            five: Double, weekly: Double, fable: Double?, error: String?, needsSignIn: Bool
+            five: Double?, weekly: Double?, fable: Double?, error: String?, needsSignIn: Bool
         )] = [
             ("P", "Personal", "izu@personal.com", 100, 5, nil, nil, false),
             ("W", "Work", "izu@work.example", 78, 20, 40, "rate limited", false),
             ("T", "Team", "izu@team.example", 15, 5, 10, nil, false),
             ("I", "Iconic", "izu@iconic.example", 0, 0, nil, nil, true),
             ("F", "Fable spent", "izu@fable.example", 30, 20, 100, nil, false),
-            ("B", "Fable spent, blocked", "izu@both.example", 100, 45, 100, nil, false)
+            ("B", "Fable spent, blocked", "izu@both.example", 100, 45, 100, nil, false),
+            ("U", "Untouched", "izu@untouched.example", 0, 0, 0, nil, false),
+            ("N", "Nothing reported", "izu@nothing.example", nil, nil, nil, nil, false)
         ]
         var accounts: [Account] = []
         var states: [UUID: AccountState] = [:]
@@ -485,20 +515,23 @@ final class AppState: ObservableObject {
                 email: spec.email, nickname: spec.nickname, label: spec.label,
                 refreshToken: "demo"
             )
+            // A null percent is a bucket the server sent with no reading in it,
+            // which is not the same thing as a reported zero and no longer draws
+            // like one: null dashes both columns, zero prints `0%` and dashes
+            // only the reset — an untouched window has not started, so there is
+            // nothing for it to reset to.
+            func bucket(
+                _ id: String, _ label: String, _ percent: Double?, in window: TimeInterval
+            ) -> UsageBucket {
+                UsageBucket(
+                    id: id, label: label, percent: percent,
+                    resetsAt: (percent ?? 0) > 0 ? Date().addingTimeInterval(window) : nil
+                )
+            }
             var snap = UsageSnapshot()
-            snap.fiveHour = UsageBucket(
-                id: "session", label: "5-hour", percent: spec.five,
-                resetsAt: Date().addingTimeInterval(4080)
-            )
-            snap.weekly = UsageBucket(
-                id: "weekly", label: "Weekly", percent: spec.weekly,
-                resetsAt: Date().addingTimeInterval(273_600)
-            )
-            // A nil Fable is the API's "no data" sentinel: 0% with no reset.
-            snap.scoped = [UsageBucket(
-                id: "scoped:Fable", label: "Fable", percent: spec.fable ?? 0,
-                resetsAt: spec.fable == nil ? nil : Date().addingTimeInterval(273_600)
-            )]
+            snap.fiveHour = bucket("session", "5-hour", spec.five, in: 4080)
+            snap.weekly = bucket("weekly", "Weekly", spec.weekly, in: 273_600)
+            snap.scoped = [bucket("scoped:Fable", "Fable", spec.fable, in: 273_600)]
             accounts.append(account)
             states[account.id] = AccountState(
                 // A rejected credential has nothing live behind it.

@@ -5,17 +5,25 @@ import Foundation
 struct UsageBucket: Identifiable, Hashable {
     let id: String
     let label: String
-    let percent: Double
+    /// The server's reading, kept optional all the way through: `nil` means the
+    /// server did not report this window, `0` means it reported that nothing has
+    /// been used. Collapsing the two — which this used to do — throws away the
+    /// only bit that separates "I don't know" from "you're fine", and every
+    /// state below is decided by that bit.
+    let percent: Double?
     let resetsAt: Date?
-    /// `percent == 0 && resetsAt == nil` is the API's "no data" sentinel.
-    let hasData: Bool
+
+    /// The server gave us a reading. Not "the reading is interesting": a
+    /// reported `0` with no open window is a real answer — nothing used, so the
+    /// whole window is still there — and it must count as data, or an account
+    /// that has simply not been used reads as an account we know nothing about.
+    var hasData: Bool { percent != nil }
 
     init(id: String, label: String, percent: Double?, resetsAt: Date?) {
         self.id = id
         self.label = label
-        self.percent = percent ?? 0
+        self.percent = percent
         self.resetsAt = resetsAt
-        self.hasData = !((percent ?? 0) == 0 && resetsAt == nil)
     }
 }
 
@@ -25,6 +33,15 @@ struct UsageSnapshot {
     /// Every `weekly_scoped` bucket found, in API order.
     var scoped: [UsageBucket] = []
     var fetchedAt: Date = Date()
+    /// Diagnostics, never drawn: every `kind` string `limits[]` actually
+    /// carried, in API order, including kinds this app does not model. It is the
+    /// difference between "the server reported nothing" and "the server reported
+    /// something we did not recognise" — two payloads that look identical once
+    /// decoded, and only one of which is a bug here.
+    var limitKinds: [String] = []
+    /// The flat top-level keys had to stand in because `limits[]` was missing or
+    /// carried nothing usable. Also diagnostics only.
+    var usedFlatKeys = false
 
     func scoped(named name: String) -> UsageBucket? {
         scoped.first { $0.label.caseInsensitiveCompare(name) == .orderedSame }
@@ -37,18 +54,19 @@ struct UsageSnapshot {
     /// The distinction that matters is exhausted versus unknown. The API nulls
     /// these keys routinely, and a bucket it did not report says nothing about
     /// whether Fable is available: it is simply not a reading. So an absent
-    /// bucket, and the `0% / no reset` sentinel that stands for one, are both
-    /// *not* exhaustion — only a present bucket that has used everything is.
+    /// bucket, and a present one whose percent came back null, are both *not*
+    /// exhaustion — only a reported reading that has used everything is.
     var isFableExhausted: Bool {
-        guard let fable, fable.hasData else { return false }
-        return fable.percent >= 100
+        guard let percent = fable?.percent else { return false }
+        return percent >= 100
     }
 
     /// The single number the menu bar draws: how much room is left before the
     /// tightest window still worth measuring blocks you. A bucket the API did
     /// not report is not a constraint, so it is skipped rather than counted as 0
-    /// or 100. `nil` means nothing resolved at all — an unknown state, not
-    /// "full".
+    /// or 100 — but a bucket it reported as `0` is a constraint of a whole
+    /// window, and counts. `nil` means the server reported no readings at all,
+    /// which is the no-data state, not "full" and not "empty".
     ///
     /// Once Fable is exhausted it stops being a constraint too, and drops out of
     /// the minimum entirely: an account with no Fable left but a whole session
@@ -58,11 +76,57 @@ struct UsageSnapshot {
     var headroom: Double? {
         let measured = isFableExhausted ? [fiveHour, weekly] : [fiveHour, weekly, fable]
         let remaining = measured
-            .compactMap { $0 }
-            .filter(\.hasData)
-            .map { 100 - $0.percent }
+            .compactMap { $0?.percent }
+            .map { 100 - $0 }
         guard let tightest = remaining.min() else { return nil }
         return max(0, min(100, tightest))
+    }
+}
+
+// MARK: - Structural logging
+
+/// One line per account per successful poll — so about three lines every five
+/// minutes — describing the *shape* of what came back rather than the fact that
+/// something did.
+///
+/// It exists because the states this app draws are decided by distinctions that
+/// a decoded snapshot hides: a bucket the server never sent, a bucket it sent
+/// with a null percent, and a bucket it sent as a real zero all used to end up
+/// looking identical, and telling them apart after the fact meant spending a
+/// live request — which costs a single-use refresh token. So the poll that
+/// already happened says which one it was.
+///
+/// The usage payload carries no credential: percentages, reset stamps and model
+/// display names. Nothing from `accounts.json` goes in here — the account is
+/// named by its one-character menu bar label and nothing else.
+enum UsageLog {
+    static func line(label: Character, snapshot: UsageSnapshot) -> String {
+        var parts = ["usage [\(label)]"]
+        parts.append("kinds=" + (snapshot.limitKinds.isEmpty
+            ? "none" : snapshot.limitKinds.joined(separator: ",")))
+        if snapshot.usedFlatKeys { parts.append("flat-keys") }
+        parts.append(field("5-hour", snapshot.fiveHour))
+        parts.append(field("weekly", snapshot.weekly))
+        if snapshot.scoped.isEmpty {
+            parts.append("scoped=none")
+        } else {
+            parts.append(contentsOf: snapshot.scoped.map { field($0.label, $0) })
+        }
+        parts.append("headroom=" + (snapshot.headroom.map(number) ?? "none"))
+        return parts.joined(separator: " ")
+    }
+
+    /// `name=absent` — never sent. `name=null/…` — sent, with no reading in it.
+    /// `name=0/…` — sent, and the reading is zero. Those are three different
+    /// facts and the whole point of the line is that they print differently.
+    private static func field(_ name: String, _ bucket: UsageBucket?) -> String {
+        guard let bucket else { return "\(name)=absent" }
+        let reading = bucket.percent.map(number) ?? "null"
+        return "\(name)=\(reading)/\(bucket.resetsAt == nil ? "no-window" : "window")"
+    }
+
+    private static func number(_ value: Double) -> String {
+        String(format: "%g", value)
     }
 }
 
@@ -176,6 +240,7 @@ enum UsageDecoder {
             for entry in limits {
                 let pct = JSONScalar.number(entry["percent"])
                 let reset = ISODate.parse(entry["resets_at"] as? String)
+                snap.limitKinds.append(entry["kind"] as? String ?? "?")
                 switch entry["kind"] as? String {
                 case "session":
                     snap.fiveHour = UsageBucket(id: "session", label: "5-hour", percent: pct, resetsAt: reset)
@@ -195,6 +260,7 @@ enum UsageDecoder {
         }
 
         if snap.fiveHour == nil, let flat = root["five_hour"] as? [String: Any] {
+            snap.usedFlatKeys = true
             snap.fiveHour = UsageBucket(
                 id: "session", label: "5-hour",
                 percent: JSONScalar.number(flat["utilization"]),
@@ -202,6 +268,7 @@ enum UsageDecoder {
             )
         }
         if snap.weekly == nil, let flat = root["seven_day"] as? [String: Any] {
+            snap.usedFlatKeys = true
             snap.weekly = UsageBucket(
                 id: "weekly", label: "Weekly",
                 percent: JSONScalar.number(flat["utilization"]),
@@ -211,6 +278,7 @@ enum UsageDecoder {
         if snap.scoped.isEmpty {
             for (key, label) in [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")] {
                 guard let flat = root[key] as? [String: Any] else { continue }
+                snap.usedFlatKeys = true
                 let b = UsageBucket(
                     id: "scoped:\(label)", label: label,
                     percent: JSONScalar.number(flat["utilization"]),

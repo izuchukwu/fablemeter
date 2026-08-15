@@ -228,10 +228,14 @@ enum Store {
     /// against a temporary file instead of the user's own.
     static var directoryOverride: URL?
 
-    /// Still `ClaudeUsageBar`, after the app itself became Claude Battery, and
-    /// that is deliberate. Nobody sees this path, so renaming it buys nothing —
-    /// and what it costs is a migration of the only copy of every account's
-    /// refresh token. `--selftest` pins the name so it cannot drift by accident.
+    /// Still `ClaudeUsageBar`, two renames after the app stopped being called
+    /// that — Claude Usage Bar, then Claude Battery, now Fablemeter — and the
+    /// stale name is deliberate every time. Nobody sees this path, so renaming
+    /// it buys nothing, and what it costs is a migration of the only copy of
+    /// every account's refresh token: those tokens are single-use and rotate, so
+    /// a move that dropped the file would orphan the accounts with nothing to
+    /// recover them from. `--selftest` pins the name so it cannot drift by
+    /// accident.
     static var directory: URL {
         if let directoryOverride { return directoryOverride }
         return FileManager.default

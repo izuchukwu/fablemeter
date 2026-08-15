@@ -128,7 +128,7 @@ final class LoopbackCallback: @unchecked Sendable {
 
     let port: UInt16
     private let listener: NWListener
-    private let queue = DispatchQueue(label: "com.izu.claudeusagebar.callback")
+    private let queue = DispatchQueue(label: "com.izu.fablemeter.callback")
     private var readyCont: CheckedContinuation<Void, Error>?
     private var resultCont: CheckedContinuation<[String: String], Error>?
     /// Everyone waiting for the socket to actually be gone.

@@ -1,4 +1,4 @@
-# Claude Battery
+# Fablemeter
 
 A macOS menu bar app that tracks the 5-hour, weekly, and Fable weekly usage
 windows for up to three Claude accounts at once.
@@ -46,6 +46,33 @@ measures 11.7:1 against a dark menu bar but 1.3:1 against a light one, which is
 not a signal. So a dark bar gets `systemYellow` and a light bar gets a darker
 yellow of the same hue, at 4.1:1. `--selftest` measures both.
 
+## Readings, zeros and nothing
+
+The API sends each window's percent as a number or as `null`, and the two are
+different facts kept apart end to end:
+
+| The server said | headroom | Gauge | Row | Verdict |
+| --- | --- | --- | --- | --- |
+| `74` | counts | painted, level | `74%` + reset | Available / Limited / … |
+| `0` | counts as a whole window | painted, full | `0%` + `—` | Available |
+| `null` | skipped | — | `—` + `—` | — |
+| nothing at all | nothing resolves | hollow, empty | dashes | No data |
+
+A reported zero means the window is untouched, which is the *best* possible
+reading, not a missing one — an account that has simply not been used reads
+`Available`. Only a payload with no readings in it at all resolves to `No data`,
+and it is called that rather than "Unknown" because every other word in that slot
+names something to act on or wait out.
+
+The menu bar track carries the same distinction on its own axis:
+
+```
+painted + level   live data
+painted + empty   blocked, and the server said so
+outline + level   stale — the last reading, no longer refreshing
+outline + empty   no reading
+```
+
 ## Polling
 
 Each account is fetched once every **5 minutes**, and the accounts in a cycle
@@ -70,8 +97,8 @@ a hollow gauge, which is what tells you it is no longer live.
 ## Build
 
 ```sh
-./build.sh          # swift build -c release + "dist/Claude Battery.app"
-open "dist/Claude Battery.app"
+./build.sh          # swift build -c release + "dist/Fablemeter.app"
+open "dist/Fablemeter.app"
 ```
 
 Swift 5.9+, macOS 14+, no third-party dependencies, no Xcode project.
@@ -97,11 +124,12 @@ relaunch without a separate index to keep in sync.
 ## Storage
 
 Accounts live in `~/Library/Application Support/ClaudeUsageBar/accounts.json`
-(directory 0700, file 0600). That directory keeps the old name on purpose: it is
-invisible to the user, it holds the only copy of each account's refresh token,
-and moving it would be a migration with nothing to gain. The bundle identifier
-(`com.izu.claudeusagebar`) is unchanged for the same reason — it is the app's
-identity to LaunchServices, not a label anyone reads. Refresh tokens are stored there in plaintext rather
+(directory 0700, file 0600). That directory keeps the old name on purpose, and
+keeps it through every rename of the app: it is invisible to the user, it holds
+the only copy of each account's refresh token, and those tokens are single-use
+and rotate — so a migration that dropped the file would orphan the accounts with
+nothing left to recover them from. `--selftest` pins the path so it cannot drift
+by accident. Refresh tokens are stored there in plaintext rather
 than the Keychain: the app is ad-hoc signed, so every rebuild changes its
 signature and macOS would prompt for Keychain access on each launch.
 
@@ -112,7 +140,8 @@ signature and macOS would prompt for Keychain access on each launch.
 | `--selftest` | Decodes an embedded usage fixture, walks the polling and backoff schedules, and exercises token rotation — single-flight refresh, persist-before-return, and the terminal `needs sign-in` state — with no network. Also runs the callback-loop checks below, so consecutive reconnects stay covered. |
 | `--callback-loop [cycles] [delayMs]` | Runs the sign-in's loopback listener over and over in one process — bind, receive the redirect, tear down — plus an abandoned flow that never gets a redirect. No browser, no credentials. This is the second reconnect in a session, on its own. |
 | `--probe` | Reads Claude Code's existing access token read-only and prints live parsed buckets. Never writes or refreshes it. |
-| `--demo` | Six fake in-memory accounts, for looking at the drawing: blocked, rate limited, healthy, one whose credential the server has rejected, one with Fable spent, and one with Fable spent *and* nothing else left. |
+| (always on) | Every successful poll writes one line to the unified log describing the shape of what it decoded — which `kind`s came back, each reading as a number or `null`, whether a reset window was present, and the headroom it resolved to. Read it with `log show --predicate 'subsystem == "com.izu.fablemeter"' --last 30m`. It names the account by its menu bar letter and nothing else; no part of `accounts.json` and no credential goes near it. |
+| `--demo` | Eight fake in-memory accounts, for looking at the drawing: blocked, rate limited, healthy, one whose credential the server has rejected, one with Fable spent, one with Fable spent *and* nothing else left, one the server reports as untouched (`0%` everywhere, Available), and one the server reports nothing about (dashes everywhere, No data). |
 | `--render-popover <dir>` | Writes the popover itself in both appearances, without a menu bar or a click. |
 | `--render <dir>` | Writes the menu bar image for every state in both appearances. The real menu bar takes its appearance from the desktop picture behind it, so a dark wallpaper otherwise makes the light case impossible to see on screen. |
 

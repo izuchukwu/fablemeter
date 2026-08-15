@@ -21,6 +21,20 @@ struct BarCell: Equatable {
     /// old that is.
     let isFableExhausted: Bool
 
+    /// The track is drawn hollow rather than painted. Two ways to earn it, and
+    /// they are the same statement: there is no live reading behind this gauge.
+    /// Either nothing arrived (`isUnreachable`) or what arrived measured nothing
+    /// (`headroom == nil`). Keying only off the connection left the second case
+    /// drawing a painted, empty track — one alpha step from a blocked account,
+    /// which is the pair the eye most needs kept apart. With both on the same
+    /// axis the four states read cleanly:
+    ///
+    ///     painted + level  live data
+    ///     painted + empty  blocked, and the server said so
+    ///     outline + level  stale — last known reading, no longer refreshing
+    ///     outline + empty  no reading
+    var isOutlined: Bool { isUnreachable || headroom == nil }
+
     init(
         character: Character,
         headroom: Double?,
@@ -218,12 +232,14 @@ enum BarRenderer {
                         roundedRect: barRect, xRadius: radius, yRadius: radius
                     )
 
-                    // The track says whether the reading is live: painted when
-                    // it is, hollow when the last fetch failed. So a hollow
-                    // gauge means "no data", and a painted one with nothing
-                    // inside means "the data says zero" — two different
-                    // problems, two different pictures.
-                    if cell.isUnreachable {
+                    // The track says whether there is a live reading behind the
+                    // gauge: painted when there is, hollow when there is not —
+                    // whether that is because the fetch failed or because the
+                    // fetch succeeded and measured nothing. So a hollow gauge
+                    // means "no reading", and a painted one with nothing inside
+                    // means "the reading says zero" — two different problems,
+                    // two different pictures. See `BarCell.isOutlined`.
+                    if cell.isOutlined {
                         let outline = NSBezierPath(
                             roundedRect: barRect.insetBy(
                                 dx: outlineWidth / 2, dy: outlineWidth / 2
@@ -298,13 +314,13 @@ enum BarRenderer {
         let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
         if let symbol = NSImage(
             systemSymbolName: "gauge.with.dots.needle.bottom.50percent",
-            accessibilityDescription: "Claude Battery"
+            accessibilityDescription: "Fablemeter"
         )?.withSymbolConfiguration(config) {
             symbol.isTemplate = true
             return symbol
         }
         let font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        let text = "Claude Battery" as NSString
+        let text = "Fablemeter" as NSString
         let size = text.size(withAttributes: [.font: font])
         let image = NSImage(
             size: NSSize(width: ceil(size.width) + 6, height: imageHeight), flipped: false
@@ -346,7 +362,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             button.target = self
             button.action = #selector(togglePopover)
             button.imagePosition = .imageOnly
-            button.toolTip = "Claude Battery"
+            button.toolTip = "Fablemeter"
         }
 
         cancellable = state.objectWillChange.sink { [weak self] _ in

@@ -4,15 +4,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-# The bundle takes the display name, spaces and all — that is what Finder shows.
-# The executable inside it does not, so `ps`, `pkill` and the crash reporter all
-# still name a single word.
-APP_NAME="Claude Battery"
-EXEC_NAME="ClaudeBattery"
-# Unchanged on purpose: the bundle id is the app's identity to LaunchServices and
-# to every permission the user has already granted the deployed copy. Renaming
-# the app is cosmetic; renaming its id is not.
-BUNDLE_ID="com.izu.claudeusagebar"
+# One word, so the bundle name, the executable name and what `ps`, `pkill` and
+# the crash reporter print are all the same string.
+APP_NAME="Fablemeter"
+EXEC_NAME="Fablemeter"
+# Renamed with the app. Safe to do here because nothing the app owns is keyed to
+# it: the accounts live at a fixed Application Support path (see Store), not a
+# bundle-id one, there is no Keychain item, and no TCC permission has ever been
+# granted to this bundle.
+BUNDLE_ID="com.izu.fablemeter"
 VERSION="1.0"
 APP="dist/$APP_NAME.app"
 
