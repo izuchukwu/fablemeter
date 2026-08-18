@@ -116,6 +116,23 @@ enum UsageLog {
         return parts.joined(separator: " ")
     }
 
+    /// One line per account per *failed* poll, in the same shape as `line` so
+    /// the two interleave readably. It carries the verdict the popover is
+    /// showing, which ladder the failure was routed onto, and how deep into that
+    /// ladder the account now is — enough to reconstruct, after the fact, that
+    /// three accounts failed together at one moment rather than one account
+    /// losing its data.
+    ///
+    /// `message` has already been through `AppState.outcome(for:)`, which is the
+    /// only thing that ever builds it and never builds it from a response body.
+    /// The account is named by its one-character menu bar label and nothing
+    /// else, exactly as in `line`.
+    static func failureLine(
+        label: Character, message: String, kind: Backoff.Failure, attempt: Int
+    ) -> String {
+        "usage [\(label)] failed verdict=\(message) ladder=\(kind) attempt=\(attempt)"
+    }
+
     /// `name=absent` — never sent. `name=null/…` — sent, with no reading in it.
     /// `name=0/…` — sent, and the reading is zero. Those are three different
     /// facts and the whole point of the line is that they print differently.

@@ -51,11 +51,31 @@ enum PollPolicy {
 /// Failures that mean the request never left this machine. They cost the API
 /// nothing — there is no server to rate limit and no packet to send — so they
 /// get their own, much tighter retry cadence, and their own words on screen.
+///
+/// It also owns the words for *every other* `URLError`, because the verdict
+/// column has one rule and it is not negotiable: nothing Foundation wrote ever
+/// reaches it. Foundation's strings are composed for an alert sheet with a
+/// paragraph of room — "The request timed out.", "An SSL error has occurred and
+/// a secure connection to the server cannot be made." — and the codes it has no
+/// sentence for come back as "The operation couldn't be completed.
+/// (NSURLErrorDomain error -1011.)", which names a number and nothing a reader
+/// can do about it. In a 40pt column all three clip to noise.
 enum NetworkFailure {
     /// What the popover says instead of "The Internet connection appears to be
     /// offline." — which truncates to "The Internet connection appe…" in the
     /// verdict column and says less doing it.
     static let offlineText = "No Internet"
+
+    /// A timeout is its own fact and deserves its own word. The request left
+    /// this machine and no answer came back inside `UsageClient`'s ten seconds —
+    /// which is not an outage, and must not read like one.
+    static let timedOutText = "Timed out"
+
+    /// Every remaining `URLError`: TLS failures, unparseable responses, codes
+    /// Foundation has no sentence for at all. None of them is separately
+    /// actionable from where the reader sits, so they share one honest word
+    /// rather than each leaking a different NSError string.
+    static let genericText = "Network error"
 
     /// Every `URLError` that means "this machine cannot currently reach the
     /// network", including the DNS/host family: with no route out, a lookup for
@@ -70,9 +90,30 @@ enum NetworkFailure {
         .internationalRoamingOff
     ]
 
+    /// The timeout family. Kept as a set beside `offlineCodes` so the two are
+    /// declared the same way and neither can quietly grow into the other.
+    static let timedOutCodes: Set<URLError.Code> = [.timedOut]
+
     static func isOffline(_ error: Error) -> Bool {
         guard let url = error as? URLError else { return false }
         return offlineCodes.contains(url.code)
+    }
+
+    static func isTimedOut(_ error: Error) -> Bool {
+        guard let url = error as? URLError else { return false }
+        return timedOutCodes.contains(url.code)
+    }
+
+    /// The one place a `URLError` becomes words. `nil` for anything that is not
+    /// one, so `AppState.outcome(for:)` can carry on classifying it. Total by
+    /// construction: every `URLError` leaves here with a short string, so there
+    /// is no code — present or future, named here or not — whose Foundation
+    /// sentence can reach the screen.
+    static func text(for error: Error) -> String? {
+        guard let url = error as? URLError else { return nil }
+        if offlineCodes.contains(url.code) { return offlineText }
+        if timedOutCodes.contains(url.code) { return timedOutText }
+        return genericText
     }
 }
 

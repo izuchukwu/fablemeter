@@ -834,6 +834,84 @@ enum SelfTest {
         check("offline is never mistaken for a dead credential",
               !AppState.outcome(for: URLError(.notConnectedToInternet)).isNeedsSignIn)
 
+        // A timeout used to reach the popover as Foundation wrote it — "The
+        // request timed out." — which is a sentence, in a column sized for a
+        // word. Same treatment as offline, same single source.
+        check("a timeout reads as 'Timed out', not as Foundation's sentence",
+              AppState.outcome(for: URLError(.timedOut)).message == "Timed out",
+              "got \(AppState.outcome(for: URLError(.timedOut)).message ?? "nil")")
+        check("…and fits the verdict column like the offline word does",
+              NetworkFailure.timedOutText.count <= 12, NetworkFailure.timedOutText)
+        check("…and says something different from an outage",
+              NetworkFailure.timedOutText != NetworkFailure.offlineText)
+        check("a bridged NSError timeout gets the same word",
+              AppState.outcome(
+                  for: NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+              ).message == "Timed out")
+
+        // The general leak, closed at the source rather than case by case. Every
+        // one of these has a Foundation string, and not one of them may reach
+        // the screen. `.badServerResponse` is the sharp one: Foundation has no
+        // sentence for it at all and returns "The operation couldn't be
+        // completed. (NSURLErrorDomain error -1011.)".
+        let leakyCodes: [URLError.Code] = [
+            .timedOut, .badServerResponse, .cannotParseResponse,
+            .secureConnectionFailed, .serverCertificateUntrusted,
+            .resourceUnavailable, .unknown, .badURL, .cancelled
+        ]
+        let leaked = leakyCodes.filter { code in
+            let message = AppState.outcome(for: URLError(code)).message ?? ""
+            return message != NetworkFailure.offlineText
+                && message != NetworkFailure.timedOutText
+                && message != NetworkFailure.genericText
+        }
+        check("no URLError reaches the verdict in Foundation's words",
+              leaked.isEmpty, "leaked \(leaked)")
+        check("…including the codes Foundation has no sentence for",
+              AppState.outcome(for: URLError(.badServerResponse)).message
+              == NetworkFailure.genericText)
+        check("…and an error from no domain this app knows at all",
+              AppState.outcome(
+                  for: NSError(domain: "com.example.whatever", code: 42)
+              ).message == NetworkFailure.genericText)
+        check("every verdict string is a word, not a sentence",
+              [NetworkFailure.offlineText, NetworkFailure.timedOutText,
+               NetworkFailure.genericText].allSatisfy {
+                  $0.count <= 14 && !$0.hasSuffix(".")
+              })
+        // The named errors still say the specific thing they always said — the
+        // generic word is a floor under the unrecognised, not a replacement for
+        // what this app actually knows.
+        check("a known HTTP failure keeps its own words",
+              AppState.outcome(for: UsageError.http(503)).message == "HTTP 503")
+        check("a 429 keeps its own words",
+              AppState.outcome(for: UsageError.rateLimited(retryAfter: nil)).message
+              == "rate limited")
+        check("an OAuth failure keeps its own words",
+              AppState.outcome(for: OAuthError.refreshBusy).message == "busy")
+
+        // Which ladder a timeout belongs on. It is *not* the offline one: the
+        // request left this machine and the server may have received it, so the
+        // 15-second cadence that offline earns by costing the API nothing is
+        // exactly wrong here.
+        check("a timeout stays on the transient ladder, not the offline one",
+              AppState.outcome(for: URLError(.timedOut)).failureKind == .transient)
+        check("…so its first retry is a minute, not fifteen seconds",
+              Backoff.delay(failures: 1, kind: .transient) == 60)
+        check("…and it never retries faster than the offline ladder would",
+              (1...6).allSatisfy {
+                  Backoff.delay(failures: $0, kind: .transient)
+                  >= Backoff.delay(failures: $0, kind: .offline)
+              })
+        check("an unrecognised failure also stays transient",
+              AppState.outcome(for: URLError(.badServerResponse)).failureKind == .transient
+              && AppState.outcome(
+                  for: NSError(domain: "com.example.whatever", code: 42)
+              ).failureKind == .transient)
+        check("no new wording moved the 429 ladder",
+              (1...6).map { Backoff.delay(failures: $0, kind: .rateLimited) }
+              == [300, 600, 1200, 2400, 2700, 2700])
+
         // Jitter keeps several accounts that failed together from coming back
         // in lockstep, but must never turn into a shorter wait than intended.
         let low = Backoff.jittered(failures: 1, kind: .rateLimited) { $0.lowerBound }
@@ -998,6 +1076,144 @@ enum SelfTest {
         let neverLoaded = AccountState(snapshot: nil, error: "rate limited")
         check("only a never-loaded account has nothing to show",
               neverLoaded.snapshot == nil && !neverLoaded.isStale)
+
+        // MARK: A failure neither clears a reading nor invents one
+        //
+        // Driven through `AccountState.applying`, which is the transition the
+        // app itself runs — not a restatement of it — so these cannot pass while
+        // `fetch` does something else.
+
+        func plainBucket(_ id: String, _ label: String, _ percent: Double?) -> UsageBucket {
+            UsageBucket(id: id, label: label, percent: percent, resetsAt: nil)
+        }
+        func triple(_ percent: Double?) -> UsageSnapshot {
+            var out = UsageSnapshot()
+            out.fiveHour = plainBucket("session", "5-hour", percent)
+            out.weekly = plainBucket("weekly", "Weekly", percent)
+            out.scoped = [plainBucket("scoped:Fable", "Fable", percent)]
+            return out
+        }
+        // The three real accounts, as the log shows them: two reporting a
+        // genuine zero everywhere, one carrying live numbers.
+        let reportedZeros = triple(0)
+        let reportedNulls = triple(nil)
+        let liveNumbers = snap
+
+        let anyFailure = FetchOutcome.failure(
+            message: "Timed out", kind: .transient, retryAfter: nil
+        )
+
+        // 1. It must not clear.
+        let zerosAfter = AccountState.applying(anyFailure, to: AccountState(snapshot: reportedZeros))
+        let liveAfter = AccountState.applying(anyFailure, to: AccountState(snapshot: liveNumbers))
+        check("a failure leaves a zeros snapshot exactly where it was",
+              zerosAfter.snapshot?.fiveHour?.percent == 0
+              && zerosAfter.snapshot?.weekly?.percent == 0
+              && zerosAfter.snapshot?.fable?.percent == 0)
+        check("a failure leaves a live snapshot exactly where it was",
+              liveAfter.snapshot?.headroom == 26,
+              "got \(liveAfter.snapshot?.headroom.map { String($0) } ?? "nil")")
+        check("…and both are marked stale rather than blank",
+              zerosAfter.isStale && liveAfter.isStale)
+
+        // 2. It must not synthesise. An account that has never loaded stays
+        // empty — a failure cannot hand it a snapshot full of zeros, which is
+        // now an assertion that the server measured nothing rather than a
+        // neutral blank.
+        let neverLoadedAfter = AccountState.applying(anyFailure, to: nil)
+        check("a failure on an account that never loaded invents no snapshot",
+              neverLoadedAfter.snapshot == nil)
+        check("…so it reads as no data, not as a reported zero",
+              !neverLoadedAfter.isStale && neverLoadedAfter.isUnreachable)
+        check("a failure never manufactures a reading on an existing account",
+              AppState.outcome(for: URLError(.timedOut)).snapshot == nil
+              && AppState.outcome(for: UsageError.http(500)).snapshot == nil
+              && AppState.outcome(for: URLError(.notConnectedToInternet)).snapshot == nil)
+
+        // 3. The `0%` versus `—` distinction survives the failure. This is the
+        // bit the optional `percent` bought, and a failure is exactly where it
+        // would be cheapest to lose.
+        let nullsAfter = AccountState.applying(anyFailure, to: AccountState(snapshot: reportedNulls))
+        check("a reported zero still prints 0% after a failure",
+              MetricDisplay.percentText(zerosAfter.snapshot?.fiveHour) == "0%",
+              MetricDisplay.percentText(zerosAfter.snapshot?.fiveHour))
+        check("a null reading still prints a dash after a failure",
+              MetricDisplay.percentText(nullsAfter.snapshot?.fiveHour) == "—",
+              MetricDisplay.percentText(nullsAfter.snapshot?.fiveHour))
+        check("…and the two are still distinguishable while failing",
+              MetricDisplay.percentText(zerosAfter.snapshot?.fiveHour)
+              != MetricDisplay.percentText(nullsAfter.snapshot?.fiveHour))
+        check("a failing zeros account still resolves full headroom, not none",
+              zerosAfter.snapshot?.headroom == 100)
+        check("a failing nulls account still resolves no headroom at all",
+              nullsAfter.snapshot?.headroom == nil)
+
+        // 4. Identical failure, identical behaviour — the actual complaint. The
+        // three accounts differ only by what they were last told, never by how
+        // the failure treated them.
+        let cohort = [reportedZeros, reportedZeros, liveNumbers].map {
+            AccountState.applying(anyFailure, to: AccountState(snapshot: $0))
+        }
+        check("every account under one failure keeps its snapshot",
+              cohort.allSatisfy { $0.snapshot != nil })
+        check("…carries the same verdict word",
+              Set(cohort.map { $0.error ?? "" }) == ["Timed out"])
+        check("…is stale rather than signed out",
+              cohort.allSatisfy { $0.isStale && !$0.needsSignIn })
+        check("…and is unreachable to exactly the same degree",
+              Set(cohort.map(\.isUnreachable)) == [true])
+
+        // 5. And the menu bar agrees. With an error on every account all three
+        // gauges go hollow — but a retained reading still draws its level, which
+        // is the grammar: outline says the reading is old, the level says what
+        // it was. Only an account with nothing behind it draws hollow *and*
+        // empty.
+        let cohortCells = zip("PCI", cohort).map { character, state in
+            BarCell(
+                character: character,
+                headroom: state.snapshot?.headroom,
+                isUnreachable: state.isUnreachable,
+                isFableExhausted: state.snapshot?.isFableExhausted == true
+            )
+        }
+        check("all three gauges outline under one failure",
+              cohortCells.allSatisfy(\.isOutlined))
+        check("…and every one of them still draws a level",
+              cohortCells.allSatisfy { $0.headroom != nil })
+        check("…the zeros accounts full, the live one at what it last read",
+              cohortCells.map(\.headroom) == [100, 100, 26],
+              "got \(cohortCells.map { $0.headroom.map { Int($0) } })")
+        check("outline plus level is the stale state, not the empty one",
+              cohortCells.allSatisfy { $0.isOutlined && $0.headroom != nil }
+              && BarRenderer.fillHeight(headroom: 100) > 0)
+        let nothingEverLoaded = BarCell(
+            character: "N", headroom: neverLoadedAfter.snapshot?.headroom,
+            isUnreachable: neverLoadedAfter.isUnreachable
+        )
+        check("only an account with nothing behind it outlines with no level",
+              nothingEverLoaded.isOutlined && nothingEverLoaded.headroom == nil)
+
+        // 6. Success still overwrites, and still clears the verdict — the
+        // retention above must not have turned into a latch.
+        let recovered = AccountState.applying(.success(liveNumbers), to: zerosAfter)
+        check("a success replaces the snapshot and clears the failure",
+              recovered.snapshot?.headroom == 26 && recovered.error == nil
+              && !recovered.isStale && !recovered.isUnreachable)
+        let signedOut = AccountState.applying(.needsSignIn, to: liveAfter)
+        check("a dead credential clears the failure word and keeps no error",
+              signedOut.needsSignIn && signedOut.error == nil)
+
+        // The failure log line — the thing whose absence made this bug readable
+        // only from a screenshot.
+        let failLine = UsageLog.failureLine(
+            label: "P", message: "Timed out", kind: .transient, attempt: 2
+        )
+        check("a failed poll logs which account, verdict, ladder and depth",
+              failLine.contains("[P]") && failLine.contains("verdict=Timed out")
+              && failLine.contains("ladder=transient") && failLine.contains("attempt=2"),
+              failLine)
+        check("the failure line is one line and carries no credential or email",
+              !failLine.contains("\n") && !failLine.contains("@"), failLine)
 
         // Ordering. The array's order is the menu bar's order, left to right.
         let p = Account(email: "p@personal.com", nickname: "Personal", label: "P", refreshToken: "x")
@@ -1454,6 +1670,14 @@ extension FetchOutcome {
         if case .failure(_, let kind, _) = self { return kind }
         return nil
     }
+
+    /// The reading this outcome carries, if any. Only `.success` can, and the
+    /// tests assert exactly that: no failure classification anywhere in
+    /// `outcome(for:)` may arrive holding a snapshot it made up.
+    var snapshot: UsageSnapshot? {
+        if case .success(let snapshot) = self { return snapshot }
+        return nil
+    }
 }
 
 /// A `TokenVault` collaborator with no network behind it: it counts refreshes,
@@ -1535,6 +1759,12 @@ enum RenderStates {
         let cells = [
             BarCell(character: "P", headroom: 0, isUnreachable: false),    // blocked
             BarCell(character: "W", headroom: 22, isUnreachable: true),    // stale
+            // Stale at the other end of the gauge: an idle account whose newest
+            // fetch failed. It has to sit next to `X` below, because the two are
+            // the pair most easily confused — both hollow, and only one of them
+            // has actually lost anything. This one is showing a real reading of
+            // "nothing used"; `X` is showing no reading at all.
+            BarCell(character: "Z", headroom: 100, isUnreachable: true),   // stale, idle
             BarCell(character: "T", headroom: 85, isUnreachable: false),   // healthy
             BarCell(character: "X", headroom: nil, isUnreachable: true),   // never loaded
             // The residual case: the fetch worked and measured nothing. Rare

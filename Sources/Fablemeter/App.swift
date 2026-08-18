@@ -34,6 +34,51 @@ struct AccountState {
 
     /// Nothing live is arriving, whatever the reason — the gauge goes hollow.
     var isUnreachable: Bool { error != nil || needsSignIn }
+
+    /// The entire state transition, in one pure place so `--selftest` can drive
+    /// every outcome against every prior state without a network or a clock.
+    /// `fetch` calls this and does nothing else to the state, so what the tests
+    /// prove is what the app does — not a second copy of it that can drift.
+    ///
+    /// The invariant it exists to hold: **`snapshot` is written by exactly one
+    /// case**, and that case is `.success`. Both halves of that matter, and the
+    /// second only became sharp when `percent` went optional:
+    ///
+    ///   - A failure must not *clear* the snapshot. Blanking the numbers is the
+    ///     thing this app must never do to a transient error — settled for 429s
+    ///     and identical for every other kind.
+    ///   - A failure must not *synthesise* one either. An empty `UsageSnapshot`
+    ///     is no longer a neutral placeholder: `0%` now means the server
+    ///     reported zero. A failure path that manufactured one would not be
+    ///     blanking the UI, it would be asserting a measurement nobody took —
+    ///     which is worse, because it looks like data.
+    ///
+    /// So all three accounts behave identically under an identical failure: each
+    /// keeps whatever it last had, and the only thing that changes is the
+    /// verdict word and the hollow track behind it.
+    static func applying(_ outcome: FetchOutcome, to previous: AccountState?) -> AccountState {
+        var state = previous ?? AccountState()
+        switch outcome {
+        case .success(let snapshot):
+            state.snapshot = snapshot
+            state.error = nil
+            state.needsSignIn = false
+        case .failure(let message, _, _):
+            // The last good numbers stay exactly where they are — untouched,
+            // not re-derived. Only the verdict changes and the track goes
+            // hollow.
+            state.error = message
+            state.needsSignIn = false
+        case .needsSignIn:
+            // Terminal. No message, because there is nothing to wait out. The
+            // snapshot is left alone here too: a dead credential does not make
+            // the last reading untrue, and the row hides the metrics on its own
+            // when there was never anything behind them.
+            state.error = nil
+            state.needsSignIn = true
+        }
+        return state
+    }
 }
 
 /// What one attempt at an account came back with.
@@ -200,13 +245,15 @@ final class AppState: ObservableObject {
         let outcome = await Self.load(account, vault: vault)
         guard accounts.contains(where: { $0.id == account.id }) else { return }
 
-        var state = states[account.id] ?? AccountState()
+        // What the account now *is* — snapshot, verdict, sign-in — decided in
+        // one pure place and applied whole. What follows only decides when to
+        // ask again and what to write to the log; nothing below touches the
+        // state, so no path can set an error and clear a reading as two
+        // separate steps.
+        let state = AccountState.applying(outcome, to: states[account.id])
         var schedule = retry[account.id] ?? RetrySchedule()
         switch outcome {
         case .success(let snapshot):
-            state.snapshot = snapshot
-            state.error = nil
-            state.needsSignIn = false
             schedule.recordSuccess()
             lastUpdated = Date()
             // The poll already happened, so the shape of what it decoded is
@@ -219,17 +266,24 @@ final class AppState: ObservableObject {
                 Log.usage.notice("\(line, privacy: .public)")
             }
         case .failure(let message, let kind, let retryAfter):
-            // The last good numbers stay exactly where they are; only the
-            // verdict changes and the track goes hollow.
-            state.error = message
-            state.needsSignIn = false
             schedule.recordFailure(kind, retryAfter: retryAfter)
+            // The counterpart to the success line, and the reason this exists:
+            // the log recorded every reading that arrived and nothing at all
+            // about the ones that did not, so an app sitting on three stale
+            // accounts left no trace of why. Diagnosing that meant reading a
+            // screenshot and guessing which account a number belonged to.
+            // `message` is the string `outcome(for:)` already vetted for the
+            // screen, so no response body can reach here either.
+            if !isDemo {
+                let line = UsageLog.failureLine(
+                    label: account.character, message: message,
+                    kind: kind, attempt: schedule.failures
+                )
+                Log.usage.notice("\(line, privacy: .public)")
+            }
         case .needsSignIn:
-            // Terminal. No message, because there is nothing to wait out — and
-            // the ladder is wiped rather than climbed, so re-authenticating
+            // The ladder is wiped rather than climbed, so re-authenticating
             // starts from a clean schedule.
-            state.error = nil
-            state.needsSignIn = true
             schedule = RetrySchedule()
         }
         states[account.id] = state
@@ -296,12 +350,26 @@ final class AppState: ObservableObject {
     }
 
     nonisolated static func outcome(for error: Error) -> FetchOutcome {
-        // First, and once: a request that never left the machine is the same
-        // failure whether it died on the token refresh or on the usage call, and
-        // it has its own words and its own cadence.
-        if NetworkFailure.isOffline(error) {
+        // First, and once: every transport failure is answered here, in this
+        // app's own words, whether it died on the token refresh or on the usage
+        // call. `NetworkFailure.text(for:)` is total over `URLError`, so this
+        // branch is the reason no Foundation sentence can reach the verdict
+        // column — not a list of the ones anybody thought to name.
+        if let text = NetworkFailure.text(for: error) {
+            // Offline is the only kind that earns the tight ladder, and the
+            // reason is narrow: the request failed locally in milliseconds
+            // without ever reaching Anthropic, so retrying costs the API
+            // literally nothing. A timeout cannot make that claim — the request
+            // left, and the server may well have received it and be working on
+            // it — so it stays on the transient ladder with the 5xx it most
+            // resembles. Putting timeouts on the offline ladder would have this
+            // app retry every 15 seconds against a server already too slow to
+            // answer in ten, which is the one behaviour a passive observer must
+            // never have.
             return .failure(
-                message: NetworkFailure.offlineText, kind: .offline, retryAfter: nil
+                message: text,
+                kind: NetworkFailure.isOffline(error) ? .offline : .transient,
+                retryAfter: nil
             )
         }
         if let error = error as? OAuthError {
@@ -322,8 +390,13 @@ final class AppState: ObservableObject {
                 message: error.errorDescription ?? "failed", kind: .transient, retryAfter: nil
             )
         }
+        // Nothing recognised. Still not `error.localizedDescription`: that was
+        // the last door a raw NSError could walk through onto the screen, and an
+        // error this app has no name for is precisely the one whose Foundation
+        // sentence will be longest and least actionable. The raw text is not
+        // lost — `fetch` logs the failure — it just does not go in the verdict.
         return .failure(
-            message: error.localizedDescription, kind: .transient, retryAfter: nil
+            message: NetworkFailure.genericText, kind: .transient, retryAfter: nil
         )
     }
 
@@ -506,7 +579,15 @@ final class AppState: ObservableObject {
             ("F", "Fable spent", "izu@fable.example", 30, 20, 100, nil, false),
             ("B", "Fable spent, blocked", "izu@both.example", 100, 45, 100, nil, false),
             ("U", "Untouched", "izu@untouched.example", 0, 0, 0, nil, false),
-            ("N", "Nothing reported", "izu@nothing.example", nil, nil, nil, nil, false)
+            ("N", "Nothing reported", "izu@nothing.example", nil, nil, nil, nil, false),
+            // The pair that reads as a bug and is not one. `U` above and this
+            // account hold the same reading — a server-reported zero everywhere
+            // — and the only difference is that this one's newest fetch failed.
+            // Side by side they are the answer to "why did that account lose its
+            // numbers": it did not. It is an idle account, and an idle account's
+            // last known reading is three zeros. The hollow track and the
+            // verdict are the whole of what the failure changed.
+            ("Z", "Idle, then timed out", "izu@idle.example", 0, 0, 0, "Timed out", false)
         ]
         var accounts: [Account] = []
         var states: [UUID: AccountState] = [:]
