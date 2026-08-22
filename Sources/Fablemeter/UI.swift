@@ -555,6 +555,7 @@ struct PopoverView: View {
         VStack(alignment: .leading, spacing: 0) {
             Text("Fablemeter")
                 .font(.system(size: 13, weight: .semibold))
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, 14)
                 .padding(.top, 11)
                 .padding(.bottom, 9)
