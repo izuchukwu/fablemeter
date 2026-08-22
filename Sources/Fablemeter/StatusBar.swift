@@ -46,6 +46,23 @@ struct BarCell: Equatable {
         self.isUnreachable = isUnreachable
         self.isFableExhausted = isFableExhausted
     }
+
+    /// How an account's state becomes a cell, under a policy. Pure, and the one
+    /// place the Fable-first switch is applied, so the selftest drives the same
+    /// composition the status item draws. With Fable-first off the exhaustion
+    /// flag is dropped *here*, not in the snapshot: Fable being spent is still a
+    /// fact about the account, it just is not something this gauge is measuring,
+    /// so the letter must not go yellow over it.
+    static func cell(
+        character: Character, state: AccountState?, fableFirst: Bool
+    ) -> BarCell {
+        BarCell(
+            character: character,
+            headroom: state?.snapshot?.headroom(fableFirst: fableFirst),
+            isUnreachable: state?.isUnreachable == true,
+            isFableExhausted: fableFirst && state?.snapshot?.isFableExhausted == true
+        )
+    }
 }
 
 /// Draws the status item image by hand. `MenuBarExtra`'s SwiftUI label cannot

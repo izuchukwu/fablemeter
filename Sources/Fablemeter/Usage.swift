@@ -73,8 +73,22 @@ struct UsageSnapshot {
     /// and a whole week in hand is not blocked, it is a non-Fable account, and
     /// this is the number that says so. The letter's colour is what carries
     /// *which* of the two this is — see `BarRenderer.glyphColor`.
-    var headroom: Double? {
-        let measured = isFableExhausted ? [fiveHour, weekly] : [fiveHour, weekly, fable]
+    var headroom: Double? { headroom(fableFirst: true) }
+
+    /// The same minimum under either policy. Fable-first is the default and is
+    /// everything above: Fable counts until it is spent, then drops out and the
+    /// letter goes yellow to say so. With Fable-first off, Fable was never in
+    /// the minimum to begin with — the gauge answers "can I use this account",
+    /// not "can I use Fable in it" — so there is no falling-back moment and
+    /// nothing for yellow to announce.
+    ///
+    /// Leaving a bucket out by *policy* is not the same fact as the server not
+    /// reporting it: the Fable reading is still decoded, still logged, still on
+    /// its own row in the popover. Only this minimum stops consulting it.
+    func headroom(fableFirst: Bool) -> Double? {
+        let measured = fableFirst && !isFableExhausted
+            ? [fiveHour, weekly, fable]
+            : [fiveHour, weekly]
         let remaining = measured
             .compactMap { $0?.percent }
             .map { 100 - $0 }

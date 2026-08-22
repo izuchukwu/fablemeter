@@ -1633,6 +1633,62 @@ enum SelfTest {
               == BarCell(character: "I", headroom: rejectedState.snapshot?.headroom,
                          isUnreachable: rejectedState.isUnreachable))
 
+        // MARK: Fable-first is a policy about the minimum, not about the data
+        //
+        // ON is today's behaviour — the fixture's 26 — and the bare `headroom`
+        // property is that case by definition. OFF takes Fable out of the
+        // minimum entirely, so the modes only diverge when Fable is the binding
+        // constraint, and yellow — which announces "the gauge dropped Fable" —
+        // can never show when there was no Fable in the gauge to drop.
+        check("fable-first on is the fixture's 26", snap.headroom(fableFirst: true) == 26)
+        check("…and is what the bare property means",
+              snap.headroom == snap.headroom(fableFirst: true))
+        check("fable-first off reads 26 here too — session binds, not Fable",
+              snap.headroom(fableFirst: false) == 26)
+
+        var pinched = UsageSnapshot()
+        pinched.fiveHour = UsageBucket(id: "session", label: "5-hour", percent: 40, resetsAt: nil)
+        pinched.weekly = UsageBucket(id: "weekly", label: "Weekly", percent: 20, resetsAt: nil)
+        pinched.scoped = [UsageBucket(id: "scoped:Fable", label: "Fable", percent: 94, resetsAt: nil)]
+        check("Fable binding: on measures it", pinched.headroom(fableFirst: true) == 6)
+        check("…off ignores it", pinched.headroom(fableFirst: false) == 60)
+
+        var spent = pinched
+        spent.scoped = [UsageBucket(id: "scoped:Fable", label: "Fable", percent: 100, resetsAt: nil)]
+        let fableSpentState = AccountState(snapshot: spent, error: nil, needsSignIn: false)
+        let onCell = BarCell.cell(character: "F", state: fableSpentState, fableFirst: true)
+        let offCell = BarCell.cell(character: "F", state: fableSpentState, fableFirst: false)
+        check("Fable spent: on goes yellow",
+              BarRenderer.showsFableYellow(
+                  headroom: onCell.headroom, fableExhausted: onCell.isFableExhausted))
+        check("…off never does",
+              !BarRenderer.showsFableYellow(
+                  headroom: offCell.headroom, fableExhausted: offCell.isFableExhausted))
+        check("…and both agree on the number once Fable is out of the minimum",
+              onCell.headroom == offCell.headroom && offCell.headroom == 60)
+
+        var noFable = pinched
+        noFable.scoped = [UsageBucket(id: "scoped:Fable", label: "Fable", percent: nil, resetsAt: nil)]
+        check("a null Fable reading is absent from the minimum, not zero",
+              noFable.headroom(fableFirst: true) == 60)
+        check("…while off leaves it out by policy — same number, different fact",
+              noFable.headroom(fableFirst: false) == 60 && !noFable.isFableExhausted)
+
+        // MARK: Start on login enrolls itself exactly once
+        //
+        // The default is ON, but only the first launch of the installed app
+        // may act on it. Anything else silently re-registering — a demo run, a
+        // bare `swift run` binary, or launch number two after the user said no
+        // — would override a choice the user already made.
+        check("first bundled launch enrolls",
+              LoginItem.shouldAutoEnroll(attempted: false, demo: false, bundled: true))
+        check("a second launch does not re-enroll",
+              !LoginItem.shouldAutoEnroll(attempted: true, demo: false, bundled: true))
+        check("demo never enrolls",
+              !LoginItem.shouldAutoEnroll(attempted: false, demo: true, bundled: true))
+        check("a bare swift-run binary never enrolls",
+              !LoginItem.shouldAutoEnroll(attempted: false, demo: false, bundled: false))
+
         // MARK: Sign-in loopback
         //
         // Reconnecting a second account without quitting first. The listener is

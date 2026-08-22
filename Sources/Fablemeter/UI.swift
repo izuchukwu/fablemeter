@@ -292,6 +292,10 @@ struct AccountRow: View {
     let account: Account
     let state: AccountState?
     let now: Date
+    /// The verdict word is the gauge's reading put into words, so it follows
+    /// the same policy the gauge does — the metric rows underneath do not: the
+    /// Fable row keeps printing whatever the server said either way.
+    let fableFirst: Bool
     /// Bumped when something outside the row is clicked — the cue to commit any
     /// in-place edit and give up focus.
     let dismissToken: Int
@@ -315,7 +319,7 @@ struct AccountRow: View {
     @State private var nameDraft = ""
     @FocusState private var focus: Field?
 
-    private var headroom: Double? { state?.snapshot?.headroom }
+    private var headroom: Double? { state?.snapshot?.headroom(fableFirst: fableFirst) }
     private var isUnreachable: Bool { state?.isUnreachable == true }
     private var needsSignIn: Bool { state?.needsSignIn == true }
     /// A rejected credential with nothing behind it has no numbers to show —
@@ -549,6 +553,13 @@ struct PopoverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            Text("Fablemeter")
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 14)
+                .padding(.top, 11)
+                .padding(.bottom, 9)
+            Divider()
+
             TimelineView(.periodic(from: .now, by: 30)) { context in
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(state.accounts.enumerated()), id: \.element.id) { index, account in
@@ -557,6 +568,7 @@ struct PopoverView: View {
                             account: account,
                             state: state.state(for: account),
                             now: context.date,
+                            fableFirst: state.isFableFirst,
                             dismissToken: dismissToken,
                             canMoveUp: state.canMove(account, by: -1),
                             canMoveDown: state.canMove(account, by: 1),
@@ -664,6 +676,14 @@ struct PopoverView: View {
                     Menu {
                         Button("Add Account…") { state.addAccount() }
                             .disabled(!state.canAddAccount)
+                        Divider()
+                        if LoginItem.isAvailable {
+                            Toggle("Start on Login", isOn: Binding(
+                                get: { LoginItem.isEnabled },
+                                set: { LoginItem.set($0) }
+                            ))
+                        }
+                        Toggle("Fable-first", isOn: $state.isFableFirst)
                         Divider()
                         Button("Quit") { NSApplication.shared.terminate(nil) }
                     } label: {

@@ -1,5 +1,6 @@
 import AppKit
 import os
+import ServiceManagement
 import SwiftUI
 
 /// The app's own log, one subsystem so `log show --predicate 'subsystem ==
@@ -102,6 +103,15 @@ final class AppState: ObservableObject {
     @Published private(set) var isManualRefreshing = false
     @Published var isSigningIn = false
     @Published var signInError: String?
+    /// Whether the gauge counts Fable in its minimum — see
+    /// `UsageSnapshot.headroom(fableFirst:)`. On by default, and `object(forKey:)`
+    /// rather than `bool(forKey:)` on purpose: an absent key means the default,
+    /// and only a stored `false` means the user turned it off — the same
+    /// missing-versus-reported distinction the readings themselves live by.
+    @Published var isFableFirst: Bool = UserDefaults.standard
+        .object(forKey: "fableFirst") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(isFableFirst, forKey: "fableFirst") }
+    }
 
     let isDemo: Bool
     private let vault = TokenVault()
@@ -149,15 +159,15 @@ final class AppState: ObservableObject {
     /// the gauge's track rather than emptying it.
     var barCells: [BarCell] {
         accounts.map { account in
-            let state = states[account.id]
-            return BarCell(
+            // Derived from the snapshot on every draw, so an account flips to
+            // yellow the moment Fable hits 100% and back the moment its week
+            // resets — no relaunch, and per account. The Fable-first toggle
+            // repaints the same way: it is `@Published`, so flipping it redraws
+            // every cell through the same factory the selftest exercises.
+            BarCell.cell(
                 character: account.character,
-                headroom: state?.snapshot?.headroom,
-                isUnreachable: state?.isUnreachable == true,
-                // Derived from the snapshot on every draw, so an account flips
-                // to yellow the moment Fable hits 100% and back the moment its
-                // week resets — no relaunch, and per account.
-                isFableExhausted: state?.snapshot?.isFableExhausted == true
+                state: states[account.id],
+                fableFirst: isFableFirst
             )
         }
     }
@@ -625,6 +635,51 @@ final class AppState: ObservableObject {
     }
 }
 
+/// Start on login, wrapped around `SMAppService.mainApp`. The service's own
+/// status is the checkbox's source of truth; UserDefaults records only that
+/// enrollment already happened once, so a choice made here or in System
+/// Settings is never overridden on a later launch.
+enum LoginItem {
+    private static let attemptedKey = "loginItemEnrollmentAttempted"
+
+    /// `swift run` has no bundle, and registering a bare debug binary as a
+    /// login item would enshrine a build path in System Settings. Only a real
+    /// .app may enroll, or show the checkbox at all.
+    static var isAvailable: Bool { Bundle.main.bundlePath.hasSuffix(".app") }
+
+    static var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    static func set(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            Log.store.error("login item \(enabled ? "register" : "unregister", privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// On by default, exactly once: the first launch of the installed app
+    /// enrolls itself, and every later launch defers to whatever the checkbox
+    /// or System Settings says now.
+    static func enrollOnFirstLaunch(demo: Bool) {
+        let defaults = UserDefaults.standard
+        guard shouldAutoEnroll(attempted: defaults.bool(forKey: attemptedKey),
+                               demo: demo,
+                               bundled: isAvailable) else { return }
+        defaults.set(true, forKey: attemptedKey)
+        set(true)
+    }
+
+    /// Kept pure so the selftest can pin the policy without touching the
+    /// real service.
+    static func shouldAutoEnroll(attempted: Bool, demo: Bool, bundled: Bool) -> Bool {
+        !attempted && !demo && bundled
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let demo: Bool
@@ -638,6 +693,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        LoginItem.enrollOnFirstLaunch(demo: demo)
         let state = AppState(demo: demo)
         self.state = state
         self.statusBar = StatusBarController(state: state)
