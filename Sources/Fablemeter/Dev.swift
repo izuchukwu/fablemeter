@@ -4,7 +4,10 @@ import SwiftUI
 
 // MARK: - Fixture
 
-/// A real `/api/oauth/usage` response, captured verbatim. Embedded as a string
+/// A real `/api/oauth/usage` response — the shape is captured as-is, but the
+/// undocumented bucket keys (`bucket_a`…`bucket_f`) are renamed placeholders:
+/// their real names are internal identifiers that do not belong in a public
+/// repo, and the decoder ignores unknown keys either way. Embedded as a string
 /// rather than a resource bundle so the hand-assembled .app stays a single binary.
 enum Fixture {
     static let usageJSON = """
