@@ -1,0 +1,5 @@
+- generic [ref=e4]:
+  - banner [ref=e5]:
+    - heading "Fablemeter" [level=1] [ref=e6]
+  - main [ref=e7]:
+    - button "Continue with Google" [ref=e11]

@@ -1785,9 +1785,22 @@ enum SelfTest {
         check("…carrying the port and the state",
               cURL?.queryItems?.contains(URLQueryItem(name: "port", value: "49152")) == true
               && cURL?.queryItems?.contains(URLQueryItem(name: "state", value: "s-abc")) == true)
-        let hex = Connect.randomHex(bytes: 16)
+        let hex = (try? Connect.randomHex(bytes: 16)) ?? ""
         check("connect state is 32 hex characters",
               hex.count == 32 && hex.allSatisfy { "0123456789abcdef".contains($0) }, hex)
+        // The state is minted fail-closed: a dead entropy source refuses the
+        // whole attempt, and nothing quieter than the real source will do.
+        check("a dead entropy source refuses to mint a state",
+              (try? Connect.randomHex(bytes: 16, using: { _ in nil })) == nil)
+        check("…as the vetted entropy error",
+              { do { _ = try Connect.randomHex(bytes: 16, using: { _ in nil }); return false }
+                catch { return error as? ConnectError == .entropyFailed } }())
+        check("a short read counts as a dead source too",
+              (try? Connect.randomHex(bytes: 16, using: { _ in [0xab] })) == nil)
+        check("an injected source still mints proper hex",
+              (try? Connect.randomHex(bytes: 2, using: { count in
+                  [UInt8](repeating: 0xab, count: count)
+              })) == "abab")
 
         check("a matching callback yields its code",
               (try? Connect.code(from: ["code": "c1", "state": "s"], expecting: "s")) == "c1")

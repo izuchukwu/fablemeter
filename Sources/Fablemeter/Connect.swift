@@ -13,6 +13,7 @@ enum ConnectError: LocalizedError, Equatable {
     case exchange(Int)
     case malformed
     case storeFailed
+    case entropyFailed
 
     var errorDescription: String? { displayText }
 
@@ -24,6 +25,7 @@ enum ConnectError: LocalizedError, Equatable {
         case .exchange(let code): return "connect failed (\(code))"
         case .malformed: return "unexpected response"
         case .storeFailed: return "could not store the key"
+        case .entropyFailed: return "secure randomness unavailable"
         }
     }
 }
@@ -106,12 +108,26 @@ enum Connect {
     static let webBase = URL(string: "https://fablemeter.oniconic.app")!
     static let timeout: TimeInterval = 300
 
-    static func randomHex(bytes count: Int) -> String {
-        var buf = [UInt8](repeating: 0, count: count)
-        if SecRandomCopyBytes(kSecRandomDefault, count, &buf) != errSecSuccess {
-            for i in 0..<count { buf[i] = UInt8.random(in: 0...255) }
+    /// The state is the whole defense against a malicious local page, so its
+    /// entropy source is not allowed to degrade quietly: if the system refuses
+    /// to hand over random bytes, the connect attempt refuses to exist rather
+    /// than proceeding on a weaker substitute. Injectable so the selftest can
+    /// prove the refusal without breaking the real source.
+    static func randomHex(
+        bytes count: Int,
+        using source: (Int) -> [UInt8]? = secureRandomBytes
+    ) throws -> String {
+        guard let buf = source(count), buf.count == count else {
+            throw ConnectError.entropyFailed
         }
         return buf.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// `nil` on failure — never a substitute.
+    static func secureRandomBytes(_ count: Int) -> [UInt8]? {
+        var buf = [UInt8](repeating: 0, count: count)
+        guard SecRandomCopyBytes(kSecRandomDefault, count, &buf) == errSecSuccess else { return nil }
+        return buf
     }
 
     /// Pure, so the selftest can pin the shape the site expects.
@@ -152,7 +168,7 @@ enum Connect {
         store: PushKeyStore = .standard,
         open: @escaping @Sendable (URL) -> Void = { NSWorkspace.shared.open($0) }
     ) async throws {
-        let state = randomHex(bytes: 16)
+        let state = try randomHex(bytes: 16)
         let params: [String: String]
         do {
             params = try await LoopbackCallback.withServer(
