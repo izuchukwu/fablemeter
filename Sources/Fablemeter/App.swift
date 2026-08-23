@@ -152,7 +152,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    var canAddAccount: Bool { !isDemo && accounts.count < Store.maxAccounts && !isSigningIn }
+    var canAddAccount: Bool { !isDemo && !isSigningIn }
 
     /// What the status item draws, one cell per account. `headroom` is the last
     /// reading that arrived even when the newest attempt failed, so a 429 dims

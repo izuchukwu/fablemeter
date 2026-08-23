@@ -222,8 +222,6 @@ final class RefreshLock: @unchecked Sendable {
 /// on to: a rotated token that landed on disk a second ago must not be undone by
 /// a rename or a reorder carrying a stale copy of it.
 enum Store {
-    static let maxAccounts = 3
-
     /// Only `--selftest` sets this, so a real save/load round-trip can run
     /// against a temporary file instead of the user's own.
     static var directoryOverride: URL?
