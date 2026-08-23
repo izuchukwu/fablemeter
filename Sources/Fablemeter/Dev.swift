@@ -1769,6 +1769,81 @@ enum SelfTest {
               pushOn.first.map { Set($0.keys) }
               == Set(["id", "label", "nickname", "headroom", "verdict", "isStale", "buckets"]))
 
+        // MARK: The web connect handoff
+        //
+        // Izu's own design: the site mints a one-time code and hands it to a
+        // listener that exists only for the redirect. What these pin: the URL
+        // shape the site expects, the state discipline (a public repo means a
+        // public port scheme, so state is the whole defense), where the key
+        // may live, and that a rejected key stops pushing without touching
+        // the gauge.
+        let cURL = URLComponents(
+            url: Connect.connectURL(port: 49152, state: "s-abc"), resolvingAgainstBaseURL: false
+        )
+        check("connect URL points at the site's /connect",
+              cURL?.host == "fablemeter.oniconic.app" && cURL?.path == "/connect")
+        check("…carrying the port and the state",
+              cURL?.queryItems?.contains(URLQueryItem(name: "port", value: "49152")) == true
+              && cURL?.queryItems?.contains(URLQueryItem(name: "state", value: "s-abc")) == true)
+        let hex = Connect.randomHex(bytes: 16)
+        check("connect state is 32 hex characters",
+              hex.count == 32 && hex.allSatisfy { "0123456789abcdef".contains($0) }, hex)
+
+        check("a matching callback yields its code",
+              (try? Connect.code(from: ["code": "c1", "state": "s"], expecting: "s")) == "c1")
+        check("a state mismatch is refused",
+              (try? Connect.code(from: ["code": "c1", "state": "evil"], expecting: "s")) == nil)
+        check("a callback with no code is refused",
+              (try? Connect.code(from: ["state": "s"], expecting: "s")) == nil)
+
+        func keyStore(keychain: String?, file: String?) -> PushKeyStore {
+            PushKeyStore(
+                readKeychain: { keychain }, writeKeychain: { _ in true }, readFile: { file }
+            )
+        }
+        check("the Keychain key outranks the file",
+              keyStore(keychain: "kc", file: "file").currentKey() == "kc")
+        check("the file stands in when the Keychain is empty",
+              keyStore(keychain: nil, file: "file").currentKey() == "file")
+        check("neither store means no key",
+              keyStore(keychain: nil, file: nil).currentKey() == nil)
+
+        check("a rejected key stops pushing", Pusher.isSuppressed(key: "k", rejected: "k"))
+        check("a fresh key resumes", !Pusher.isSuppressed(key: "k2", rejected: "k"))
+        check("no key is not a rejection", !Pusher.isSuppressed(key: nil, rejected: nil))
+
+        let named = PushPayload.body(accounts: [], states: [:], fableFirst: true, machine: "Izu's Mac")
+        check("the payload names the machine", named["machine"] as? String == "Izu's Mac")
+        let unnamed = PushPayload.body(accounts: [], states: [:], fableFirst: true)
+        check("…and omits it when unnamed, rather than nulling it",
+              unnamed["machine"] == nil)
+
+        // MARK: The curated demo trio
+        //
+        // `--demo 3` is for product shots; the full set is for eyeballing
+        // every state and reads as a wall of failures in a screenshot.
+        let everyState = AppState.demoData()
+        check("bare --demo keeps the full every-state set",
+              everyState.accounts.count == 9
+              && everyState.states.values.contains { $0.error != nil }
+              && everyState.states.values.contains { $0.needsSignIn })
+        let trio = AppState.demoData(count: 3)
+        check("--demo 3 seeds the showcase trio",
+              trio.accounts.map(\.nickname) == ["Personal", "Work", "Team"])
+        check("…every one healthy and painted",
+              trio.states.values.allSatisfy { $0.error == nil && !$0.needsSignIn && $0.snapshot != nil })
+        let trioHeadrooms = trio.accounts.compactMap {
+            trio.states[$0.id]?.snapshot?.headroom(fableFirst: true)
+        }
+        check("…spread comfortable / mid / tight",
+              trioHeadrooms == [85, 45, 12], "\(trioHeadrooms)")
+        check("…with the tight one in the orange tier, not red",
+              trioHeadrooms.last.map { $0 <= 25 && $0 > 10 } == true)
+        check("asking for more than the showcase holds gets all of it",
+              AppState.demoData(count: 7).accounts.count == 3)
+
+        ConnectAudit.run(check: check)
+
         // MARK: Sign-in loopback
         //
         // Reconnecting a second account without quitting first. The listener is
@@ -2088,6 +2163,120 @@ enum Probe {
 /// the credentials. The point is what a *single* run can never show: whether a
 /// finished flow, or an abandoned one, leaves anything behind that the next
 /// reconnect trips over.
+/// The connect handoff, exercised the way `CallbackLoop` exercises sign-in's
+/// listener: really binding, really hitting it over local HTTP, really
+/// abandoning it. What is different here — and what these checks exist for —
+/// is the ephemeral port, and the listener refusing a wrong-state callback
+/// at the socket without consuming the attempt.
+enum ConnectAudit {
+    /// A `Connect.run` with the site played by `redirect` and the network
+    /// stubbed out. Returns "stored" on success, the error's display text
+    /// otherwise.
+    private static func drive(
+        timeout: TimeInterval,
+        code: String = "c-42",
+        redirect: @escaping @Sendable (_ port: String, _ state: String) -> Void
+    ) async -> String {
+        final class Box: @unchecked Sendable { var key: String? }
+        let box = Box()
+        let store = PushKeyStore(
+            readKeychain: { nil },
+            writeKeychain: { box.key = $0; return true },
+            readFile: { nil }
+        )
+        do {
+            try await Connect.run(
+                timeout: timeout,
+                exchange: { received in
+                    guard received == code else { throw ConnectError.malformed }
+                    return "key-42"
+                },
+                store: store,
+                open: { url in
+                    let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+                    let port = comps?.queryItems?.first { $0.name == "port" }?.value ?? "0"
+                    let state = comps?.queryItems?.first { $0.name == "state" }?.value ?? ""
+                    redirect(port, state)
+                }
+            )
+            return box.key == "key-42" ? "stored" : "wrong key"
+        } catch {
+            return (error as? ConnectError)?.displayText ?? "\(error)"
+        }
+    }
+
+    private static func hit(_ port: String, code: String, state: String) async -> Int {
+        let url = URL(string: "http://127.0.0.1:\(port)/callback?code=\(code)&state=\(state)")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3
+        let (_, response) = (try? await URLSession.shared.data(for: request)) ?? (Data(), URLResponse())
+        return (response as? HTTPURLResponse)?.statusCode ?? 0
+    }
+
+    static func run(check: (String, Bool, String) -> Void) {
+        // 1. The advertised port is real: an ephemeral bind reports what the
+        // kernel assigned, and the whole handoff completes against it.
+        let happy = CallbackLoop.bounded(seconds: 12) {
+            await drive(timeout: 5) { port, state in
+                Task.detached { _ = await hit(port, code: "c-42", state: state) }
+            }
+        }
+        check("a full handoff on an ephemeral port stores the exchanged key",
+              happy == "stored", happy ?? "HUNG")
+
+        // 2. A guessed callback — right port, wrong state — is answered as a
+        // stranger and does not consume the attempt: the real redirect still
+        // lands afterwards. The repo is public, so the port scheme is public;
+        // this is the check that a guesser gets nothing.
+        final class Status: @unchecked Sendable { var wrongState = 0 }
+        let status = Status()
+        let guessed = CallbackLoop.bounded(seconds: 12) {
+            await drive(timeout: 6) { port, state in
+                Task.detached {
+                    status.wrongState = await hit(port, code: "evil", state: "guessed")
+                    _ = await hit(port, code: "c-42", state: state)
+                }
+            }
+        }
+        check("a wrong-state callback cannot consume the handoff",
+              guessed == "stored", guessed ?? "HUNG")
+        check("…and is answered as a stranger",
+              status.wrongState == 404, "got \(status.wrongState)")
+
+        // 3. Abandoned — the browser never comes back. It times out rather
+        // than wedging, exactly like the sign-in it is built on.
+        let abandoned = CallbackLoop.bounded(seconds: 12) {
+            await drive(timeout: 0.5) { _, _ in }
+        }
+        check("an abandoned connect times out instead of hanging",
+              abandoned == "connect timed out", abandoned ?? "HUNG")
+
+        // 4. …and the next handoff after an abandoned one still works: the
+        // ephemeral listener was genuinely torn down.
+        let after = CallbackLoop.bounded(seconds: 12) {
+            await drive(timeout: 5) { port, state in
+                Task.detached { _ = await hit(port, code: "c-42", state: state) }
+            }
+        }
+        check("a connect after an abandoned one still works",
+              after == "stored", after ?? "HUNG")
+
+        // 5. The listener's bind is pinned to loopback. Behavioral proof for
+        // "127.0.0.1 only" would need a second interface; pinning the
+        // required host refuses the drift that matters — someone widening
+        // the bind to "any".
+        let host = CallbackLoop.bounded(seconds: 12) {
+            do {
+                return try await LoopbackCallback.withServer(ports: [0]) { server in
+                    "\(server.requiredHost)"
+                }
+            } catch { return "\(error)" }
+        }
+        check("the handoff listener is required onto loopback",
+              host == "127.0.0.1", host ?? "HUNG")
+    }
+}
+
 enum CallbackLoop {
     /// One listen → redirect → resolve → stop cycle, structured exactly the way
     /// `OAuth.signIn` structures it. `deliver: false` abandons the flow, which
@@ -2116,8 +2305,9 @@ enum CallbackLoop {
 
     /// Runs `body` on its own task and refuses to wait forever for it — the
     /// harness cannot use a task group here, because a task group is the very
-    /// thing being tested for hanging.
-    private static func bounded(
+    /// thing being tested for hanging. `ConnectAudit` borrows it for the same
+    /// reason.
+    static func bounded(
         seconds: Double, _ body: @escaping @Sendable () async -> String
     ) -> String? {
         final class Box: @unchecked Sendable { var value: String? }

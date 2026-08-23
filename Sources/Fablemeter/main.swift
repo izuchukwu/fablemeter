@@ -35,7 +35,13 @@ if arguments.contains("--probe") {
 }
 
 // Top-level code already runs on the main thread.
-let delegate = MainActor.assumeIsolated { AppDelegate(demo: arguments.contains("--demo")) }
+// `--demo` takes an optional count: `--demo 3` seeds the curated showcase trio
+// (product shots) instead of the full every-state set.
+let demoIndex = CommandLine.arguments.firstIndex(of: "--demo")
+let demoCount = demoIndex.flatMap { CommandLine.arguments.dropFirst($0 + 1).first.flatMap(Int.init) }
+let delegate = MainActor.assumeIsolated {
+    AppDelegate(demo: demoIndex != nil, demoCount: demoCount)
+}
 let application = NSApplication.shared
 application.delegate = delegate
 application.setActivationPolicy(.accessory)

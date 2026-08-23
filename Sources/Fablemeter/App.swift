@@ -104,6 +104,9 @@ final class AppState: ObservableObject {
     @Published private(set) var isManualRefreshing = false
     @Published var isSigningIn = false
     @Published var signInError: String?
+    /// True while the web-companion handoff is in flight, so the menu item
+    /// cannot stack a second listener behind the first.
+    @Published private(set) var isConnectingWeb = false
     /// Whether the gauge counts Fable in its minimum — see
     /// `UsageSnapshot.headroom(fableFirst:)`. On by default, and `object(forKey:)`
     /// rather than `bool(forKey:)` on purpose: an absent key means the default,
@@ -127,10 +130,10 @@ final class AppState: ObservableObject {
     private var retry: [UUID: RetrySchedule] = [:]
     private var isPassRunning = false
 
-    init(demo: Bool = false) {
+    init(demo: Bool = false, demoCount: Int? = nil) {
         isDemo = demo
         if demo {
-            let seeded = AppState.demoData()
+            let seeded = AppState.demoData(count: demoCount)
             accounts = seeded.accounts
             states = seeded.states
             lastUpdated = Date()
@@ -365,6 +368,7 @@ final class AppState: ObservableObject {
     /// code, never a body.
     nonisolated static func signInMessage(for error: Error) -> String {
         if let error = error as? OAuthError { return error.displayText }
+        if let error = error as? ConnectError { return error.displayText }
         return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
@@ -460,6 +464,25 @@ final class AppState: ObservableObject {
                 signInError = Self.signInMessage(for: error)
                 isSigningIn = false
             }
+        }
+    }
+
+    /// The web companion's localhost handoff, from the ⋯ menu. On success the
+    /// key is in the Keychain and the pusher picks it up on the next pass —
+    /// no relaunch, nothing else to do. Failures land in the same banner as
+    /// sign-in failures, in the same vetted vocabulary.
+    func connectWeb() {
+        guard !isDemo, !isConnectingWeb else { return }
+        isConnectingWeb = true
+        signInError = nil
+        Task {
+            do {
+                try await Connect.run()
+                Log.push.notice("connect: key stored")
+            } catch {
+                signInError = Self.signInMessage(for: error)
+            }
+            isConnectingWeb = false
         }
     }
 
@@ -586,11 +609,22 @@ final class AppState: ObservableObject {
     /// server reports as untouched (`0%` rows, a full gauge, `Available`) and an
     /// account the server reports nothing about at all (dashes, a hollow gauge,
     /// `No data`). Both used to read `Unknown` over three `0%` rows.
-    private static func demoData() -> (accounts: [Account], states: [UUID: AccountState]) {
-        let specs: [(
+    nonisolated static func demoData(count: Int? = nil) -> (accounts: [Account], states: [UUID: AccountState]) {
+        typealias Spec = (
             label: String, nickname: String, email: String,
             five: Double?, weekly: Double?, fable: Double?, error: String?, needsSignIn: Bool
-        )] = [
+        )
+        // The showcase set, for a count: healthy, painted, and varied —
+        // comfortable, mid, and tight-enough-to-tier — because a product shot
+        // of the every-state set below reads as a wall of failures. Asking for
+        // more than it holds gets all of it rather than sliding into the
+        // failure states; the full set stays what a bare `--demo` means.
+        let showcase: [Spec] = [
+            ("P", "Personal", "izu@personal.example", 15, 10, 12, nil, false),
+            ("W", "Work", "izu@work.example", 55, 40, 30, nil, false),
+            ("T", "Team", "izu@team.example", 88, 60, 75, nil, false),
+        ]
+        let fullSpecs: [Spec] = [
             ("P", "Personal", "izu@personal.com", 100, 5, nil, nil, false),
             ("W", "Work", "izu@work.example", 78, 20, 40, "rate limited", false),
             ("T", "Team", "izu@team.example", 15, 5, 10, nil, false),
@@ -608,6 +642,7 @@ final class AppState: ObservableObject {
             // verdict are the whole of what the failure changed.
             ("Z", "Idle, then timed out", "izu@idle.example", 0, 0, 0, "Timed out", false)
         ]
+        let specs = count.map { Array(showcase.prefix(max(1, $0))) } ?? fullSpecs
         var accounts: [Account] = []
         var states: [UUID: AccountState] = [:]
         for spec in specs {
@@ -692,18 +727,20 @@ enum LoginItem {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let demo: Bool
+    private let demoCount: Int?
     private var state: AppState?
     private var statusBar: StatusBarController?
 
-    init(demo: Bool) {
+    init(demo: Bool, demoCount: Int? = nil) {
         self.demo = demo
+        self.demoCount = demoCount
         super.init()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         LoginItem.enrollOnFirstLaunch(demo: demo)
-        let state = AppState(demo: demo)
+        let state = AppState(demo: demo, demoCount: demoCount)
         self.state = state
         self.statusBar = StatusBarController(state: state)
     }

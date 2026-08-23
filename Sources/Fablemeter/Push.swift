@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 // MARK: - Payload
 
@@ -17,9 +18,10 @@ enum PushPayload {
         accounts: [Account],
         states: [UUID: AccountState],
         fableFirst: Bool,
-        now: Date = Date()
+        now: Date = Date(),
+        machine: String? = nil
     ) -> [String: Any] {
-        [
+        var payload: [String: Any] = [
             "updatedAt": iso.string(from: now),
             "accounts": accounts.map { account -> [String: Any] in
                 let state = states[account.id]
@@ -40,17 +42,25 @@ enum PushPayload {
                 ]
             },
         ]
+        // Named machines let the key-management page say which Mac last
+        // pushed, so a lost one is recognizable before it is cut off.
+        // Optional, and omitted rather than nulled when unnamed: the contract
+        // reserves null for a reading that exists and is empty.
+        if let machine { payload["machine"] = machine }
+        return payload
     }
 
     static func data(
         accounts: [Account],
         states: [UUID: AccountState],
         fableFirst: Bool,
-        now: Date = Date()
+        now: Date = Date(),
+        machine: String? = nil
     ) throws -> Data {
         try JSONSerialization.data(
             withJSONObject: body(
-                accounts: accounts, states: states, fableFirst: fableFirst, now: now
+                accounts: accounts, states: states, fableFirst: fableFirst,
+                now: now, machine: machine
             ),
             options: [.sortedKeys]
         )
@@ -82,29 +92,54 @@ enum PushPayload {
 /// no UI, one log line per outcome. The ten-second timeout is so a hung push
 /// cannot stack up behind a healthy poll loop.
 final class Pusher {
-    private let secret: String?
+    private let keys: PushKeyStore
     private let endpoint = URL(string: "https://fablemeter.oniconic.app/api/push")!
+    /// How the key-management page names this Mac.
+    private let machine = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
 
-    /// The secret is read once, at startup, and its value goes into the
-    /// Authorization header and nowhere else — never a log line, never an
-    /// error message. A missing or unreadable file switches the pusher off for
-    /// the whole session, said once so five-minute polling does not turn one
-    /// absent file into a log column.
-    init(secretFile: URL = Store.directory.appendingPathComponent("push-secret.txt")) {
-        let raw = try? String(contentsOf: secretFile, encoding: .utf8)
-        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
-        secret = (trimmed?.isEmpty == false) ? trimmed : nil
-        if secret == nil {
-            Log.push.notice("push: no secret, disabled")
-        }
+    /// Written by the detached completion, read by the next pass — locked, not
+    /// hoped about.
+    private struct Flags {
+        var loggedMissing = false
+        var rejected: String?
+    }
+    private let flags = OSAllocatedUnfairLock<Flags>(initialState: Flags())
+
+    init(keys: PushKeyStore = .standard) {
+        self.keys = keys
+    }
+
+    /// A key the server has rejected stays rejected — retrying it every five
+    /// minutes is hammering a locked door with the same key. Only a
+    /// *different* key (a reconnect, or a re-provisioned file) resumes. Pure,
+    /// so the selftest can pin the policy.
+    static func isSuppressed(key: String?, rejected: String?) -> Bool {
+        key != nil && key == rejected
     }
 
     func push(accounts: [Account], states: [UUID: AccountState], fableFirst: Bool) {
-        guard let secret else { return }
+        // Resolved per pass rather than once at startup, so a connect that
+        // lands mid-session starts pushing on the next pass without a
+        // relaunch. The value goes into the Authorization header and nowhere
+        // else — never a log line, never an error message. No key at all is
+        // said once, so five-minute polling does not turn one absent key into
+        // a log column.
+        guard let key = keys.currentKey() else {
+            let firstTime = flags.withLock { state -> Bool in
+                if state.loggedMissing { return false }
+                state.loggedMissing = true
+                return true
+            }
+            if firstTime { Log.push.notice("push: no key, disabled — connect from the ⋯ menu") }
+            return
+        }
+        guard !flags.withLock({ Self.isSuppressed(key: key, rejected: $0.rejected) }) else {
+            return
+        }
         let payload: Data
         do {
             payload = try PushPayload.data(
-                accounts: accounts, states: states, fableFirst: fableFirst
+                accounts: accounts, states: states, fableFirst: fableFirst, machine: machine
             )
         } catch {
             Log.push.error("push failed encoding")
@@ -113,17 +148,24 @@ final class Pusher {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = 10
-        request.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = payload
         let count = accounts.count
-        Task.detached {
+        Task.detached { [flags] in
             do {
                 let (_, response) = try await URLSession.shared.data(for: request)
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if code == 200 {
+                switch code {
+                case 200:
                     Log.push.notice("push ok accounts=\(count, privacy: .public)")
-                } else {
+                case 401:
+                    // The server no longer knows this key — revoked, or the
+                    // account behind it deleted. Said once; the gauge is
+                    // untouched and the next different key resumes.
+                    flags.withLock { $0.rejected = key }
+                    Log.push.notice("push: key rejected — reconnect from the ⋯ menu")
+                default:
                     Log.push.notice("push failed status=\(code, privacy: .public)")
                 }
             } catch {

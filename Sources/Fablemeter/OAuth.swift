@@ -127,6 +127,17 @@ final class LoopbackCallback: @unchecked Sendable {
     private static let current = OSAllocatedUnfairLock<LoopbackCallback?>(initialState: nil)
 
     let port: UInt16
+    /// What the success page says — sign-in and connect finish differently.
+    private let successText: String
+    /// When set, a `/callback` whose `state` query does not match is answered
+    /// as a stranger and the flow keeps waiting. The port scheme is public
+    /// (the repo is), and any web page can fire requests at 127.0.0.1, so a
+    /// guessed callback must not be able to consume the attempt — refusal
+    /// happens here at the socket, not after teardown.
+    private let expectedState: String?
+    /// Pinned so the selftest can refuse a drift to "any interface": binding
+    /// loopback only is the other half of the handoff's security story.
+    let requiredHost: NWEndpoint.Host = .ipv4(.loopback)
     private let listener: NWListener
     private let queue = DispatchQueue(label: "com.izu.fablemeter.callback")
     private var readyCont: CheckedContinuation<Void, Error>?
@@ -139,26 +150,38 @@ final class LoopbackCallback: @unchecked Sendable {
     private var stopped = false
     private var cancelled = false
 
-    private init(port: UInt16) throws {
+    private init(port: UInt16, successText: String, expectedState: String?) throws {
         self.port = port
+        self.successText = successText
+        self.expectedState = expectedState
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { throw OAuthError.noPort }
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
         if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
             ip.version = .v4
         }
-        params.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: nwPort)
+        params.requiredLocalEndpoint = .hostPort(host: requiredHost, port: nwPort)
         self.listener = try NWListener(using: params)
     }
+
+    /// The port actually bound. For the fixed sign-in ports this is `port`;
+    /// for an ephemeral bind (`ports: [0]`, the connect flow) it is whatever
+    /// the kernel assigned, and it is what the browser must be told.
+    var boundPort: UInt16 { listener.port?.rawValue ?? port }
 
     /// Runs `body` with a listener that is guaranteed to be torn down before
     /// this returns — on the happy path, on a throw, and on cancellation alike.
     /// `defer` cannot await, and "cancel and hope" is exactly what left a socket
     /// holding 8317 for the rest of the session.
     static func withServer<T>(
-        ports: [UInt16], _ body: (LoopbackCallback) async throws -> T
+        ports: [UInt16],
+        successText: String = "Signed in — you can close this tab.",
+        expectedState: String? = nil,
+        _ body: (LoopbackCallback) async throws -> T
     ) async throws -> T {
-        let server = try await start(ports: ports)
+        let server = try await start(
+            ports: ports, successText: successText, expectedState: expectedState
+        )
         do {
             let value = try await body(server)
             await server.stop()
@@ -169,14 +192,20 @@ final class LoopbackCallback: @unchecked Sendable {
         }
     }
 
-    static func start(ports: [UInt16]) async throws -> LoopbackCallback {
+    static func start(
+        ports: [UInt16],
+        successText: String = "Signed in — you can close this tab.",
+        expectedState: String? = nil
+    ) async throws -> LoopbackCallback {
         // Whatever the last flow was doing, it is over. Waiting for its socket
         // here is what lets this one bind the port it advertised last time,
         // rather than sliding down the ladder to one the authorize request was
         // never told about.
         await retireActive()
         for p in ports {
-            guard let candidate = try? LoopbackCallback(port: p) else { continue }
+            guard let candidate = try? LoopbackCallback(
+                port: p, successText: successText, expectedState: expectedState
+            ) else { continue }
             do {
                 try await candidate.waitUntilReady()
                 candidate.becomeActive()
@@ -328,13 +357,21 @@ final class LoopbackCallback: @unchecked Sendable {
     private func respond(_ conn: NWConnection, requestHead: String) {
         let line = requestHead.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? ""
         let target = line.split(separator: " ").dropFirst().first.map(String.init) ?? ""
+        var params: [String: String] = [:]
+        if let comps = URLComponents(string: "http://localhost" + target) {
+            for item in comps.queryItems ?? [] { params[item.name] = item.value ?? "" }
+        }
         // A listener from a finished flow may briefly still be bound, and the
         // kernel is free to hand it a connection. It answers as a stranger
-        // rather than claiming a sign-in it cannot deliver to anyone.
-        let isCallback = target.hasPrefix("/callback") && isCurrent
+        // rather than claiming a sign-in it cannot deliver to anyone. A
+        // callback carrying the wrong state gets the identical treatment —
+        // and, crucially, does not settle the flow: the guessed request is
+        // refused and the listener keeps waiting for the real one.
+        let stateMatches = expectedState == nil || params["state"] == expectedState
+        let isCallback = target.hasPrefix("/callback") && isCurrent && stateMatches
 
         let body = isCallback
-            ? "<!doctype html><meta charset=utf-8><title>Signed in</title><body style=\"font:15px -apple-system,sans-serif;display:grid;place-items:center;height:100vh;margin:0\">Signed in — you can close this tab.</body>"
+            ? "<!doctype html><meta charset=utf-8><title>Done</title><body style=\"font:15px -apple-system,sans-serif;display:grid;place-items:center;height:100vh;margin:0\">\(successText)</body>"
             : "<!doctype html><meta charset=utf-8><title>Not found</title><body>Not found.</body>"
         let status = isCallback ? "200 OK" : "404 Not Found"
         let response = "HTTP/1.1 \(status)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
@@ -346,10 +383,6 @@ final class LoopbackCallback: @unchecked Sendable {
 
         guard isCallback, !settled else { return }
         settled = true
-        var params: [String: String] = [:]
-        if let comps = URLComponents(string: "http://localhost" + target) {
-            for item in comps.queryItems ?? [] { params[item.name] = item.value ?? "" }
-        }
         resultCont?.resume(returning: params)
         resultCont = nil
     }

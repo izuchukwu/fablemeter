@@ -677,6 +677,8 @@ struct PopoverView: View {
                     Menu {
                         Button("Add Account…") { state.addAccount() }
                             .disabled(!state.canAddAccount)
+                        Button("Connect to Fablemeter Web…") { state.connectWeb() }
+                            .disabled(state.isDemo || state.isConnectingWeb)
                         Divider()
                         if LoginItem.isAvailable {
                             Toggle("Start on Login", isOn: Binding(
