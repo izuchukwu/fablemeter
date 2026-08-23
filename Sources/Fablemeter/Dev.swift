@@ -1689,6 +1689,86 @@ enum SelfTest {
         check("a bare swift-run binary never enrolls",
               !LoginItem.shouldAutoEnroll(attempted: false, demo: false, bundled: false))
 
+        // MARK: The push payload keeps null and zero apart on the wire
+        //
+        // The web companion draws from this JSON alone, so the encoder is where
+        // the null-versus-zero distinction either survives or silently dies at
+        // the far end of a POST. Encoded with explicit NSNull, decoded back
+        // here, and read the way the server will read it. The stamp date is
+        // fixed so nothing in these checks consults a clock.
+        let pushStamp = ISODate.parse("2026-08-12T01:40:00Z")!
+
+        // Fable is the binding constraint (94% spent), so the two policies
+        // disagree: Fable-first reads min(60, 80, 6) = 6, Fable-off min(60, 80)
+        // = 60 — the same discriminating shape the gauge checks use.
+        let pushFirst = Account(email: "p@example.com", label: "P", refreshToken: "unused")
+        var pushSnap = UsageSnapshot()
+        pushSnap.fiveHour = UsageBucket(
+            id: "session", label: "5-hour", percent: 40, resetsAt: pushStamp)
+        pushSnap.weekly = UsageBucket(id: "weekly", label: "Weekly", percent: 20, resetsAt: nil)
+        pushSnap.scoped = [UsageBucket(id: "scoped:Fable", label: "Fable", percent: 94, resetsAt: nil)]
+
+        // A reported zero, a sent-but-null reading, an absent bucket, and a
+        // failing newest fetch — every fact the wire has to carry, on one row.
+        let pushSecond = Account(email: "z@example.com", label: "Z", refreshToken: "unused")
+        var mixedSnap = UsageSnapshot()
+        mixedSnap.fiveHour = UsageBucket(id: "session", label: "5-hour", percent: 0, resetsAt: nil)
+        mixedSnap.weekly = UsageBucket(id: "weekly", label: "Weekly", percent: nil, resetsAt: nil)
+
+        // Never loaded at all.
+        let pushThird = Account(email: "n@example.com", label: "N", refreshToken: "unused")
+
+        let pushAccounts = [pushFirst, pushSecond, pushThird]
+        let pushStates: [UUID: AccountState] = [
+            pushFirst.id: AccountState(snapshot: pushSnap),
+            pushSecond.id: AccountState(snapshot: mixedSnap, error: "Timed out"),
+            pushThird.id: AccountState(),
+        ]
+
+        func pushJSON(fableFirst: Bool) -> [[String: Any]] {
+            let data = try? PushPayload.data(
+                accounts: pushAccounts, states: pushStates,
+                fableFirst: fableFirst, now: pushStamp
+            )
+            let root = data.flatMap {
+                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+            }
+            return root?["accounts"] as? [[String: Any]] ?? []
+        }
+        func pushBucket(_ row: [String: Any]?, _ name: String) -> [String: Any]? {
+            (row?["buckets"] as? [String: Any])?[name] as? [String: Any]
+        }
+        let pushOn = pushJSON(fableFirst: true)
+        let pushOff = pushJSON(fableFirst: false)
+
+        check("push carries every account", pushOn.count == 3, "got \(pushOn.count)")
+        check("a null reading pushes as null, not zero",
+              pushBucket(pushOn.dropFirst().first, "weekly")?["percent"] is NSNull)
+        check("a reported zero pushes as 0",
+              JSONScalar.number(pushBucket(pushOn.dropFirst().first, "fiveHour")?["percent"]) == 0)
+        check("an absent bucket pushes as a null reading",
+              pushBucket(pushOn.dropFirst().first, "fable")?["percent"] is NSNull)
+        check("push headroom follows Fable-first on",
+              JSONScalar.number(pushOn.first?["headroom"]) == 6,
+              "got \(reading(JSONScalar.number(pushOn.first?["headroom"])))")
+        check("…and Fable-first off",
+              JSONScalar.number(pushOff.first?["headroom"]) == 60,
+              "got \(reading(JSONScalar.number(pushOff.first?["headroom"])))")
+        check("push verdict follows the same policy",
+              pushOn.first?["verdict"] as? String == "Almost out"
+              && pushOff.first?["verdict"] as? String == "Available")
+        check("a never-loaded account pushes null headroom and No data",
+              pushOn.last?["headroom"] is NSNull
+              && pushOn.last?["verdict"] as? String == "No data")
+        check("isStale travels",
+              pushOn.dropFirst().first?["isStale"] as? Bool == true
+              && pushOn.first?["isStale"] as? Bool == false)
+        check("push reset stamps survive a round trip",
+              ISODate.parse(pushBucket(pushOn.first, "fiveHour")?["resetsAt"] as? String) == pushStamp)
+        check("push carries exactly the contract's keys — no email, no token",
+              pushOn.first.map { Set($0.keys) }
+              == Set(["id", "label", "nickname", "headroom", "verdict", "isStale", "buckets"]))
+
         // MARK: Sign-in loopback
         //
         // Reconnecting a second account without quitting first. The listener is

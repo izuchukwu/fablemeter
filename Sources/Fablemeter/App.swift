@@ -14,6 +14,7 @@ import SwiftUI
 enum Log {
     static let usage = Logger(subsystem: "com.izu.fablemeter", category: "usage")
     static let store = Logger(subsystem: "com.izu.fablemeter", category: "store")
+    static let push = Logger(subsystem: "com.izu.fablemeter", category: "push")
 }
 
 struct AccountState {
@@ -115,6 +116,8 @@ final class AppState: ObservableObject {
 
     let isDemo: Bool
     private let vault = TokenVault()
+    /// Absent in demo mode, so fixture accounts can never reach the wire.
+    private var pusher: Pusher?
     private var pollTask: Task<Void, Never>?
     private var lastManualRefresh: Date = .distantPast
     /// When each account was last *asked* — success or failure. The ordinary
@@ -134,6 +137,7 @@ final class AppState: ObservableObject {
             return
         }
         accounts = Store.load()
+        pusher = Pusher()
         // The loop wakes often but asks each account's own schedule whether it
         // is due, so waking is free — only a due account costs a request.
         pollTask = Task { [weak self] in
@@ -213,6 +217,11 @@ final class AppState: ObservableObject {
             guard accounts.contains(where: { $0.id == account.id }) else { continue }
             await fetch(account)
         }
+        // The pass is over and the state is whatever the gauge now shows —
+        // successes, failures and staleness alike — so this is the one moment
+        // the web companion hears about it. Fire and forget: nothing past this
+        // line can touch the gauge, the schedule, or the screen.
+        pusher?.push(accounts: accounts, states: states, fableFirst: isFableFirst)
     }
 
     private func isDue(_ account: Account, reason: RefreshReason, now: Date) -> Bool {
