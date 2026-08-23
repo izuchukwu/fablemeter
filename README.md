@@ -150,3 +150,11 @@ signature and macOS would prompt for Keychain access on each launch.
 `https://api.anthropic.com/api/oauth/usage` is undocumented and its key set
 changes without notice; parsing is deliberately defensive and unknown keys are
 ignored, but the app can still go blank if the shape changes enough.
+
+## History note
+
+On 2026-08-22 this repository's git history was rewritten to replace the
+captured fixture's internal bucket names with placeholders (`bucket_a`…`bucket_f`).
+No credential, key, or token was ever committed to this repository — verified
+against every blob and commit message in the pre-rewrite history before this
+sentence was written. Nothing else changed.
