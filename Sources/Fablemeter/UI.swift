@@ -687,6 +687,13 @@ struct PopoverView: View {
                             ))
                         }
                         Toggle("Fable-first", isOn: $state.isFableFirst)
+                        Menu("Warnings") {
+                            Toggle("Warn at 75%", isOn: $state.warnAt75)
+                            Toggle("Warn at 90%", isOn: $state.warnAt90)
+                            Toggle("Warn at 95%", isOn: $state.warnAt95)
+                            Divider()
+                            Toggle("Warn on fast burn", isOn: $state.warnFastBurn)
+                        }
                         Divider()
                         Button("Quit") { NSApplication.shared.terminate(nil) }
                     } label: {

@@ -116,11 +116,35 @@ final class AppState: ObservableObject {
         .object(forKey: "fableFirst") as? Bool ?? true {
         didSet { UserDefaults.standard.set(isFableFirst, forKey: "fableFirst") }
     }
+    /// The warning toggles, same absent-key-means-default pattern as above.
+    /// All default ON: this feature exists because a window went 0 to 100 in
+    /// half an hour with nothing said.
+    @Published var warnAt75: Bool = UserDefaults.standard
+        .object(forKey: "warnAt75") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(warnAt75, forKey: "warnAt75") }
+    }
+    @Published var warnAt90: Bool = UserDefaults.standard
+        .object(forKey: "warnAt90") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(warnAt90, forKey: "warnAt90") }
+    }
+    @Published var warnAt95: Bool = UserDefaults.standard
+        .object(forKey: "warnAt95") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(warnAt95, forKey: "warnAt95") }
+    }
+    @Published var warnFastBurn: Bool = UserDefaults.standard
+        .object(forKey: "warnFastBurn") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(warnFastBurn, forKey: "warnFastBurn") }
+    }
+
+    private var warnSettings: WarnSettings {
+        WarnSettings(at75: warnAt75, at90: warnAt90, at95: warnAt95, fastBurn: warnFastBurn)
+    }
 
     let isDemo: Bool
     private let vault = TokenVault()
     /// Absent in demo mode, so fixture accounts can never reach the wire.
     private var pusher: Pusher?
+    private let warner = Warner()
     private var pollTask: Task<Void, Never>?
     private var lastManualRefresh: Date = .distantPast
     /// When each account was last *asked* — success or failure. The ordinary
@@ -307,6 +331,20 @@ final class AppState: ObservableObject {
             // The ladder is wiped rather than climbed, so re-authenticating
             // starts from a clean schedule.
             schedule = RetrySchedule()
+        }
+        // Warnings are decided against the reading being replaced, which is
+        // the last one that ever arrived (failures keep it), so this happens
+        // before the state lands. Only a fresh reading can warn: a failure has
+        // nothing new to compare and demo fixtures never notify.
+        if case .success(let snapshot) = outcome, !isDemo {
+            warner.deliver(WarnPolicy.assess(
+                label: account.character,
+                previous: states[account.id]?.snapshot,
+                current: snapshot,
+                now: Date(),
+                settings: warnSettings,
+                fired: warner.fired
+            ))
         }
         states[account.id] = state
         retry[account.id] = schedule

@@ -1857,6 +1857,94 @@ enum SelfTest {
 
         ConnectAudit.run(check: check)
 
+        // MARK: Usage warnings — crossings, once per window, never from null
+        //
+        // Born from a 5-hour window that went 0 to 100 in half an hour with
+        // nothing said. The policy is pure, so every rule is driven here: a
+        // warning fires on the way UP through a threshold, exactly once per
+        // window, and a null is never a reading, a baseline, or a zero.
+        do {
+            let now = Date(timeIntervalSinceReferenceDate: 800_000_000)
+            func snap(five: Double?, resets: Date? = nil, weekly: Double? = nil) -> UsageSnapshot {
+                UsageSnapshot(
+                    fiveHour: UsageBucket(id: "5h", label: "5-hour", percent: five, resetsAt: resets),
+                    weekly: weekly.map { UsageBucket(id: "wk", label: "Weekly", percent: $0, resetsAt: resets) }
+                )
+            }
+            func warn(
+                _ prev: UsageSnapshot?, _ cur: UsageSnapshot,
+                settings: WarnSettings = WarnSettings(), fired: Set<String> = []
+            ) -> [UsageWarning] {
+                WarnPolicy.assess(label: "P", previous: prev, current: cur,
+                                  now: now, settings: settings, fired: fired)
+            }
+
+            let up = warn(snap(five: 85), snap(five: 92))
+            check("crossing a threshold warns", up.count == 1, up.first.map(\.title) ?? "none")
+            check("…titled with the account, bucket and number",
+                  up.first?.title == "P — 5-hour at 92%")
+            check("…and the body is the reset stamp",
+                  up.first?.body.hasPrefix("Resets") == true, up.first?.body ?? "")
+            check("hovering above it afterwards stays quiet",
+                  warn(snap(five: 91), snap(five: 93)).isEmpty)
+            check("a decrease never warns", warn(snap(five: 96), snap(five: 80)).isEmpty)
+            check("one jump names only the highest threshold",
+                  warn(snap(five: 70), snap(five: 96)).map(\.key).joined().contains("t95")
+                  && warn(snap(five: 70), snap(five: 96)).count == 1)
+            var offAt90 = WarnSettings(); offAt90.at90 = false
+            check("a disabled threshold is silent",
+                  warn(snap(five: 85), snap(five: 92), settings: offAt90).isEmpty)
+            check("the Weekly bucket warns the same way",
+                  warn(snap(five: nil, weekly: 85), snap(five: nil, weekly: 92))
+                      .first?.title == "P — Weekly at 92%")
+
+            let window1 = now.addingTimeInterval(2 * 3600)
+            let window2 = now.addingTimeInterval(3 * 3600)
+            let first = warn(snap(five: 85, resets: window1), snap(five: 92, resets: window1))
+            check("the same window never warns twice",
+                  warn(snap(five: 85, resets: window1), snap(five: 92, resets: window1),
+                       fired: Set(first.map(\.key))).isEmpty)
+            check("a new window re-arms the warning",
+                  !warn(snap(five: 85, resets: window2), snap(five: 92, resets: window2),
+                        fired: Set(first.map(\.key))).isEmpty)
+
+            check("a null reading never warns", warn(snap(five: 85), snap(five: nil)).isEmpty)
+            check("no snapshot yet means no baseline, not a zero",
+                  warn(nil, snap(five: 92)).isEmpty)
+            check("a null baseline means no crossing either",
+                  warn(snap(five: nil), snap(five: 92)).isEmpty)
+
+            // Fast burn: crossed the checkpoint with less of the window
+            // elapsed than the checkpoint's own fraction. 0.1 elapsed = resets
+            // 4.5h away; 0.3 = 3.5h; 0.4 = 3h; 0.6 = 2h.
+            func resetsAt(elapsed: Double) -> Date {
+                now.addingTimeInterval(WarnPolicy.fiveHourWindow * (1 - elapsed))
+            }
+            let burn = warn(snap(five: 10, resets: resetsAt(elapsed: 0.1)),
+                            snap(five: 25, resets: resetsAt(elapsed: 0.1)))
+            check("fast burn: 20% in a tenth of the window warns",
+                  burn.first?.key.contains("burn20") == true, burn.first.map(\.body) ?? "none")
+            check("…and the body names the pace",
+                  burn.first?.body == "20% of the 5-hour window in 30m", burn.first?.body ?? "")
+            check("fast burn: 20% on pace stays quiet",
+                  warn(snap(five: 10, resets: resetsAt(elapsed: 0.3)),
+                       snap(five: 25, resets: resetsAt(elapsed: 0.3))).isEmpty)
+            check("fast burn: 50% early warns",
+                  warn(snap(five: 40, resets: resetsAt(elapsed: 0.4)),
+                       snap(five: 55, resets: resetsAt(elapsed: 0.4)))
+                      .first?.key.contains("burn50") == true)
+            check("fast burn: 50% on pace stays quiet",
+                  warn(snap(five: 40, resets: resetsAt(elapsed: 0.6)),
+                       snap(five: 55, resets: resetsAt(elapsed: 0.6))).isEmpty)
+            var burnOff = WarnSettings(); burnOff.fastBurn = false
+            check("fast burn obeys its toggle",
+                  warn(snap(five: 10, resets: resetsAt(elapsed: 0.1)),
+                       snap(five: 25, resets: resetsAt(elapsed: 0.1)),
+                       settings: burnOff).isEmpty)
+            check("fast burn with no reset stamp stays quiet",
+                  warn(snap(five: 10), snap(five: 25)).isEmpty)
+        }
+
         // MARK: Sign-in loopback
         //
         // Reconnecting a second account without quitting first. The listener is
