@@ -55,7 +55,11 @@ enum WarnPolicy {
     /// polls does not break the chain, because `AccountState` keeps the last
     /// snapshot that arrived, so `previous` here is always the last *real*
     /// reading even when the poll in between died.
+    /// A notification has room for the whole name, so it uses one: the menu bar
+    /// letter is a space-constrained stand-in, not what the account is called.
+    /// `label` still keys the dedup identity, which is deliberately untouched.
     static func assess(
+        name: String,
         label: Character,
         previous: UsageSnapshot?,
         current: UsageSnapshot,
@@ -64,6 +68,7 @@ enum WarnPolicy {
         fired: Set<String>
     ) -> [UsageWarning] {
         var warnings: [UsageWarning] = []
+        let who = displayName(name, label)
 
         let pairs: [(name: String, prev: UsageBucket?, cur: UsageBucket?)] = [
             ("5-hour", previous?.fiveHour, current.fiveHour),
@@ -82,7 +87,7 @@ enum WarnPolicy {
                 .filter({ baseline < $0 && reading >= $0 })
                 .max() {
                 let warning = UsageWarning(
-                    title: "\(label) — \(pair.name) at \(Int(reading.rounded()))%",
+                    title: "\(who): \(pair.name) at \(Int(reading.rounded()))%",
                     body: "Resets \(Format.resetStamp(bucket.resetsAt, from: now))",
                     key: key(label, pair.name, "t\(Int(crossed))", bucket.resetsAt)
                 )
@@ -99,7 +104,7 @@ enum WarnPolicy {
                 && reading >= checkpoint.percent
                 && elapsed < checkpoint.maxElapsed {
                 let warning = UsageWarning(
-                    title: "\(label) — fast burn",
+                    title: "\(who): fast burn",
                     body: "\(Int(checkpoint.percent))% of the 5-hour window in "
                         + duration(elapsed * fiveHourWindow),
                     key: key(label, pair.name, "burn\(Int(checkpoint.percent))", bucket.resetsAt)
@@ -118,6 +123,14 @@ enum WarnPolicy {
         let remaining = resetsAt.timeIntervalSince(now)
         guard remaining > 0, remaining <= fiveHourWindow else { return nil }
         return (fiveHourWindow - remaining) / fiveHourWindow
+    }
+
+    /// `Account` normalizes a blank nickname away at construction, so this
+    /// should never fire — but a title beginning with ": " would be a worse
+    /// answer than the letter the menu bar already shows.
+    static func displayName(_ name: String, _ label: Character) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? String(label) : trimmed
     }
 
     private static func key(

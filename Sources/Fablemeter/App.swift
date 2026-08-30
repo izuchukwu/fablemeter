@@ -338,6 +338,7 @@ final class AppState: ObservableObject {
         // nothing new to compare and demo fixtures never notify.
         if case .success(let snapshot) = outcome, !isDemo {
             warner.deliver(WarnPolicy.assess(
+                name: account.nickname,
                 label: account.character,
                 previous: states[account.id]?.snapshot,
                 current: snapshot,

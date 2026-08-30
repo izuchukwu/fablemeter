@@ -1873,16 +1873,22 @@ enum SelfTest {
             }
             func warn(
                 _ prev: UsageSnapshot?, _ cur: UsageSnapshot,
+                name: String = "Personal",
                 settings: WarnSettings = WarnSettings(), fired: Set<String> = []
             ) -> [UsageWarning] {
-                WarnPolicy.assess(label: "P", previous: prev, current: cur,
+                WarnPolicy.assess(name: name, label: "P", previous: prev, current: cur,
                                   now: now, settings: settings, fired: fired)
             }
 
             let up = warn(snap(five: 85), snap(five: 92))
             check("crossing a threshold warns", up.count == 1, up.first.map(\.title) ?? "none")
-            check("…titled with the account, bucket and number",
-                  up.first?.title == "P — 5-hour at 92%")
+            check("…titled with the account's full name, bucket and number",
+                  up.first?.title == "Personal: 5-hour at 92%", up.first?.title ?? "none")
+            check("…the name, never the menu bar letter",
+                  up.first?.title.hasPrefix("P:") == false)
+            check("a blank nickname falls back to the letter",
+                  warn(snap(five: 85), snap(five: 92), name: "  ").first?.title
+                      == "P: 5-hour at 92%")
             check("…and the body is the reset stamp",
                   up.first?.body.hasPrefix("Resets") == true, up.first?.body ?? "")
             check("hovering above it afterwards stays quiet",
@@ -1896,7 +1902,7 @@ enum SelfTest {
                   warn(snap(five: 85), snap(five: 92), settings: offAt90).isEmpty)
             check("the Weekly bucket warns the same way",
                   warn(snap(five: nil, weekly: 85), snap(five: nil, weekly: 92))
-                      .first?.title == "P — Weekly at 92%")
+                      .first?.title == "Personal: Weekly at 92%")
 
             let window1 = now.addingTimeInterval(2 * 3600)
             let window2 = now.addingTimeInterval(3 * 3600)
@@ -1926,6 +1932,13 @@ enum SelfTest {
                   burn.first?.key.contains("burn20") == true, burn.first.map(\.body) ?? "none")
             check("…and the body names the pace",
                   burn.first?.body == "20% of the 5-hour window in 30m", burn.first?.body ?? "")
+            check("…and it is titled with the name too",
+                  burn.first?.title == "Personal: fast burn", burn.first?.title ?? "none")
+            // The title carries the name; the dedup key does not. Renaming an
+            // account mid-window must not re-arm a warning it already sent.
+            check("renaming does not re-arm a fired warning",
+                  warn(snap(five: 85, resets: window1), snap(five: 92, resets: window1),
+                       name: "Renamed", fired: Set(first.map(\.key))).isEmpty)
             check("fast burn: 20% on pace stays quiet",
                   warn(snap(five: 10, resets: resetsAt(elapsed: 0.3)),
                        snap(five: 25, resets: resetsAt(elapsed: 0.3))).isEmpty)
