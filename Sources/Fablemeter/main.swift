@@ -23,6 +23,17 @@ if let index = CommandLine.arguments.firstIndex(of: "--callback-loop") {
     exit(CallbackLoop.run(cycles: rest.first ?? 3, delayMilliseconds: rest.dropFirst().first ?? 0))
 }
 
+if arguments.contains("--slack-test") {
+    let semaphore = DispatchSemaphore(value: 0)
+    var status: Int32 = 1
+    Task {
+        status = await SlackTest.run()
+        semaphore.signal()
+    }
+    semaphore.wait()
+    exit(status)
+}
+
 if arguments.contains("--probe") {
     let semaphore = DispatchSemaphore(value: 0)
     var status: Int32 = 1

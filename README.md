@@ -121,6 +121,14 @@ popover's order, left to right, and rearranges as the drag crosses each row.
 The order is the order of the array in `accounts.json`, so it survives a
 relaunch without a separate index to keep in sync.
 
+## Warnings
+
+Crossing 75%, 90% or 95%, and burning through the 5-hour window too fast, each
+raise one warning per window. A warning goes to two places: the macOS
+notification center, and, when `slack.json` is present, a Slack channel. Slack
+is a second destination rather than a fallback, so a run that cannot notify —
+notification rights denied, or an unbundled `swift run` — still posts.
+
 ## Storage
 
 Accounts live in `~/Library/Application Support/ClaudeUsageBar/accounts.json`
@@ -133,12 +141,21 @@ by accident. Refresh tokens are stored there in plaintext rather
 than the Keychain: the app is ad-hoc signed, so every rebuild changes its
 signature and macOS would prompt for Keychain access on each launch.
 
+Slack mirroring reads `~/Library/Application Support/ClaudeUsageBar/slack.json`
+(same directory, also 0600), shaped `{"token": "...", "channel": "C..."}`. The
+token is a Slack bot token, so it is a credential and is never logged or
+printed. The file is optional: absent or unreadable, mirroring is simply off
+and the app says so once in the log, the same way a denied notification does.
+It is re-read per warning, so dropping it in or taking it away takes effect
+without a relaunch.
+
 ## Flags
 
 | Flag | What it does |
 | --- | --- |
 | `--selftest` | Decodes an embedded usage fixture, walks the polling and backoff schedules, and exercises token rotation — single-flight refresh, persist-before-return, and the terminal `needs sign-in` state — with no network. Also runs the callback-loop checks below, so consecutive reconnects stay covered. |
 | `--callback-loop [cycles] [delayMs]` | Runs the sign-in's loopback listener over and over in one process — bind, receive the redirect, tear down — plus an abandoned flow that never gets a redirect. No browser, no credentials. This is the second reconnect in a session, on its own. |
+| `--slack-test` | Posts one line to the Slack channel in `slack.json` and exits 0 if Slack took it, 1 if there is no readable config or the post was refused. Proves the mirror without waiting for a real threshold to be crossed. |
 | `--probe` | Reads Claude Code's existing access token read-only and prints live parsed buckets. Never writes or refreshes it. |
 | (always on) | Every successful poll writes one line to the unified log describing the shape of what it decoded — which `kind`s came back, each reading as a number or `null`, whether a reset window was present, and the headroom it resolved to. Read it with `log show --predicate 'subsystem == "com.izu.fablemeter"' --last 30m`. It names the account by its menu bar letter and nothing else; no part of `accounts.json` and no credential goes near it. |
 | `--demo` | Eight fake in-memory accounts, for looking at the drawing: blocked, rate limited, healthy, one whose credential the server has rejected, one with Fable spent, one with Fable spent *and* nothing else left, one the server reports as untouched (`0%` everywhere, Available), and one the server reports nothing about (dashes everywhere, No data). |

@@ -169,6 +169,18 @@ final class Warner {
         // was made once, and a denied notification must not come back as a
         // fresh warning every poll.
         fired.formUnion(warnings.map(\.key))
+
+        // Slack is a second destination, not a fallback, so it runs before the
+        // notification guard and independently of it: a run that cannot notify
+        // — denied rights, or an unbundled `swift run` — still mirrors. The
+        // dedup above is what keeps it to one post per warning.
+        let mirrored = warnings
+        Task.detached {
+            for warning in mirrored {
+                await Slack.post(title: warning.title, body: warning.body)
+            }
+        }
+
         guard isBundled, !denied else { return }
 
         Task { @MainActor in

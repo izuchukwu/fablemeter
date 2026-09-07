@@ -1958,6 +1958,29 @@ enum SelfTest {
                   warn(snap(five: 10), snap(five: 25)).isEmpty)
         }
 
+        // MARK: Slack mirror
+        //
+        // Only the pure half: what a warning turns into on the wire, and what
+        // counts as a usable config. The post itself is a network call and
+        // stays out of a test that must run without one.
+        do {
+            check("slack escapes only Slack's three characters",
+                  Slack.escape("a & b < c > d *e* _f_") == "a &amp; b &lt; c &gt; d *e* _f_")
+            check("slack message is the notification's title over its body",
+                  Slack.message(title: "A: 5-hour at 90%", body: "Resets in 2h")
+                      == "A: 5-hour at 90%\nResets in 2h")
+            check("slack config decodes token and channel",
+                  SlackConfig.decode(Data(#"{"token":"x","channel":"C1"}"#.utf8))
+                      == SlackConfig(token: "x", channel: "C1"))
+            check("slack config with a blank field reads as no config",
+                  SlackConfig.decode(Data(#"{"token":"","channel":"C1"}"#.utf8)) == nil)
+            check("slack config that is not the expected shape reads as no config",
+                  SlackConfig.decode(Data(#"{"channel":"C1"}"#.utf8)) == nil)
+            check("slack config file sits beside the accounts file",
+                  Slack.file.lastPathComponent == "slack.json"
+                      && Slack.file.deletingLastPathComponent() == Store.file.deletingLastPathComponent())
+        }
+
         // MARK: Sign-in loopback
         //
         // Reconnecting a second account without quitting first. The listener is
