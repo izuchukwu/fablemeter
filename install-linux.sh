@@ -45,6 +45,9 @@ command -v python3 >/dev/null || die "python3 is required for the fablemeter hel
 
 # ---- 1. data directory -------------------------------------------------------
 DATA_DIR="${DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fablemeter}"
+case "$DATA_DIR" in
+  *"'"*|*$'\n'*) die "the data dir path may not contain a single quote or a newline: $DATA_DIR" ;;
+esac
 mkdir -p "$DATA_DIR"; chmod 700 "$DATA_DIR"
 DATA_FS="$(df -P "$DATA_DIR" | awk 'NR==2 {print $6}')"
 if [ "$DATA_FS" = "/" ]; then
@@ -60,8 +63,20 @@ if [ -z "$BINARY" ]; then
   if ! command -v swift >/dev/null; then
     if [ "$INSTALL_SWIFT" = 1 ]; then
       say "installing a Swift toolchain with swiftly"
+      command -v gpg >/dev/null || die "--install-swift verifies swiftly's PGP signature and needs gpg (apt-get install gnupg), or build elsewhere and pass --binary"
       tmp="$(mktemp -d)"
-      curl -fsSL "https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz" -o "$tmp/swiftly.tgz"
+      url="https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz"
+      curl -fsSL "$url" -o "$tmp/swiftly.tgz"
+      curl -fsSL "$url.sig" -o "$tmp/swiftly.tgz.sig"
+      # swift.org's published release keys, in a throwaway keyring so nothing
+      # is added to this user's own. Refuse to run an unverified download.
+      export GNUPGHOME="$tmp/gnupg"; mkdir -m 700 "$GNUPGHOME"
+      curl -fsSL "https://www.swift.org/keys/all-keys.asc" | gpg --batch --quiet --import - \
+        || die "could not import swift.org's signing keys"
+      gpg --batch --quiet --verify "$tmp/swiftly.tgz.sig" "$tmp/swiftly.tgz" 2>/dev/null \
+        || die "swiftly's signature did not verify — refusing to run it"
+      unset GNUPGHOME
+      say "swiftly signature verified against swift.org's keys"
       tar -xzf "$tmp/swiftly.tgz" -C "$tmp"
       "$tmp/swiftly" init --quiet-shell-followup --assume-yes
       # shellcheck disable=SC1091
@@ -100,7 +115,7 @@ if [ ! -f "$ENV_FILE" ]; then
   umask 077
   cat > "$ENV_FILE" <<ENV
 # fablemeter-server environment. Mode 600. Read by the service and the wrapper.
-FABLEMETER_DATA_DIR=$DATA_DIR
+FABLEMETER_DATA_DIR='$DATA_DIR'
 # Slack: the SERVER alone posts warnings. Fill these from your secret store —
 # this installer never writes a token.
 # FABLEMETER_SLACK_TOKEN=
@@ -158,7 +173,8 @@ exec 9>"\$LOCK"
 flock -n 9 || { echo "fablemeter-supervise: already running" >&2; exit 1; }
 while true; do
   "$BIN_DIR/fablemeter-serverd" run >>"\$LOG" 2>&1
-  echo "\$(date -u +%FT%TZ) fablemeter-server exited (\$?), restarting in 10s" >>"\$LOG"
+  rc=\$?
+  echo "\$(date -u +%FT%TZ) fablemeter-server exited (\$rc), restarting in 10s" >>"\$LOG"
   sleep 10
 done
 SUP

@@ -37,7 +37,7 @@ struct LogChannel: Sendable {
 
     func notice(_ message: String) {
         #if canImport(os)
-        logger.notice("\(message)")
+        logger.notice("\(message, privacy: .public)")
         #else
         emit("notice", message)
         #endif
@@ -45,7 +45,7 @@ struct LogChannel: Sendable {
 
     func error(_ message: String) {
         #if canImport(os)
-        logger.error("\(message)")
+        logger.error("\(message, privacy: .public)")
         #else
         emit("error", message)
         #endif
@@ -103,7 +103,7 @@ enum HTTP {
             }.resume()
         }
         #else
-        return try await HTTP.data(for: request)
+        return try await URLSession.shared.data(for: request)
         #endif
     }
 }

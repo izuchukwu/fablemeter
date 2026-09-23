@@ -19,11 +19,19 @@ final class AppState: ObservableObject {
     /// True while the web-companion handoff is in flight, so the menu item
     /// cannot stack a second listener behind the first.
     @Published private(set) var isConnectingWeb = false
-    /// Another machine has been promoted to server (the web answered a push
-    /// with 409). From then on this Mac never polls Anthropic: it is a
-    /// follower. Showing the server's numbers here is the follower UI, a
-    /// separate step; until it lands the gauge says so honestly rather than
-    /// holding the last reading up as if it were live.
+    /// Another machine is the owner's server. From then on this Mac never
+    /// polls Anthropic and never refreshes a token: it is a follower. Learned
+    /// from the web before the first poll of every launch, from a 409 on push,
+    /// and — when the web cannot be reached — from `role.json`, so a follower
+    /// that restarts stays one. Showing the server's numbers in the gauge is
+    /// the follower UI, a separate step; until then the gauge says so honestly,
+    /// and `state.json` keeps carrying the server's numbers for the fleet.
+    ///
+    /// A Mac with NO web key cannot ask the web anything and is never answered
+    /// with a 409, so it cannot learn it was demoted. It keeps polling on its
+    /// own sign-ins exactly as before roles existed: a separate token lineage,
+    /// which bricks nothing, and it cannot push anyway. Connect it (⋯ menu) to
+    /// make it a proper follower.
     @Published private(set) var isFollowingServer = false
     /// Whether the gauge counts Fable in its minimum — see
     /// `UsageSnapshot.headroom(fableFirst:)`. On by default, and `object(forKey:)`
@@ -75,6 +83,10 @@ final class AppState: ObservableObject {
     /// Per-account backoff. The one gate no refresh reason may override.
     private var retry: [UUID: RetrySchedule] = [:]
     private var isPassRunning = false
+    private var roleMemory: RoleMemory?
+    private var lastFollowCheck: Date = .distantPast
+    private var loggedNoKey = false
+    private let identity = IdentityResolver()
 
     init(demo: Bool = false, demoCount: Int? = nil) {
         isDemo = demo
@@ -88,10 +100,19 @@ final class AppState: ObservableObject {
         accounts = Store.load()
         pusher = Pusher()
         localState = LocalStateWriter()
+        // A follower that restarts stays a follower, before anything else can
+        // run: no pass may start until the role is settled.
+        roleMemory = RoleMemory.load()
+        if roleMemory?.stance == .follower { enterFollowerMode(persist: false) }
         // The loop wakes often but asks each account's own schedule whether it
         // is due, so waking is free — only a due account costs a request.
         pollTask = Task { [weak self] in
+            // Ask the web who the server is BEFORE the first pass, so an
+            // upgraded Mac never spends a poll pass (and a token rotation)
+            // finding out by 409 that it should not have.
+            await self?.settleRoleAtLaunch()
             while !Task.isCancelled {
+                await self?.followIfFollowing()
                 await self?.refresh(reason: .scheduled)
                 // Unconditional, and outside every branch above it: there is no
                 // path through this loop that gets back to the top without
@@ -157,6 +178,12 @@ final class AppState: ObservableObject {
         let now = Date()
         let due = accounts.filter { isDue($0, reason: reason, now: now) }
         guard !due.isEmpty else { return }
+
+        // Still the server? Asked once per pass, before anything reaches
+        // Anthropic — see `PrePass` for why per pass and not per account. A
+        // pass happens at most every few minutes (plus a debounced manual
+        // one), so this adds ~12 reads/hr, far under the web's 600/hr cap.
+        guard await stillMayPoll() else { return }
 
         isRefreshing = true
         defer { isRefreshing = false }
@@ -268,14 +295,24 @@ final class AppState: ObservableObject {
         }
         states[account.id] = state
         retry[account.id] = schedule
+        if case .success = outcome, !isDemo {
+            await identity.resolveIfMissing(account, vault: vault)
+        }
     }
 
     /// Demotion, within one tick: the pass guard above stops every further
     /// request to Anthropic, and every gauge goes hollow with a verdict that
     /// says why, so no reading is left looking live after it stopped being so.
+    /// Remembered in `role.json`, so the next launch starts as a follower.
     func becomeFollower() {
+        enterFollowerMode(persist: true)
+    }
+
+    private func enterFollowerMode(persist: Bool) {
+        if persist { remember(.follower) }
         guard !isFollowingServer else { return }
         isFollowingServer = true
+        lastFollowCheck = .distantPast
         Log.role.notice("role: follower — another machine is the server; not polling Anthropic")
         for account in accounts {
             states[account.id] = AccountState.applying(
@@ -283,6 +320,93 @@ final class AppState: ObservableObject {
                 to: states[account.id]
             )
         }
+    }
+
+    /// Only the web naming this machine (or nobody) brings a follower back.
+    private func leaveFollowerMode() {
+        guard isFollowingServer else { return }
+        isFollowingServer = false
+        Log.role.notice("role: polling again — the web names this machine, or nobody, as the server")
+        for account in accounts { retry[account.id] = nil; lastAttempt[account.id] = nil }
+    }
+
+    private func remember(_ stance: RoleMemory.Stance) {
+        guard roleMemory?.stance != stance else { return }
+        let shown = roleMemory?.shownWarnings ?? []
+        roleMemory = RoleMemory(stance: stance, updatedAt: Date(), shownWarnings: shown)
+        roleMemory?.save()
+    }
+
+    private func webClient() -> WebClient? {
+        guard let key = PushKeyStore.standard.currentKey() else {
+            if !loggedNoKey {
+                loggedNoKey = true
+                Log.role.notice("role: no web key — cannot learn this Mac's role; polling as before. Connect from the ⋯ menu.")
+            }
+            return nil
+        }
+        return WebClient(key: key, machineId: MachineIdentity.id(), machine: MachineIdentity.displayName)
+    }
+
+    /// The pre-pass check. With a key: ask the web (5 s deadline) and let a
+    /// live answer decide; if the web does not answer, the remembered role
+    /// decides. Without a key: the remembered role decides.
+    private func stillMayPoll() async -> Bool {
+        guard let client = webClient() else {
+            return PrePass.mayPoll(hasKey: false, live: nil, remembered: roleMemory?.stance)
+        }
+        let remote = try? await OAuth.firstOf(timeout: 5) { try await client.state() }
+        let live = remote?.election(machineId: client.machineId)
+        if let remote { apply(remote, machineId: client.machineId) }
+        return PrePass.mayPoll(hasKey: true, live: live, remembered: roleMemory?.stance) && !isFollowingServer
+    }
+
+    /// One question at launch, with a short deadline. A live answer wins; no
+    /// answer leaves the remembered stance in charge (see `StartupRole`).
+    func settleRoleAtLaunch() async {
+        guard !isDemo, let client = webClient() else { return }
+        let remote = try? await OAuth.firstOf(timeout: 5) { try await client.state() }
+        guard let remote else { return }
+        apply(remote, machineId: client.machineId)
+    }
+
+    private func apply(_ remote: RemoteState, machineId: String) {
+        let election = remote.election(machineId: machineId)
+        remember(RoleMemory.stance(for: election))
+        if StartupRole.mayPoll(live: election, remembered: roleMemory?.stance) {
+            leaveFollowerMode()
+        } else {
+            enterFollowerMode(persist: false)
+            followFrom(remote)
+        }
+    }
+
+    /// A follower's tick: every 30 s, ask the web for the server's snapshot,
+    /// hand it to the fleet's state file (the server's `updatedAt`, the server's
+    /// nulls), and show any warning the server fired in the last half hour that
+    /// this Mac has not shown. Never touches Anthropic or a token.
+    func followIfFollowing() async {
+        guard isFollowingServer, !isDemo else { return }
+        guard Date().timeIntervalSince(lastFollowCheck) >= 30 else { return }
+        lastFollowCheck = Date()
+        guard let client = webClient(),
+              let remote = try? await OAuth.firstOf(timeout: 10, { try await client.state() })
+        else { return }
+        apply(remote, machineId: client.machineId)
+    }
+
+    private func followFrom(_ remote: RemoteState) {
+        guard let snapshot = remote.snapshot else { return }
+        localState?.write(followingServer: snapshot, activeAccountId: ActiveAccount.signedInAccountId())
+        let shown = Set(roleMemory?.shownWarnings ?? [])
+        let decision = WarningReplay.decide(ServerWarning.decode(snapshot["warnings"]), shown: shown, now: Date())
+        guard !decision.markSeen.isEmpty else { return }
+        warner.showFromServer(decision.show)
+        roleMemory = RoleMemory(
+            stance: roleMemory?.stance ?? .follower, updatedAt: Date(),
+            shownWarnings: (roleMemory?.shownWarnings ?? []) + Array(decision.markSeen)
+        )
+        roleMemory?.save()
     }
 
     nonisolated static let followingText = "Following server"

@@ -41,6 +41,10 @@ enum OAuthError: LocalizedError, Equatable {
     /// Another process is already refreshing this account. Transient by
     /// definition: whatever it rotates to will be on disk by the next tick.
     case refreshBusy
+    /// A sign-in succeeded but neither the token response nor the profile said
+    /// whose account it was. Refused rather than stored under a placeholder: an
+    /// account with a made-up address never matches anything, silently.
+    case profileUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -52,6 +56,7 @@ enum OAuthError: LocalizedError, Equatable {
         case .malformed: return "Unexpected token response."
         case .credentialExpired: return "Sign-in expired."
         case .refreshBusy: return "busy"
+        case .profileUnavailable: return "Signed in, but the account's profile could not be read."
         }
     }
 
@@ -68,6 +73,7 @@ enum OAuthError: LocalizedError, Equatable {
         case .malformed: return "unexpected response"
         case .credentialExpired: return "signed out"
         case .refreshBusy: return "busy"
+        case .profileUnavailable: return "could not identify the account"
         }
     }
 
@@ -127,6 +133,9 @@ struct TokenBundle {
     var refreshToken: String?
     var expiresAt: Date
     var email: String?
+    /// The Anthropic account's UUID, when the token response carries it. The
+    /// stable identity followers match on — see `AccountIdentity`.
+    var accountId: String? = nil
 }
 
 enum OAuth {
@@ -190,11 +199,19 @@ enum OAuth {
             accessToken: access,
             refreshToken: json["refresh_token"] as? String,
             expiresAt: Date().addingTimeInterval(expiresIn),
-            email: email
+            email: email,
+            accountId: AccountIdentity.normalize(account?["uuid"] as? String)
         )
     }
 
     static func fetchProfileEmail(accessToken: String) async throws -> String? {
+        try await fetchProfile(accessToken: accessToken)?.email
+    }
+
+    /// Email and account UUID, the same two fields Claude Code itself reads
+    /// from this endpoint (`account.email`, `account.uuid`). Either may be nil;
+    /// nothing downstream fills a gap with a guess.
+    static func fetchProfile(accessToken: String) async throws -> (email: String?, accountId: String?)? {
         var req = URLRequest(url: URL(string: Constants.profileURL)!)
         req.timeoutInterval = 10
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
@@ -203,7 +220,8 @@ enum OAuth {
         let (data, _) = try await HTTP.data(for: req)
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         let account = json["account"] as? [String: Any]
-        return (account?["email"] as? String) ?? (account?["email_address"] as? String)
+        let email = (account?["email"] as? String) ?? (account?["email_address"] as? String)
+        return (email, AccountIdentity.normalize(account?["uuid"] as? String))
     }
 }
 

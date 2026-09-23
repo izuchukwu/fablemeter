@@ -41,7 +41,19 @@ final class Warner {
             }
         }
 
-        guard isBundled, !denied else { return }
+        notify(warnings.map { ($0.key, $0.title, $0.body) })
+    }
+
+    /// A follower's path: the SERVER fired these and already posted them to
+    /// Slack, so this machine only puts them on its own screen. Never Slack,
+    /// never the ledger — a follower is not the voice of record.
+    func showFromServer(_ warnings: [ServerWarning]) {
+        guard !warnings.isEmpty else { return }
+        notify(warnings.map { ($0.key, $0.title, $0.body) })
+    }
+
+    private func notify(_ warnings: [(key: String, title: String, body: String)]) {
+        guard !warnings.isEmpty, isBundled, !denied else { return }
 
         Task { @MainActor in
             let center = UNUserNotificationCenter.current()

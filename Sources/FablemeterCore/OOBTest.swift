@@ -17,7 +17,7 @@ enum OOBTest {
         }
         do {
             let result = try await OOB.complete(attempt, pasted: line)
-            print("oob-test: PASS — exchange accepted, refresh token received (\(result.refreshToken.count) chars, discarded), account \(result.email)")
+            print("oob-test: PASS — exchange accepted, refresh token received (\(result.refreshToken.count) chars, discarded), account \(result.email), account id \(result.accountId == nil ? "ABSENT" : "present")")
             return 0
         } catch let error as OAuthError {
             // `errorDescription` carries at most a 200-byte response prefix for

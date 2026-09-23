@@ -110,7 +110,9 @@ struct PushKeyStore {
     static let service = "com.izu.fablemeter"
     static let account = "push-key"
 
-    static let standard = PushKeyStore(
+    /// Reassigned only by `fablemeter-server` on macOS, which must never share
+    /// the menu bar app's Keychain item — see `dataDirectory`.
+    static var standard = PushKeyStore(
         readKeychain: {
             #if canImport(Security)
             Keychain.read(service: service, account: account)
@@ -132,4 +134,18 @@ struct PushKeyStore {
             return (trimmed?.isEmpty == false) ? trimmed : nil
         }
     )
+}
+
+extension PushKeyStore {
+    /// Files in the account store's own directory, never the Keychain. What
+    /// `fablemeter-server` uses on macOS: a key minted for the server must not
+    /// overwrite the menu bar app's, or the web would see one machine where
+    /// there are two.
+    static var dataDirectory: PushKeyStore {
+        PushKeyStore(
+            readKeychain: { KeyFile.read("push-key") },
+            writeKeychain: { KeyFile.write($0, named: "push-key") },
+            readFile: { KeyFile.read("push-secret.txt") }
+        )
+    }
 }

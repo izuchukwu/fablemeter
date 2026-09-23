@@ -260,6 +260,12 @@ enum Store {
         if let explicit = env["FABLEMETER_DATA_DIR"], !explicit.isEmpty {
             return URL(fileURLWithPath: explicit, isDirectory: true)
         }
+        // One default, one place: the installer's env file. Running a command
+        // without the wrapper must land in the same directory as the service,
+        // or `promote` signs accounts into a store the daemon never reads.
+        if let configured = DataDirConfig.fromEnvFile(env: env) {
+            return URL(fileURLWithPath: configured, isDirectory: true)
+        }
         let base = env["XDG_DATA_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
             ?? Home.directory.appendingPathComponent(".local/share", isDirectory: true)
         return base.appendingPathComponent("fablemeter", isDirectory: true)
@@ -317,5 +323,36 @@ enum Store {
             if let expected, accounts[idx].refreshToken != expected { return }
             accounts[idx].refreshToken = token
         }
+    }
+}
+
+/// Reads `FABLEMETER_DATA_DIR` out of the installer's env file
+/// (`$XDG_CONFIG_HOME/fablemeter/env`, else `~/.config/fablemeter/env`).
+enum DataDirConfig {
+    static func envFile(env: [String: String]) -> URL {
+        let base = env["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? Home.directory.appendingPathComponent(".config", isDirectory: true)
+        return base.appendingPathComponent("fablemeter/env")
+    }
+
+    static func fromEnvFile(env: [String: String]) -> String? {
+        guard let text = try? String(contentsOf: envFile(env: env), encoding: .utf8) else { return nil }
+        return parse(text)
+    }
+
+    /// Pure. The last uncommented `FABLEMETER_DATA_DIR=` line, one layer of
+    /// matching single or double quotes removed.
+    static func parse(_ text: String) -> String? {
+        var found: String?
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("FABLEMETER_DATA_DIR=") else { continue }
+            var value = String(line.dropFirst("FABLEMETER_DATA_DIR=".count))
+            if value.count >= 2, let f = value.first, let l = value.last, f == l, f == "'" || f == "\"" {
+                value = String(value.dropFirst().dropLast())
+            }
+            found = value.isEmpty ? nil : value
+        }
+        return found
     }
 }

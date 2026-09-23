@@ -53,11 +53,30 @@ func claimDataDirectory() {
     }
     let chosen = URL(fileURLWithPath: explicit, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
     let app = Store.directory.standardizedFileURL.resolvingSymlinksInPath()
-    guard chosen.path != app.path else {
+    // APFS is case-insensitive by default, so compare case-folded AND by file
+    // identity: "…/claudeusagebar" names the same store and must be refused
+    // however it is spelled.
+    guard chosen.path.lowercased() != app.path.lowercased(), !sameDirectory(chosen, app) else {
         fail("FABLEMETER_DATA_DIR points at the menu bar app's account store. Refusing.")
     }
     Store.directoryOverride = chosen
+    // Everything else a server owns moves with it: its machine id, its role
+    // memory, its account ids, its web key and its state file. Sharing any of
+    // them with the menu bar app would make the web see one machine where
+    // there are two, and let one overwrite the other's key.
+    LocalState.directoryOverride = chosen
+    PushKeyStore.standard = .dataDirectory
     #endif
+    // On every platform the server keeps its identity on the data directory —
+    // the persistent volume on Fly — so a restart that wipes $HOME cannot mint
+    // a new machine id and orphan the server role.
+    MachineIdentity.directoryOverride = Store.directory
+}
+
+func sameDirectory(_ a: URL, _ b: URL) -> Bool {
+    var sa = stat(), sb = stat()
+    guard stat(a.path, &sa) == 0, stat(b.path, &sb) == 0 else { return false }
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino
 }
 
 func webClient() -> WebClient? {
@@ -67,7 +86,7 @@ func webClient() -> WebClient? {
 
 /// One paste-back sign-in. Returns the credentials; persisting is the
 /// caller's job, done the moment this returns.
-func signIn(heading: String) async -> (email: String, refreshToken: String)? {
+func signIn(heading: String) async -> OOB.SignedIn? {
     while true {
         let attempt = OOB.begin()
         print("\n\(heading)")
@@ -122,8 +141,50 @@ case "promote":
     claimDataDirectory()
     blocking {
         guard let client = webClient() else { fail("not connected — run `fablemeter-server connect` first") }
+        // Promote rewrites accounts.json. A running daemon may be mid-refresh
+        // in the same file, and two load-modify-save writers can silently drop
+        // one another's change — a fresh sign-in included. So promote holds the
+        // daemon's lock for its whole length, and refuses if the daemon has it.
+        let lock: DaemonLock
+        switch DaemonLock.tryAcquire(in: Store.directory) {
+        case .acquired(let held): lock = held
+        case .busy: fail("the daemon is running on this data directory. Stop it, promote, then start it again (systemctl --user stop fablemeter, or stop fablemeter-supervise).")
+        case .unavailable: fail("cannot lock \(Store.directory.path) — check it exists and is writable")
+        }
+        defer { lock.release() }
+
         print("Promote \(MachineIdentity.displayName) to server.")
+        print("Data directory: \(Store.directory.path)")
         print("Every account gets a fresh sign-in on THIS machine, one at a time, so no token is ever copied from another machine.")
+
+        // What the current server calls each account, keyed by the Anthropic
+        // account id, so this machine inherits the same labels and nicknames
+        // (P Personal, C Charm, I Iconic) that agents already pass as --account.
+        var serverNames: [String: (label: String, nickname: String)] = [:]
+        if let rows = (try? await client.state())?.snapshot?["accounts"] as? [[String: Any]] {
+            for row in rows {
+                guard let id = AccountIdentity.normalize(row["accountId"] as? String),
+                      let label = row["label"] as? String, let nickname = row["nickname"] as? String else { continue }
+                serverNames[id] = (label, nickname)
+            }
+        }
+        if serverNames.isEmpty {
+            print("(The web has no account names to inherit — you will be asked for each label.)")
+        }
+
+        func takenLabels(excluding id: UUID? = nil) -> Set<String> {
+            Set(Store.load().filter { $0.id != id }.map(\.label))
+        }
+        func askLabel(default suggested: String, excluding id: UUID?) -> String {
+            while true {
+                let answer = ask("  One-character label for the gauge [\(suggested)]: ")
+                let label = answer.isEmpty ? suggested : answer
+                if PromoteLabels.isFree(label, taken: takenLabels(excluding: id)) {
+                    return Account.normalizeLabel(label) ?? suggested
+                }
+                print("  ✗ another account here already uses \(Account.normalizeLabel(label) ?? label) — pick another")
+            }
+        }
 
         // Re-sign every account already here, then offer to add more.
         let existing = Store.load()
@@ -138,13 +199,15 @@ case "promote":
                 guard answer.lowercased().hasPrefix("y") else { print("  kept the old sign-in"); continue }
             }
             do {
-                // Persisted the moment it exists. Unconditional: a person just
-                // signed in, and that fresh token is the one that must win.
+                // Persisted the moment it exists, under the daemon lock, so no
+                // rotation can race it. Unconditional: a person just signed in,
+                // and that fresh token is the one that must win.
                 try Store.mutate { accounts in
                     guard let i = accounts.firstIndex(where: { $0.id == account.id }) else { return }
                     accounts[i].refreshToken = result.refreshToken
                     accounts[i].email = result.email
                 }
+                AccountIdentity.remember(account.id, accountId: result.accountId)
                 print("  ✓ \(account.nickname) signed in")
             } catch {
                 fail("could not save \(account.nickname)'s sign-in — nothing was promoted")
@@ -157,16 +220,21 @@ case "promote":
             guard wantsMore else { break }
             let n = Store.load().count + 1
             guard let result = await signIn(heading: "Account \(n)") else { continue }
-            let nickname = ask("  Nickname [\(Account.localPart(of: result.email))]: ")
-            let label = ask("  One-character label for the gauge [auto]: ")
+            let known = result.accountId.flatMap { serverNames[$0] }
+            if let known { print("  The current server calls this account \(known.nickname) (\(known.label)).") }
+            let defaultNickname = known?.nickname ?? Account.localPart(of: result.email)
+            let nicknameAnswer = ask("  Nickname [\(defaultNickname)]: ")
+            let nickname = nicknameAnswer.isEmpty ? defaultNickname : nicknameAnswer
+            let label = askLabel(
+                default: PromoteLabels.freeDefault(preferred: known?.label, nickname: nickname, taken: takenLabels()),
+                excluding: nil
+            )
             let account = Account(
-                email: result.email,
-                nickname: nickname.isEmpty ? nil : nickname,
-                label: label.isEmpty ? nil : label,
-                refreshToken: result.refreshToken
+                email: result.email, nickname: nickname, label: label, refreshToken: result.refreshToken
             )
             do {
                 try Store.mutate { $0.append(account) }
+                AccountIdentity.remember(account.id, accountId: result.accountId)
                 print("  ✓ \(account.nickname) (\(account.label)) added")
             } catch {
                 fail("could not save \(result.email) — nothing was promoted")
@@ -175,6 +243,7 @@ case "promote":
         guard !Store.load().isEmpty else { fail("no accounts signed in — nothing to promote") }
         do {
             let server = try await client.promote()
+            RoleMemory(stance: .server, updatedAt: Date(), shownWarnings: RoleMemory.load()?.shownWarnings ?? []).save()
             print("\n✓ \(server?.machine ?? MachineIdentity.displayName) is now the server.")
             print("  Other machines stop polling on their next check. Start or restart `fablemeter-server run`.")
             return 0
@@ -191,6 +260,7 @@ case "status":
         let accounts = Store.load()
         print("machine   \(MachineIdentity.displayName)  (\(MachineIdentity.id()))")
         print("data dir  \(Store.directory.path)")
+        print("state     \(LocalState.file.path)")
         print("accounts  \(accounts.isEmpty ? "none signed in here" : accounts.map { "\($0.label) \($0.nickname)" }.joined(separator: ", "))")
         print("slack     \(Slack.config() == nil ? "not configured" : "configured")")
         guard let client = webClient() else {

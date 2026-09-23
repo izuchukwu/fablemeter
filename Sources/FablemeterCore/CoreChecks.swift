@@ -5,8 +5,9 @@ import FoundationNetworking
 
 /// The core's own pure checks, run by the menu bar app's `--selftest` and by
 /// `fablemeter-server selftest` alike, so the server's logic is proven on the
-/// machine it runs on and not only on the Mac that built it. No network, no
-/// Keychain, no clock but the one passed in.
+/// machine it runs on and not only on the Mac that built it. No network beyond
+/// one loopback round trip through the HTTP seam, no Keychain, no clock but the
+/// one passed in.
 enum CoreChecks {
     typealias Check = (_ name: String, _ ok: Bool, _ detail: String) -> Void
 
@@ -15,8 +16,10 @@ enum CoreChecks {
         roles(check)
         replay(check)
         followerState(check)
+        startup(check)
         wire(check)
         slackConfig(check)
+        HTTPSeamCheck.run(check)
     }
 
     // MARK: Paste-back sign-in
@@ -140,32 +143,161 @@ enum CoreChecks {
 
     static func followerState(_ check: Check) {
         let serverStamp = "2026-09-23T10:00:00Z"
+        let personal = "11111111-1111-1111-1111-111111111111"
+        let charm = "22222222-2222-2222-2222-222222222222"
         let snapshot: [String: Any] = [
             "updatedAt": serverStamp,
             "machineId": "FLY",
             "warnings": [["key": "k", "title": "t", "body": "b", "firedAt": serverStamp]],
             "accounts": [
-                ["id": "1", "label": "P", "nickname": "Personal", "headroom": 94.0, "verdict": "Available", "isStale": false,
+                ["id": "1", "label": "P", "nickname": "Personal", "accountId": personal, "headroom": 94.0, "verdict": "Available", "isStale": false,
                  "buckets": ["fiveHour": ["percent": 6.0, "resetsAt": NSNull()], "weekly": ["percent": NSNull(), "resetsAt": NSNull()], "fable": ["percent": 0.0, "resetsAt": NSNull()]]],
-                ["id": "2", "label": "C", "nickname": "Charm", "headroom": NSNull(), "verdict": "No data", "isStale": true, "buckets": [:]],
+                ["id": "2", "label": "C", "nickname": "Charm", "accountId": charm, "headroom": NSNull(), "verdict": "No data", "isStale": true, "buckets": [:]],
             ],
         ]
-        let body = LocalState.body(followingServer: snapshot, activeLabel: "P")
+        let body = LocalState.body(followingServer: snapshot, activeAccountId: personal.uppercased())
         check("follower: updatedAt is the SERVER's, not the copy time", (body["updatedAt"] as? String) == serverStamp, "")
         check("follower: the warnings list stays off the fleet's file", body["warnings"] == nil, "")
         let rows = (body["accounts"] as? [[String: Any]]) ?? []
-        check("follower: the active account is marked by label", (rows.first?["isActive"] as? Bool) == true && (rows.last?["isActive"] as? Bool) == false, "")
-        check("follower: active resolved when a label matched", (body["activeResolved"] as? Bool) == true, "")
+        check("follower: the active account is marked by account id (case-insensitive)",
+              (rows.first?["isActive"] as? Bool) == true && (rows.last?["isActive"] as? Bool) == false, "")
+        check("follower: active resolved when exactly one id matched", (body["activeResolved"] as? Bool) == true, "")
         let buckets = rows.first?["buckets"] as? [String: Any]
         check("follower: a null reading stays null", ((buckets?["weekly"] as? [String: Any])?["percent"]) is NSNull, "")
         check("follower: a reported zero stays zero", ((buckets?["fable"] as? [String: Any])?["percent"] as? Double) == 0, "")
         check("follower: null headroom stays null", rows.last?["headroom"] is NSNull, "")
-        let none = LocalState.body(followingServer: snapshot, activeLabel: nil)
-        check("follower: no signed-in label means unresolved, never a guess", (none["activeResolved"] as? Bool) == false, "")
-        let stranger = LocalState.body(followingServer: snapshot, activeLabel: "Z")
-        check("follower: a label the server does not have is unresolved", (stranger["activeResolved"] as? Bool) == false, "")
+        let none = LocalState.body(followingServer: snapshot, activeAccountId: nil)
+        check("follower: no signed-in account id means unresolved, never a guess", (none["activeResolved"] as? Bool) == false, "")
+        let stranger = LocalState.body(followingServer: snapshot, activeAccountId: "33333333-3333-3333-3333-333333333333")
+        check("follower: an account the server does not have is unresolved", (stranger["activeResolved"] as? Bool) == false, "")
+
+        // The review's failure: labels picked in a different order on each
+        // machine. Signed in as Charm here; the server labelled Charm "P" and
+        // Personal "C". A label match would call Personal active and could
+        // answer "clear" about the wrong account.
+        var swapped = snapshot
+        swapped["accounts"] = [
+            ["id": "1", "label": "C", "nickname": "Personal", "accountId": personal, "headroom": 94.0, "verdict": "Available", "isStale": false, "buckets": [:]],
+            ["id": "2", "label": "P", "nickname": "Charm", "accountId": charm, "headroom": 0.0, "verdict": "Blocked", "isStale": false, "buckets": [:]],
+        ]
+        let swappedBody = LocalState.body(followingServer: swapped, activeAccountId: charm)
+        let swappedRows = (swappedBody["accounts"] as? [[String: Any]]) ?? []
+        let active = swappedRows.filter { ($0["isActive"] as? Bool) == true }
+        check("follower: mismatched labels still mark the RIGHT account (by id)",
+              active.count == 1 && (active.first?["nickname"] as? String) == "Charm", "\(active.map { $0["nickname"] ?? "?" })")
+
+        // A server that does not know its accounts' ids (an old build, or a
+        // profile outage) gives nothing to match: unresolved, never a label fallback.
+        var anonymous = snapshot
+        anonymous["accounts"] = (snapshot["accounts"] as! [[String: Any]]).map { row -> [String: Any] in
+            var row = row; row.removeValue(forKey: "accountId"); return row
+        }
+        let anonBody = LocalState.body(followingServer: anonymous, activeAccountId: personal)
+        check("follower: rows without account ids are unresolved — no fallback to label",
+              (anonBody["activeResolved"] as? Bool) == false
+              && ((anonBody["accounts"] as? [[String: Any]]) ?? []).allSatisfy { ($0["isActive"] as? Bool) == false }, "")
+
+        // Two rows claiming one account is not an answer.
+        var twice = snapshot
+        twice["accounts"] = [
+            ["id": "1", "label": "P", "nickname": "A", "accountId": personal, "headroom": 50.0, "verdict": "Available", "isStale": false, "buckets": [:]],
+            ["id": "2", "label": "Q", "nickname": "B", "accountId": personal, "headroom": 50.0, "verdict": "Available", "isStale": false, "buckets": [:]],
+        ]
+        check("follower: two rows with one id is unresolved",
+              (LocalState.body(followingServer: twice, activeAccountId: personal)["activeResolved"] as? Bool) == false, "")
+        check("follower: a malformed account id is no identity",
+              (LocalState.body(followingServer: snapshot, activeAccountId: "not-a-uuid")["activeResolved"] as? Bool) == false, "")
+
         let encoded = (try? JSONSerialization.data(withJSONObject: body)).map { String(decoding: $0, as: UTF8.self) } ?? ""
         check("follower: no token or email reaches the file", !encoded.lowercased().contains("token") && !encoded.contains("@"), "")
+
+        // Account ids travel on the wire only when known, and never as a guess.
+        let acct = Account(email: "someone@example.com", nickname: "Personal", label: "P", refreshToken: "x")
+        let withId = PushPayload.body(accounts: [acct], states: [:], fableFirst: true, accountIds: [acct.id: personal])
+        let withoutId = PushPayload.body(accounts: [acct], states: [:], fableFirst: true)
+        check("wire: a known account id is sent", ((withId["accounts"] as? [[String: Any]])?.first?["accountId"] as? String) == personal, "")
+        check("wire: an unknown account id is omitted, not invented",
+              ((withoutId["accounts"] as? [[String: Any]])?.first?["accountId"]) == nil, "")
+        check("identity: only a real UUID counts, lowercased",
+              AccountIdentity.normalize(" \(personal.uppercased()) ") == personal
+              && AccountIdentity.normalize("P") == nil && AccountIdentity.normalize("") == nil && AccountIdentity.normalize(nil) == nil, "")
+    }
+
+    // MARK: Start-up role
+
+    static func startup(_ check: Check) {
+        let other = Election.other(ServerInfo(machineId: "FLY", machine: "fly", since: nil))
+        // live answer wins
+        check("startup: live 'another machine is server' → never poll, whatever was remembered",
+              !StartupRole.mayPoll(live: other, remembered: .server) && !StartupRole.mayPoll(live: other, remembered: nil), "")
+        check("startup: live 'this machine' → poll, even if remembered follower",
+              StartupRole.mayPoll(live: .thisMachine, remembered: .follower), "")
+        check("startup: live 'unelected' → poll", StartupRole.mayPoll(live: .unelected, remembered: .follower), "")
+        // web unreachable: memory decides
+        check("startup: web unreachable + remembered follower → stays a follower (no poll, no refresh)",
+              !StartupRole.mayPoll(live: nil, remembered: .follower), "")
+        check("startup: web unreachable + remembered server → keeps polling",
+              StartupRole.mayPoll(live: nil, remembered: .server), "")
+        check("startup: web unreachable + remembered unelected → keeps polling",
+              StartupRole.mayPoll(live: nil, remembered: .unelected), "")
+        check("startup: nothing known at all → polls, as every install did before roles",
+              StartupRole.mayPoll(live: nil, remembered: nil), "")
+        check("startup: stances map from elections",
+              RoleMemory.stance(for: .unelected) == .unelected && RoleMemory.stance(for: .thisMachine) == .server
+              && RoleMemory.stance(for: other) == .follower, "")
+
+        // Before every pass (Izu: "before each check, the clients should check
+        // web (if connected) to make sure they're still the leader").
+        check("prepass: live server (this machine) → poll", PrePass.mayPoll(hasKey: true, live: .thisMachine, remembered: .follower), "")
+        check("prepass: live unelected → poll", PrePass.mayPoll(hasKey: true, live: .unelected, remembered: nil), "")
+        check("prepass: live follower → do NOT poll", !PrePass.mayPoll(hasKey: true, live: other, remembered: .server), "")
+        check("prepass: web unreachable + remembered server → poll (a blip does not stop a server)",
+              PrePass.mayPoll(hasKey: true, live: nil, remembered: .server), "")
+        check("prepass: web unreachable + remembered follower → do NOT poll",
+              !PrePass.mayPoll(hasKey: true, live: nil, remembered: .follower), "")
+        check("prepass: no key → the remembered role decides (today: poll)",
+              PrePass.mayPoll(hasKey: false, live: nil, remembered: nil)
+              && PrePass.mayPoll(hasKey: false, live: nil, remembered: .unelected)
+              && !PrePass.mayPoll(hasKey: false, live: nil, remembered: .follower), "")
+
+        // The memory survives a round trip, and caps what it keeps.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fm-role-\(UUID().uuidString)")
+        let file = dir.appendingPathComponent("role.json")
+        let keys = (0..<(RoleMemory.shownCap + 20)).map { "k\($0)" }
+        RoleMemory(stance: .follower, updatedAt: Date(timeIntervalSince1970: 2_000_000_000), shownWarnings: keys).save(to: file)
+        let back = RoleMemory.load(from: file)
+        check("startup: a remembered follower reads back as a follower", back?.stance == .follower, "")
+        check("startup: shown warnings persist (a restart does not re-show them), capped",
+              back?.shownWarnings.count == RoleMemory.shownCap && back?.shownWarnings.last == keys.last, "\(back?.shownWarnings.count ?? -1)")
+        check("startup: a missing role file is 'nothing remembered', not a crash",
+              RoleMemory.load(from: dir.appendingPathComponent("nope.json")) == nil, "")
+        // identity cache round trip, 0600
+        let idFile = dir.appendingPathComponent("account-ids.json")
+        let local = UUID()
+        AccountIdentity.remember(local, accountId: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", at: idFile)
+        AccountIdentity.remember(UUID(), accountId: "garbage", at: idFile)
+        let ids = AccountIdentity.load(from: idFile)
+        let mode = (try? FileManager.default.attributesOfItem(atPath: idFile.path)[.posixPermissions] as? Int) ?? 0
+        check("identity: remembered lowercased, garbage refused, file is 0600",
+              ids == [local: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"] && mode == 0o600, "\(ids) mode \(String(mode, radix: 8))")
+        try? FileManager.default.removeItem(at: dir)
+
+        // One data directory for every command, wrapper or not.
+        check("datadir: the env file's quoted value is read",
+              DataDirConfig.parse("# x\nFABLEMETER_DATA_DIR='/data/fable meter'\n") == "/data/fable meter", "")
+        check("datadir: unquoted and double-quoted forms read too",
+              DataDirConfig.parse("FABLEMETER_DATA_DIR=/data/f") == "/data/f"
+              && DataDirConfig.parse("FABLEMETER_DATA_DIR=\"/data/g\"") == "/data/g", "")
+        check("datadir: commented or empty lines are not a directory",
+              DataDirConfig.parse("# FABLEMETER_DATA_DIR=/x\nFABLEMETER_DATA_DIR=") == nil, "")
+
+        // Label choice at promote: no duplicates, and a free default when the
+        // email's letter is taken (the three-accounts-all-"I" trap).
+        check("labels: a taken label is refused", !PromoteLabels.isFree("I", taken: ["I"]) && PromoteLabels.isFree("P", taken: ["I"]), "")
+        check("labels: the automatic default never collides",
+              !["I", "C"].contains(PromoteLabels.freeDefault(preferred: "I", nickname: "Izu", taken: ["I", "C"])), "")
+        check("labels: the server's own label for this account wins when free",
+              PromoteLabels.freeDefault(preferred: "C", nickname: "Izu", taken: ["P"]) == "C", "")
     }
 
     // MARK: Wire

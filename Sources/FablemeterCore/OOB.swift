@@ -89,11 +89,19 @@ enum OOB {
         return code
     }
 
+    struct SignedIn {
+        let email: String
+        let refreshToken: String
+        /// The Anthropic account UUID, when either response carried it.
+        let accountId: String?
+    }
+
     /// Code in, credentials out. The exchange carries the manual redirect —
     /// the server checks it against the authorize request.
-    static func complete(
-        _ attempt: Attempt, pasted: String
-    ) async throws -> (email: String, refreshToken: String) {
+    ///
+    /// An account whose address cannot be learned is refused, not stored under
+    /// a placeholder: a made-up address matches nothing and says so nowhere.
+    static func complete(_ attempt: Attempt, pasted: String) async throws -> SignedIn {
         let code: String
         do {
             code = try parse(pasted, expectedState: attempt.state)
@@ -109,9 +117,15 @@ enum OOB {
         )
         guard let refresh = bundle.refreshToken else { throw OAuthError.malformed }
         var email = bundle.email
-        if email == nil || email?.isEmpty == true {
-            email = try? await OAuth.fetchProfileEmail(accessToken: bundle.accessToken)
+        var accountId = bundle.accountId
+        if email?.isEmpty != false || accountId == nil {
+            let profile = try? await OAuth.fetchProfile(accessToken: bundle.accessToken)
+            if email?.isEmpty != false { email = profile?.email }
+            if accountId == nil { accountId = profile?.accountId }
         }
-        return (email ?? "Claude account", refresh)
+        guard let email, !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw OAuthError.profileUnavailable
+        }
+        return SignedIn(email: email, refreshToken: refresh, accountId: accountId)
     }
 }

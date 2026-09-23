@@ -22,14 +22,21 @@ which is what agents on this machine read with `fablemeter --guard`.
    that user's `$HOME`; a different user means `fablemeter --guard` reads a file
    nobody writes and fails closed (exit 2) forever.
 5. **Put the data directory on a persistent volume.** On Fly, the root
-   filesystem is wiped on restart; sign-ins would vanish.
+   filesystem is wiped on restart; sign-ins would vanish. The machine id and
+   the remembered role live there too, so a restart keeps this machine's
+   identity and its server role.
+6. **Promote only while the daemon is stopped.** `promote` rewrites the account
+   store and refuses to run while `fablemeter-server run` holds the data
+   directory. To re-promote later: stop the daemon, `promote`, start it again.
 
 ## Prerequisites
 
 - Linux, `git`, `python3`, `curl`
 - A Swift toolchain — or pass `--install-swift` and the installer fetches one
-  with swiftly (~1 GB, one time). Keep it installed afterwards: the binary links
-  the Swift runtime from it.
+  with swiftly (~1 GB, one time). That also needs `gpg`: the installer verifies
+  swiftly's PGP signature against swift.org's published keys and refuses to run
+  it otherwise. Keep the toolchain installed afterwards: the binary links the
+  Swift runtime from it.
 - A mounted volume for data, e.g. `/data` on Fly
 - An interactive terminal for `connect` and `promote` (`fly ssh console` works):
   each asks you to open a URL on any device and paste back a code
@@ -68,6 +75,11 @@ $EDITOR ~/.config/fablemeter/env
 
 # 3. Become the server. Signs in each account on THIS machine, one at a time:
 #    open the printed URL, approve, paste the code. Type `skip` to leave one out.
+#    Labels and nicknames: for each account, promote offers the name the CURRENT
+#    server already uses (matched by the Anthropic account id, not by guess), so
+#    accept the defaults to keep P Personal / C Charm / I Iconic — the letters
+#    agents pass as `--account`. If the web has no names to offer, type them:
+#    P Personal, C Charm, I Iconic. Duplicate labels are refused.
 ~/.local/bin/fablemeter-serverd promote
 
 # 4. Start it.
@@ -94,7 +106,7 @@ The first usage lines arrive within one poll cycle (up to ~5 minutes).
 
 | Variable | Meaning |
 | --- | --- |
-| `FABLEMETER_DATA_DIR` | sign-ins + machine key (mode 700). Must be persistent. |
+| `FABLEMETER_DATA_DIR` | sign-ins, web key, machine id, remembered role, account ids (mode 700). Must be persistent. Commands run without the wrapper read it from this file too, so every command uses the same directory. |
 | `FABLEMETER_SLACK_TOKEN`, `FABLEMETER_SLACK_CHANNEL` | Slack warnings (server only) |
 | `FABLEMETER_SLACK_CONFIG` | alternatively, a path to `{"token":…,"channel":…}` |
 | `FABLEMETER_FABLE_FIRST=0` | measure `min(5-hour, weekly)` and ignore Fable |
@@ -109,6 +121,8 @@ The first usage lines arrive within one poll cycle (up to ~5 minutes).
 | log: `role: follower` | another machine is the server. To take over, run `promote` here |
 | log: `needs sign-in` | that account's sign-in is dead; run `promote` again |
 | guard exits 2 | no/stale state file, a null reading, or unknown active account — pass `--account` |
+| guard exits 2 on a follower | the active account is matched by Anthropic account id; the server's rows carry none (an older server build, or its profile lookup failed) or this machine is signed into an account the server does not track — pass `--account` |
+| `promote`: "the daemon is running" | stop it (`systemctl --user stop fablemeter`, or kill `fablemeter-supervise`), promote, start it again |
 | a Mac's gauges read "Following server" | expected once this machine is promoted: that Mac stopped polling |
 
 ## What it never does
@@ -117,4 +131,6 @@ Never prints, logs or writes a token outside the data directory; never writes
 an email into the state file; never polls Anthropic while another machine is
 the server; never promotes itself — only `promote`, run by a person here, does.
 The follower check hits `/api/state` every 30 s (120/hr, under the web's 600/hr
-per-key cap); do not lower it.
+per-key cap); do not lower it. A server asks it before every poll pass as well
+("am I still the server?"), reusing any answer under 30 s old, so it stays near
+60–70 reads/hr.

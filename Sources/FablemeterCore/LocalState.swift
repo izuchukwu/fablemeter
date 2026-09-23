@@ -34,6 +34,17 @@ enum ActiveAccount {
         return email
     }
 
+    /// Claude Code's own record of the signed-in account's UUID
+    /// (`oauthAccount.accountUuid`), read-only. The identity a follower matches
+    /// on, since the server's rows carry the same UUID and never an address.
+    static func signedInAccountId(at url: URL? = nil) -> String? {
+        guard let data = try? Data(contentsOf: url ?? claudeConfig),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["oauthAccount"] as? [String: Any]
+        else { return nil }
+        return AccountIdentity.normalize(oauth["accountUuid"] as? String)
+    }
+
     static func normalize(_ email: String) -> String {
         email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
@@ -68,8 +79,14 @@ enum ActiveAccount {
 /// local file are the same gauge state going to two places, and a second
 /// encoder is a second chance to collapse null into zero.
 enum LocalState {
+    /// Set only by `fablemeter-server` on macOS, where the menu bar app already
+    /// owns `~/.claude/fablemeter/state.json` and a second writer would clobber
+    /// it. On Linux the server writes the path the fleet's helper reads.
+    static var directoryOverride: URL?
+
     static var directory: URL {
-        Home.directory
+        if let directoryOverride { return directoryOverride }
+        return Home.directory
             .appendingPathComponent(".claude/fablemeter", isDirectory: true)
     }
 
@@ -84,10 +101,12 @@ enum LocalState {
         states: [UUID: AccountState],
         fableFirst: Bool,
         activeID: UUID?,
-        now: Date = Date()
+        now: Date = Date(),
+        accountIds: [UUID: String] = [:]
     ) -> [String: Any] {
         var payload = PushPayload.body(
-            accounts: accounts, states: states, fableFirst: fableFirst, now: now
+            accounts: accounts, states: states, fableFirst: fableFirst, now: now,
+            accountIds: accountIds
         )
         let rows = (payload["accounts"] as? [[String: Any]]) ?? []
         payload["accounts"] = rows.map { row -> [String: Any] in
@@ -107,12 +126,13 @@ enum LocalState {
         states: [UUID: AccountState],
         fableFirst: Bool,
         activeID: UUID?,
-        now: Date = Date()
+        now: Date = Date(),
+        accountIds: [UUID: String] = [:]
     ) throws -> Data {
         try JSONSerialization.data(
             withJSONObject: body(
                 accounts: accounts, states: states, fableFirst: fableFirst,
-                activeID: activeID, now: now
+                activeID: activeID, now: now, accountIds: accountIds
             ),
             options: [.sortedKeys, .prettyPrinted]
         )
@@ -133,7 +153,8 @@ final class LocalStateWriter {
         )
         do {
             let payload = try LocalState.data(
-                accounts: accounts, states: states, fableFirst: fableFirst, activeID: activeID
+                accounts: accounts, states: states, fableFirst: fableFirst, activeID: activeID,
+                accountIds: AccountIdentity.load()
             )
             try FileManager.default.createDirectory(
                 at: LocalState.directory,
@@ -143,6 +164,27 @@ final class LocalStateWriter {
             // Temp-plus-rename inside the same directory: a reader polling this
             // file must never catch it half-written, and the fleet's own bus
             // spent a night learning that lesson the other way round.
+            try AtomicFile.write(payload, to: LocalState.file, mode: 0o644)
+        } catch {
+            if !loggedFailure {
+                loggedFailure = true
+                Log.store.notice("local state: write failed, disabled for this run")
+            }
+        }
+    }
+
+    /// A follower's write: the server's snapshot, with only the active marker
+    /// resolved here (by account id — see `LocalState.body(followingServer:)`).
+    func write(followingServer snapshot: [String: Any], activeAccountId: String?) {
+        do {
+            let payload = try JSONSerialization.data(
+                withJSONObject: LocalState.body(followingServer: snapshot, activeAccountId: activeAccountId),
+                options: [.sortedKeys, .prettyPrinted]
+            )
+            try FileManager.default.createDirectory(
+                at: LocalState.directory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o755]
+            )
             try AtomicFile.write(payload, to: LocalState.file, mode: 0o644)
         } catch {
             if !loggedFailure {

@@ -258,21 +258,30 @@ extension LocalState {
     /// A follower's local file is the SERVER's snapshot, handed on untouched —
     /// including `updatedAt`, because staleness has to mean "when the server
     /// last measured", not "when this machine last copied". Only the active
-    /// marker is this machine's own: it is resolved here, by label, against
-    /// whichever account this machine's Claude Code is signed into.
-    static func body(followingServer snapshot: [String: Any], activeLabel: String?) -> [String: Any] {
+    /// marker is this machine's own.
+    ///
+    /// It is matched on the Anthropic account UUID, never on the label. Labels
+    /// are picked per machine, so "C" here and "C" on the server can be two
+    /// different accounts, and a single wrong match is a guard saying "clear"
+    /// about the wrong account. So: exactly one row whose `accountId` equals
+    /// the one this machine's Claude Code is signed into, or nothing is active
+    /// and `activeResolved` is false — which the guard answers with "cannot
+    /// tell", never with a guess.
+    static func body(followingServer snapshot: [String: Any], activeAccountId: String?) -> [String: Any] {
         var payload = snapshot
         payload.removeValue(forKey: "warnings")
         let rows = (payload["accounts"] as? [[String: Any]]) ?? []
-        var matched = false
+        let wanted = AccountIdentity.normalize(activeAccountId)
+        let hits = wanted == nil ? 0 : rows.filter {
+            AccountIdentity.normalize($0["accountId"] as? String) == wanted
+        }.count
+        let resolved = hits == 1
         payload["accounts"] = rows.map { row -> [String: Any] in
             var row = row
-            let hit = activeLabel != nil && (row["label"] as? String) == activeLabel
-            if hit { matched = true }
-            row["isActive"] = hit
+            row["isActive"] = resolved && AccountIdentity.normalize(row["accountId"] as? String) == wanted
             return row
         }
-        payload["activeResolved"] = matched
+        payload["activeResolved"] = resolved
         return payload
     }
 }

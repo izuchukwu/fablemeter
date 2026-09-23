@@ -23,7 +23,8 @@ enum PushPayload {
         now: Date = Date(),
         machine: String? = nil,
         machineId: String? = nil,
-        warnings: [ServerWarning]? = nil
+        warnings: [ServerWarning]? = nil,
+        accountIds: [UUID: String] = [:]
     ) -> [String: Any] {
         var payload: [String: Any] = [
             "updatedAt": iso.string(from: now),
@@ -31,7 +32,7 @@ enum PushPayload {
                 let state = states[account.id]
                 let snapshot = state?.snapshot
                 let headroom = snapshot?.headroom(fableFirst: fableFirst)
-                return [
+                var row: [String: Any] = [
                     "id": account.id.uuidString,
                     "label": String(account.character),
                     "nickname": account.nickname,
@@ -44,6 +45,11 @@ enum PushPayload {
                         "fable": bucket(snapshot?.fable),
                     ],
                 ]
+                // The Anthropic account's UUID, when this machine knows it:
+                // what a follower matches "the account I'm signed into" on.
+                // Omitted rather than guessed when unknown — see AccountIdentity.
+                if let accountId = accountIds[account.id] { row["accountId"] = accountId }
+                return row
             },
         ]
         // Named machines let the key-management page say which Mac last
@@ -67,12 +73,14 @@ enum PushPayload {
         now: Date = Date(),
         machine: String? = nil,
         machineId: String? = nil,
-        warnings: [ServerWarning]? = nil
+        warnings: [ServerWarning]? = nil,
+        accountIds: [UUID: String] = [:]
     ) throws -> Data {
         try JSONSerialization.data(
             withJSONObject: body(
                 accounts: accounts, states: states, fableFirst: fableFirst,
-                now: now, machine: machine, machineId: machineId, warnings: warnings
+                now: now, machine: machine, machineId: machineId, warnings: warnings,
+                accountIds: accountIds
             ),
             options: [.sortedKeys]
         )
@@ -133,8 +141,8 @@ final class Pusher {
     }
 
     /// `onNotServer` fires when the web answers 409: another machine has been
-    /// promoted, so this one must stop polling Anthropic. The menu bar app
-    /// passes nothing yet (its follower mode is a later step) and simply logs.
+    /// promoted, so this one must stop polling Anthropic. Both the menu bar app
+    /// and the headless engine pass it and demote themselves on it.
     func push(
         accounts: [Account],
         states: [UUID: AccountState],
@@ -164,7 +172,8 @@ final class Pusher {
         do {
             payload = try PushPayload.data(
                 accounts: accounts, states: states, fableFirst: fableFirst,
-                machine: machine, machineId: machineId, warnings: warnings
+                machine: machine, machineId: machineId, warnings: warnings,
+                accountIds: AccountIdentity.load()
             )
         } catch {
             Log.push.error("push failed encoding")

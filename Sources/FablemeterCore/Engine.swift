@@ -45,13 +45,17 @@ final class Engine: @unchecked Sendable {
     private let ledger = WarningLedger()
     private let localState = LocalStateFile()
     private var fired = Set<String>()
-    private var shown = Set<String>()
+    private var shown: Set<String>
+    private let identity = IdentityResolver()
     private var states: [UUID: AccountState] = [:]
     private var retry: [UUID: RetrySchedule] = [:]
     private var lastAttempt: [UUID: Date] = [:]
     private var remote: RemoteState?
     private var lastRemoteCheck: Date = .distantPast
-    private var isServer = true
+    /// Seeded from `role.json`, never assumed: a follower that restarts while
+    /// the web is unreachable must stay a follower.
+    private var isServer: Bool
+    private var stance: RoleMemory.Stance?
     private var loggedRole: Bool?
     /// Set by the push completion on a 409, read before every request.
     private let demoted = Locked<Bool>(initialState: false)
@@ -62,10 +66,22 @@ final class Engine: @unchecked Sendable {
         self.settings = settings
         self.machineId = machineId
         self.machine = machine
+        let memory = RoleMemory.load()
+        stance = memory?.stance
+        isServer = StartupRole.mayPoll(live: nil, remembered: memory?.stance)
+        shown = Set(memory?.shownWarnings ?? [])
     }
 
     /// Forever. One tick every `PollPolicy.tick` seconds.
     func run() async {
+        // One daemon per data directory, for the process lifetime. `promote`
+        // takes the same lock, so it can never rewrite accounts.json while a
+        // running daemon is rotating a token in it; a daemon started mid-promote
+        // waits here until the sign-ins are saved.
+        let daemonLock = DaemonLock.acquire(in: Store.directory, wait: true, onWait: {
+            Log.role.notice("engine: another fablemeter process holds the data directory (promote running?) — waiting")
+        })
+        defer { daemonLock?.release() }
         Log.role.notice("engine: started machine=\(machine) id=\(machineId)")
         while !Task.isCancelled {
             await tick(now: Date())
@@ -88,8 +104,10 @@ final class Engine: @unchecked Sendable {
         let wasDemoted = demoted.withLock { flag in defer { flag = false }; return flag }
         if wasDemoted {
             // The web refused our push: someone else is the server. Believe
-            // it at once, and look at the web on this very tick.
+            // it at once, remember it across restarts, and look at the web on
+            // this very tick.
             isServer = Self.nextIsServer(current: isServer, demoted: true, remote: nil, machineId: machineId)
+            remember(.follower)
             lastRemoteCheck = .distantPast
         }
         let interval = isServer ? settings.serverHeartbeat : settings.followInterval
@@ -111,7 +129,42 @@ final class Engine: @unchecked Sendable {
             remote = nil
         }
         isServer = Self.nextIsServer(current: isServer, demoted: false, remote: remote, machineId: machineId)
+        if let remote {
+            remember(RoleMemory.stance(for: remote.election(machineId: machineId)))
+        } else if wasDemoted {
+            remember(.follower)
+        }
         noteRole()
+    }
+
+    private func stillMayPoll() async -> Bool {
+        guard let key = PushKeyStore.standard.currentKey() else {
+            return PrePass.mayPoll(hasKey: false, live: nil, remembered: stance)
+        }
+        let now = Date()
+        if remote == nil || now.timeIntervalSince(lastRemoteCheck) > 30 {
+            let client = WebClient(key: key, machineId: machineId, machine: machine)
+            lastRemoteCheck = now
+            remote = try? await client.state()
+            if let remote { remember(RoleMemory.stance(for: remote.election(machineId: machineId))) }
+        }
+        let live = remote?.election(machineId: machineId)
+        let may = PrePass.mayPoll(hasKey: true, live: live, remembered: stance)
+        if !may, isServer {
+            isServer = false
+            noteRole()
+        }
+        return may
+    }
+
+    private func remember(_ next: RoleMemory.Stance) {
+        guard next != stance else { return }
+        stance = next
+        persistMemory()
+    }
+
+    private func persistMemory() {
+        RoleMemory(stance: stance ?? .unelected, updatedAt: Date(), shownWarnings: Array(shown)).save()
     }
 
     /// The whole role transition, pure. A 409 demotes at once, and only the
@@ -145,6 +198,10 @@ final class Engine: @unchecked Sendable {
             )
         }
         guard !due.isEmpty else { return }
+        // Still the server? Once per pass, before anything reaches Anthropic
+        // (see `PrePass`). Reuses a /api/state answer under 30 s old — the
+        // heartbeat usually just asked — so a server stays near 60-70 reads/hr.
+        guard await stillMayPoll() else { return }
         for (index, account) in due.enumerated() {
             // Demotion is honoured between accounts, not only between passes.
             if demoted.withLock({ $0 }) { return }
@@ -171,6 +228,7 @@ final class Engine: @unchecked Sendable {
         case .success(let snapshot):
             schedule.recordSuccess()
             Log.usage.notice(UsageLog.line(label: account.character, snapshot: snapshot))
+            await identity.resolveIfMissing(account, vault: vault)
             let warnings = WarnPolicy.assess(
                 name: account.nickname, label: account.character,
                 previous: previous?.snapshot, current: snapshot,
@@ -200,12 +258,12 @@ final class Engine: @unchecked Sendable {
 
     private func follow(now: Date) {
         guard let snapshot = remote?.snapshot else { return }
-        let activeLabel = ActiveAccount.match(email: ActiveAccount.signedInEmail(), accounts: Store.load())
-            .flatMap { id in Store.load().first { $0.id == id } }
-            .map { String($0.character) }
-        localState.write(followingServer: snapshot, activeLabel: activeLabel)
+        localState.write(followingServer: snapshot, activeAccountId: ActiveAccount.signedInAccountId())
         let decision = WarningReplay.decide(ServerWarning.decode(snapshot["warnings"]), shown: shown, now: now)
-        shown.formUnion(decision.markSeen)
+        if !decision.markSeen.isEmpty {
+            shown.formUnion(decision.markSeen)
+            persistMemory()
+        }
         // Headless has no notification centre; the log is where a follower
         // says it. The menu bar app's follower mode turns these into
         // notifications.
@@ -222,14 +280,17 @@ final class LocalStateFile: @unchecked Sendable {
     func write(accounts: [Account], states: [UUID: AccountState], fableFirst: Bool) {
         let activeID = ActiveAccount.match(email: ActiveAccount.signedInEmail(), accounts: accounts)
         write {
-            try LocalState.data(accounts: accounts, states: states, fableFirst: fableFirst, activeID: activeID)
+            try LocalState.data(
+                accounts: accounts, states: states, fableFirst: fableFirst, activeID: activeID,
+                accountIds: AccountIdentity.load()
+            )
         }
     }
 
-    func write(followingServer snapshot: [String: Any], activeLabel: String?) {
+    func write(followingServer snapshot: [String: Any], activeAccountId: String?) {
         write {
             try JSONSerialization.data(
-                withJSONObject: LocalState.body(followingServer: snapshot, activeLabel: activeLabel),
+                withJSONObject: LocalState.body(followingServer: snapshot, activeAccountId: activeAccountId),
                 options: [.sortedKeys, .prettyPrinted]
             )
         }
@@ -249,5 +310,49 @@ final class LocalStateFile: @unchecked Sendable {
                 Log.store.notice("local state: write failed, disabled for this run")
             }
         }
+    }
+}
+
+/// One process at a time per data directory: the daemon for its lifetime,
+/// `promote` for the length of its sign-ins. `flock`, so a holder that dies
+/// releases it and no stale lock file can wedge anything.
+final class DaemonLock: @unchecked Sendable {
+    private var descriptor: Int32
+    private init(descriptor: Int32) { self.descriptor = descriptor }
+
+    enum Outcome { case acquired(DaemonLock), busy, unavailable }
+
+    static func tryAcquire(in directory: URL) -> Outcome {
+        try? FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
+        )
+        let fd = open(directory.appendingPathComponent(".daemon.lock").path, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else { return .unavailable }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 { return .acquired(DaemonLock(descriptor: fd)) }
+        let busy = errno == EWOULDBLOCK
+        close(fd)
+        return busy ? .busy : .unavailable
+    }
+
+    /// Blocking form for the daemon. `nil` only when locking is impossible
+    /// (unwritable directory) — which must not stop a server measuring.
+    static func acquire(in directory: URL, wait: Bool, onWait: () -> Void) -> DaemonLock? {
+        switch tryAcquire(in: directory) {
+        case .acquired(let lock): return lock
+        case .unavailable: return nil
+        case .busy:
+            guard wait else { return nil }
+            onWait()
+            let fd = open(directory.appendingPathComponent(".daemon.lock").path, O_CREAT | O_RDWR, 0o600)
+            guard fd >= 0, flock(fd, LOCK_EX) == 0 else { return nil }
+            return DaemonLock(descriptor: fd)
+        }
+    }
+
+    func release() {
+        guard descriptor >= 0 else { return }
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+        descriptor = -1
     }
 }
