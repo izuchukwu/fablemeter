@@ -1989,6 +1989,114 @@ enum SelfTest {
         // a continuation that ignored cancellation, so `signIn` never returned,
         // never released port 8317, and never cleared "Signing in…". Every later
         // reconnect was then a silent no-op until the app was relaunched.
+        // MARK: The local read rail — null survives to disk, identity does not
+        //
+        // Other agents on this Mac read state.json to decide whether to start
+        // real work, so two things have to hold on the way out: a reading the
+        // server never sent must still be null rather than a confident zero,
+        // and nothing in the file may identify the human behind an account.
+        do {
+            let now = Date(timeIntervalSinceReferenceDate: 800_000_000)
+            let personal = Account(
+                id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
+                email: "izu@example.com", nickname: "Personal", label: "P",
+                refreshToken: "sk-ant-not-a-real-token-selftest"
+            )
+            let charm = Account(
+                id: UUID(uuidString: "22222222-2222-2222-2222-222222222222")!,
+                email: "izu@charm.example", nickname: "Charm", label: "C",
+                refreshToken: "sk-ant-also-not-real-selftest"
+            )
+            let accounts = [personal, charm]
+
+            // A reported zero and a reading that never came, side by side.
+            let reported = UsageSnapshot(
+                fiveHour: UsageBucket(id: "5h", label: "5-hour", percent: 0, resetsAt: nil),
+                weekly: UsageBucket(id: "wk", label: "Weekly", percent: nil, resetsAt: nil)
+            )
+            let states: [UUID: AccountState] = [
+                personal.id: AccountState(snapshot: reported, error: nil, needsSignIn: false),
+            ]
+
+            func rows(_ activeID: UUID?) -> [[String: Any]] {
+                (LocalState.body(
+                    accounts: accounts, states: states, fableFirst: true,
+                    activeID: activeID, now: now
+                )["accounts"] as? [[String: Any]]) ?? []
+            }
+            func bucket(_ row: [String: Any], _ name: String) -> [String: Any] {
+                ((row["buckets"] as? [String: Any])?[name] as? [String: Any]) ?? [:]
+            }
+
+            let withActive = LocalState.body(
+                accounts: accounts, states: states, fableFirst: true,
+                activeID: personal.id, now: now
+            )
+            let activeRows = rows(personal.id)
+            check("state: a reported zero stays 0 on disk",
+                  bucket(activeRows[0], "fiveHour")["percent"] as? Double == 0)
+            check("state: a reading the server never sent stays null",
+                  bucket(activeRows[0], "weekly")["percent"] is NSNull)
+            check("state: a bucket that never arrived is null, not absent",
+                  bucket(activeRows[0], "fable")["percent"] is NSNull)
+            check("state: an account with no snapshot at all is null throughout",
+                  activeRows[1]["headroom"] is NSNull
+                  && bucket(activeRows[1], "fiveHour")["percent"] is NSNull)
+
+            check("state: exactly the matched account is active",
+                  activeRows.filter { $0["isActive"] as? Bool == true }.count == 1
+                  && activeRows[0]["isActive"] as? Bool == true)
+            check("state: …and it says so out loud",
+                  withActive["activeResolved"] as? Bool == true)
+
+            let unresolved = LocalState.body(
+                accounts: accounts, states: states, fableFirst: true,
+                activeID: nil, now: now
+            )
+            check("state: an unresolved login marks nobody active",
+                  (unresolved["accounts"] as? [[String: Any]])?
+                      .allSatisfy { $0["isActive"] as? Bool == false } == true)
+            check("state: …and is distinguishable from a resolved one",
+                  unresolved["activeResolved"] as? Bool == false)
+
+            // The file is world-readable by design, so this is the check that
+            // matters most: it must carry no address and no credential.
+            let encoded = try? LocalState.data(
+                accounts: accounts, states: states, fableFirst: true,
+                activeID: personal.id, now: now
+            )
+            let text = encoded.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            check("state: no email reaches the file",
+                  !text.contains("@") && !text.lowercased().contains("example"))
+            check("state: no refresh token reaches the file",
+                  !text.contains("sk-ant") && !text.lowercased().contains("token"))
+            check("state: the labels and nicknames a reader needs do reach it",
+                  text.contains("\"Personal\"") && text.contains("\"P\""))
+            check("state: it is stamped, so staleness is the reader's to see",
+                  (withActive["updatedAt"] as? String)?.hasPrefix("2026-") == true)
+
+            // Matching, which is the part that decides whether the guard can
+            // answer at all.
+            check("active: the signed-in address picks its account",
+                  ActiveAccount.match(email: "izu@example.com", accounts: accounts) == personal.id)
+            check("active: case and padding do not hide a match",
+                  ActiveAccount.match(email: "  IZU@Example.COM \n", accounts: accounts) == personal.id)
+            check("active: an address we do not hold resolves to nobody",
+                  ActiveAccount.match(email: "someone@else.example", accounts: accounts) == nil)
+            check("active: a logged-out machine resolves to nobody",
+                  ActiveAccount.match(email: nil, accounts: accounts) == nil
+                  && ActiveAccount.match(email: "   ", accounts: accounts) == nil)
+            check("active: two accounts on one address is not an answer",
+                  ActiveAccount.match(
+                      email: "izu@example.com",
+                      accounts: [personal, Account(email: "izu@example.com", refreshToken: "x")]
+                  ) == nil)
+            check("active: an unreadable config is not a guess",
+                  ActiveAccount.signedInEmail(
+                      at: URL(fileURLWithPath: "/nonexistent/.claude.json")
+                  ) == nil)
+        }
+
         CallbackLoop.audit(cycles: 3, delayMilliseconds: 0, check: check)
 
         print(failures == 0 ? "\nselftest: all checks passed" : "\nselftest: \(failures) failure(s)")

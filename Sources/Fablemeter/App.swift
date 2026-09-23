@@ -144,6 +144,10 @@ final class AppState: ObservableObject {
     private let vault = TokenVault()
     /// Absent in demo mode, so fixture accounts can never reach the wire.
     private var pusher: Pusher?
+    /// Absent in demo mode for the same reason: the fleet reads this file to
+    /// decide whether to start real work, and fixture numbers must never be
+    /// what it reads.
+    private var localState: LocalStateWriter?
     private let warner = Warner()
     private var pollTask: Task<Void, Never>?
     private var lastManualRefresh: Date = .distantPast
@@ -165,6 +169,7 @@ final class AppState: ObservableObject {
         }
         accounts = Store.load()
         pusher = Pusher()
+        localState = LocalStateWriter()
         // The loop wakes often but asks each account's own schedule whether it
         // is due, so waking is free — only a due account costs a request.
         pollTask = Task { [weak self] in
@@ -249,6 +254,10 @@ final class AppState: ObservableObject {
         // the web companion hears about it. Fire and forget: nothing past this
         // line can touch the gauge, the schedule, or the screen.
         pusher?.push(accounts: accounts, states: states, fableFirst: isFableFirst)
+        // Same moment, same state, different destination: the web companion
+        // hears about the pass over the wire and the fleet on this Mac hears
+        // about it on disk.
+        localState?.write(accounts: accounts, states: states, fableFirst: isFableFirst)
     }
 
     private func isDue(_ account: Account, reason: RefreshReason, now: Date) -> Bool {
