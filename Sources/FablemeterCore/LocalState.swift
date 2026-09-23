@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 // MARK: - Which account is being spent
 
@@ -18,7 +17,7 @@ import os
 /// and a caller that does not gets the machine's best answer, clearly labelled.
 enum ActiveAccount {
     static var claudeConfig: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        Home.directory
             .appendingPathComponent(".claude.json")
     }
 
@@ -70,7 +69,7 @@ enum ActiveAccount {
 /// encoder is a second chance to collapse null into zero.
 enum LocalState {
     static var directory: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        Home.directory
             .appendingPathComponent(".claude/fablemeter", isDirectory: true)
     }
 

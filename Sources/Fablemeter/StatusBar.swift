@@ -1,4 +1,5 @@
 import AppKit
+@testable import FablemeterCore
 import Combine
 import SwiftUI
 

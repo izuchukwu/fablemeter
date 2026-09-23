@@ -1,89 +1,11 @@
 import AppKit
+@testable import FablemeterCore
 import SwiftUI
 
-// MARK: - Formatting
 
-enum Format {
-    /// When a limit comes back, as a wall clock reading rather than a countdown:
-    /// `5:03 PM` today, `Tue 4 PM` (nearest hour) on a later day. The 12/24-hour
-    /// choice follows the user's locale via the `j` template symbol.
-    static func resetStamp(
-        _ date: Date?,
-        from now: Date = Date(),
-        locale: Locale = .current,
-        timeZone: TimeZone = .current
-    ) -> String {
-        guard let date else { return "—" }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.locale = locale
-        calendar.timeZone = timeZone
-
-        let today = calendar.isDate(date, inSameDayAs: now)
-        // A later day only needs the hour, so round to the nearest one — a
-        // "Tue 3:57 PM" is false precision for something a week out.
-        let subject = today
-            ? date
-            : Date(timeIntervalSinceReferenceDate:
-                (date.timeIntervalSinceReferenceDate / 3600).rounded() * 3600)
-
-        let template = today ? "jmm" : "Ej"
-        var pattern = DateFormatter.dateFormat(fromTemplate: template, options: 0, locale: locale)
-            ?? (today ? "h:mm a" : "ccc h a")
-        if !today {
-            // `Ej` comes back as "ccc, h a"; the comma is noise in a narrow
-            // column. Drop it but keep the locale's own ordering.
-            pattern = pattern.replacingOccurrences(of: ",", with: "")
-                .replacingOccurrences(of: "  ", with: " ")
-        }
-        let formatter = DateFormatter()
-        formatter.locale = locale
-        formatter.timeZone = timeZone
-        formatter.dateFormat = pattern
-        return formatter.string(from: subject)
-    }
-
-    /// Compact countdown: `3d 04h`, `1h 08m`, `12m`, `now`. Only `--probe`
-    /// prints this now; the popover shows the reset stamp instead.
-    static func countdown(to date: Date?, from now: Date = Date()) -> String {
-        guard let date else { return "—" }
-        let seconds = Int(date.timeIntervalSince(now).rounded())
-        if seconds <= 0 { return "now" }
-        let days = seconds / 86400
-        let hours = (seconds % 86400) / 3600
-        let minutes = (seconds % 3600) / 60
-        if days > 0 { return String(format: "%dd %02dh", days, hours) }
-        if hours > 0 { return String(format: "%dh %02dm", hours, minutes) }
-        return "\(max(minutes, 1))m"
-    }
-
-    static func relative(_ date: Date?, from now: Date = Date()) -> String {
-        guard let date else { return "never" }
-        let seconds = Int(now.timeIntervalSince(date))
-        if seconds < 10 { return "just now" }
-        if seconds < 60 { return "\(seconds)s ago" }
-        if seconds < 3600 { return "\(seconds / 60)m ago" }
-        return "\(seconds / 3600)h ago"
-    }
-}
-
-/// Plain-language reading of headroom — the verdict shown before any number.
-enum Verdict {
-    /// `nil` headroom means the fetch succeeded and reported no readings at all.
-    /// It is called "No data" rather than "Unknown" on purpose: every other word
-    /// this app puts in this slot names something you can act on or wait out —
-    /// "rate limited", "No Internet", "Reconnect" — and "Unknown" only names the
-    /// app's own confusion. "No data" says whose gap it is: the server sent
-    /// none. After the null-versus-zero fix this should be genuinely rare, since
-    /// an unused account now reports zeros and reads Available.
-    static func word(headroom: Double?) -> String {
-        guard let headroom else { return "No data" }
-        if headroom > 40 { return "Available" }
-        if headroom > 10 { return "Limited" }
-        if headroom > 0 { return "Almost out" }
-        return "Blocked"
-    }
-
-    /// Monochrome until something is wrong — same thresholds as the menu bar.
+/// The colour half of the verdict; the words live in the core so the server
+/// and the wire can say them too.
+extension Verdict {
     static func color(headroom: Double?) -> Color {
         guard let headroom else { return .secondary }
         if headroom <= 10 { return .red }

@@ -1,5 +1,7 @@
 import Foundation
-import os
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 // MARK: - Payload
 
@@ -19,7 +21,9 @@ enum PushPayload {
         states: [UUID: AccountState],
         fableFirst: Bool,
         now: Date = Date(),
-        machine: String? = nil
+        machine: String? = nil,
+        machineId: String? = nil,
+        warnings: [ServerWarning]? = nil
     ) -> [String: Any] {
         var payload: [String: Any] = [
             "updatedAt": iso.string(from: now),
@@ -47,6 +51,12 @@ enum PushPayload {
         // Optional, and omitted rather than nulled when unnamed: the contract
         // reserves null for a reading that exists and is empty.
         if let machine { payload["machine"] = machine }
+        // Which machine measured this, so the web can refuse a push from a
+        // machine that is no longer the owner's server, and the warnings it
+        // fired in the last day, so followers can show the fresh ones locally
+        // without ever polling Anthropic themselves.
+        if let machineId { payload["machineId"] = machineId }
+        if let warnings { payload["warnings"] = warnings.map(\.json) }
         return payload
     }
 
@@ -55,12 +65,14 @@ enum PushPayload {
         states: [UUID: AccountState],
         fableFirst: Bool,
         now: Date = Date(),
-        machine: String? = nil
+        machine: String? = nil,
+        machineId: String? = nil,
+        warnings: [ServerWarning]? = nil
     ) throws -> Data {
         try JSONSerialization.data(
             withJSONObject: body(
                 accounts: accounts, states: states, fableFirst: fableFirst,
-                now: now, machine: machine
+                now: now, machine: machine, machineId: machineId, warnings: warnings
             ),
             options: [.sortedKeys]
         )
@@ -94,16 +106,19 @@ enum PushPayload {
 final class Pusher {
     private let keys: PushKeyStore
     private let endpoint = URL(string: "https://fablemeter.oniconic.app/api/push")!
-    /// How the key-management page names this Mac.
-    private let machine = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+    /// How the key-management page names this machine, and the stable id the
+    /// server role is keyed on.
+    private let machine = MachineIdentity.displayName
+    private let machineId = MachineIdentity.id()
 
     /// Written by the detached completion, read by the next pass — locked, not
     /// hoped about.
     private struct Flags {
         var loggedMissing = false
         var rejected: String?
+        var loggedNotServer = false
     }
-    private let flags = OSAllocatedUnfairLock<Flags>(initialState: Flags())
+    private let flags = Locked<Flags>(initialState: Flags())
 
     init(keys: PushKeyStore = .standard) {
         self.keys = keys
@@ -117,7 +132,16 @@ final class Pusher {
         key != nil && key == rejected
     }
 
-    func push(accounts: [Account], states: [UUID: AccountState], fableFirst: Bool) {
+    /// `onNotServer` fires when the web answers 409: another machine has been
+    /// promoted, so this one must stop polling Anthropic. The menu bar app
+    /// passes nothing yet (its follower mode is a later step) and simply logs.
+    func push(
+        accounts: [Account],
+        states: [UUID: AccountState],
+        fableFirst: Bool,
+        warnings: [ServerWarning] = [],
+        onNotServer: (@Sendable () -> Void)? = nil
+    ) {
         // Resolved per pass rather than once at startup, so a connect that
         // lands mid-session starts pushing on the next pass without a
         // relaunch. The value goes into the Authorization header and nowhere
@@ -139,7 +163,8 @@ final class Pusher {
         let payload: Data
         do {
             payload = try PushPayload.data(
-                accounts: accounts, states: states, fableFirst: fableFirst, machine: machine
+                accounts: accounts, states: states, fableFirst: fableFirst,
+                machine: machine, machineId: machineId, warnings: warnings
             )
         } catch {
             Log.push.error("push failed encoding")
@@ -154,24 +179,34 @@ final class Pusher {
         let count = accounts.count
         Task.detached { [flags] in
             do {
-                let (_, response) = try await URLSession.shared.data(for: request)
+                let (_, response) = try await HTTP.data(for: request)
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                 switch code {
                 case 200:
-                    Log.push.notice("push ok accounts=\(count, privacy: .public)")
+                    Log.push.notice("push ok accounts=\(count)")
                 case 401:
                     // The server no longer knows this key — revoked, or the
                     // account behind it deleted. Said once; the gauge is
                     // untouched and the next different key resumes.
                     flags.withLock { $0.rejected = key }
                     Log.push.notice("push: key rejected — reconnect from the ⋯ menu")
+                case 409:
+                    // Another machine is the server now. Said once; the caller
+                    // decides what stopping means for it.
+                    let first = flags.withLock { state -> Bool in
+                        if state.loggedNotServer { return false }
+                        state.loggedNotServer = true
+                        return true
+                    }
+                    if first { Log.push.notice("push: another machine is the server now") }
+                    onNotServer?()
                 default:
-                    Log.push.notice("push failed status=\(code, privacy: .public)")
+                    Log.push.notice("push failed status=\(code)")
                 }
             } catch {
                 // The same vetted vocabulary the gauge uses — never a body.
                 let verdict = NetworkFailure.text(for: error) ?? NetworkFailure.genericText
-                Log.push.notice("push failed verdict=\(verdict, privacy: .public)")
+                Log.push.notice("push failed verdict=\(verdict)")
             }
         }
     }

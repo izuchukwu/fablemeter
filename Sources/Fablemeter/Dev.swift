@@ -1,4 +1,5 @@
 import AppKit
+@testable import FablemeterCore
 import Foundation
 import SwiftUI
 
@@ -2098,6 +2099,11 @@ enum SelfTest {
         }
 
         CallbackLoop.audit(cycles: 3, delayMilliseconds: 0, check: check)
+
+        // The core's own checks — the same ones `fablemeter-server selftest`
+        // runs on the Linux box — so a server-side rule cannot pass there and
+        // be unproven here, or the other way round.
+        CoreChecks.run { name, ok, detail in check(name, ok, detail) }
 
         print(failures == 0 ? "\nselftest: all checks passed" : "\nselftest: \(failures) failure(s)")
         return failures == 0 ? 0 : 1

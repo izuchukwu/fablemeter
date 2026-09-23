@@ -141,9 +141,19 @@ enum AtomicFile {
             try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 var offset = 0
                 while offset < raw.count {
+                    #if canImport(Darwin)
                     let written = Darwin.write(
                         fd, raw.baseAddress!.advanced(by: offset), raw.count - offset
                     )
+                    #elseif canImport(Glibc)
+                    let written = Glibc.write(
+                        fd, raw.baseAddress!.advanced(by: offset), raw.count - offset
+                    )
+                    #else
+                    let written = Musl.write(
+                        fd, raw.baseAddress!.advanced(by: offset), raw.count - offset
+                    )
+                    #endif
                     if written < 0 {
                         if errno == EINTR { continue }
                         throw FileError.syscall("write", errno)
@@ -153,9 +163,16 @@ enum AtomicFile {
             }
             // F_FULLFSYNC pushes past the drive's own write cache; plain fsync
             // only reaches it. Either is enough to survive a killed process.
+            // Linux has no F_FULLFSYNC; its fsync already flushes the device.
+            #if canImport(Darwin)
             if fcntl(fd, F_FULLFSYNC) != 0, fsync(fd) != 0 {
                 throw FileError.syscall("fsync", errno)
             }
+            #else
+            if fsync(fd) != 0 {
+                throw FileError.syscall("fsync", errno)
+            }
+            #endif
         } catch {
             close(fd)
             throw error
@@ -236,9 +253,21 @@ enum Store {
     /// accident.
     static var directory: URL {
         if let directoryOverride { return directoryOverride }
+        #if os(Linux)
+        // Headless: the operator names the directory — on a Fly machine it
+        // must be a mounted volume, or every restart forgets the accounts.
+        let env = ProcessInfo.processInfo.environment
+        if let explicit = env["FABLEMETER_DATA_DIR"], !explicit.isEmpty {
+            return URL(fileURLWithPath: explicit, isDirectory: true)
+        }
+        let base = env["XDG_DATA_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? Home.directory.appendingPathComponent(".local/share", isDirectory: true)
+        return base.appendingPathComponent("fablemeter", isDirectory: true)
+        #else
         return FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ClaudeUsageBar", isDirectory: true)
+        #endif
     }
 
     static var file: URL { directory.appendingPathComponent("accounts.json") }

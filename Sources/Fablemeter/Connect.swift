@@ -1,94 +1,7 @@
 import AppKit
+@testable import FablemeterCore
 import Foundation
 import Security
-
-// MARK: - Errors
-
-/// Same two-layer shape as `OAuthError`: the case may carry detail for the
-/// log, `displayText` is the only form that reaches the screen.
-enum ConnectError: LocalizedError, Equatable {
-    case timedOut
-    case stateMismatch
-    case missingCode
-    case exchange(Int)
-    case malformed
-    case storeFailed
-    case entropyFailed
-
-    var errorDescription: String? { displayText }
-
-    var displayText: String {
-        switch self {
-        case .timedOut: return "connect timed out"
-        case .stateMismatch: return "connect aborted"
-        case .missingCode: return "connect refused"
-        case .exchange(let code): return "connect failed (\(code))"
-        case .malformed: return "unexpected response"
-        case .storeFailed: return "could not store the key"
-        case .entropyFailed: return "secure randomness unavailable"
-        }
-    }
-}
-
-// MARK: - Push key storage
-
-enum Keychain {
-    static func read(service: String, account: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let text = String(data: data, encoding: .utf8), !text.isEmpty
-        else { return nil }
-        return text
-    }
-
-    @discardableResult
-    static func write(_ value: String, service: String, account: String) -> Bool {
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(base as CFDictionary)
-        var add = base
-        add[kSecValueData as String] = Data(value.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
-    }
-}
-
-/// Where the push key lives. Keychain first — the home a key minted for a
-/// stranger's machine deserves — then the pre-connect `push-secret.txt`, so a
-/// Mac that was provisioned by hand keeps pushing without ever running the
-/// connect flow. A successful connect writes the Keychain, which then wins.
-struct PushKeyStore {
-    var readKeychain: () -> String?
-    var writeKeychain: (String) -> Bool
-    var readFile: () -> String?
-
-    func currentKey() -> String? { readKeychain() ?? readFile() }
-
-    static let service = "com.izu.fablemeter"
-    static let account = "push-key"
-
-    static let standard = PushKeyStore(
-        readKeychain: { Keychain.read(service: service, account: account) },
-        writeKeychain: { Keychain.write($0, service: service, account: account) },
-        readFile: {
-            let file = Store.directory.appendingPathComponent("push-secret.txt")
-            let raw = try? String(contentsOf: file, encoding: .utf8)
-            let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (trimmed?.isEmpty == false) ? trimmed : nil
-        }
-    )
-}
 
 // MARK: - Connect flow
 
@@ -115,19 +28,14 @@ enum Connect {
     /// prove the refusal without breaking the real source.
     static func randomHex(
         bytes count: Int,
-        using source: (Int) -> [UInt8]? = secureRandomBytes
+        using source: (Int) -> [UInt8]? = WebConnect.secureRandomBytes
     ) throws -> String {
-        guard let buf = source(count), buf.count == count else {
-            throw ConnectError.entropyFailed
-        }
-        return buf.map { String(format: "%02x", $0) }.joined()
+        try WebConnect.randomHex(bytes: count, using: source)
     }
 
     /// `nil` on failure — never a substitute.
     static func secureRandomBytes(_ count: Int) -> [UInt8]? {
-        var buf = [UInt8](repeating: 0, count: count)
-        guard SecRandomCopyBytes(kSecRandomDefault, count, &buf) == errSecSuccess else { return nil }
-        return buf
+        WebConnect.secureRandomBytes(count)
     }
 
     /// Pure, so the selftest can pin the shape the site expects.
@@ -193,17 +101,6 @@ enum Connect {
     }
 
     static func exchangeCode(_ code: String) async throws -> String {
-        var request = URLRequest(url: webBase.appendingPathComponent("api/exchange"))
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["code": code])
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard status == 200 else { throw ConnectError.exchange(status) }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let key = json["key"] as? String, !key.isEmpty
-        else { throw ConnectError.malformed }
-        return key
+        try await WebConnect.exchangeCode(code)
     }
 }

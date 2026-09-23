@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Read Fablemeter's usage state, and gate work on it.
+
+Usage:
+  fablemeter                                    one line per account
+  fablemeter --json                             the raw snapshot
+  fablemeter --guard --min-5h 10 --min-weekly 20 [--account P] [--max-age 900]
+  fablemeter --selftest                         prove the guard's decision table
+
+The guard answers "may I start this job?" with an EXIT CODE:
+  0  the account clears both floors
+  1  it does not
+  2  CANNOT TELL — and this is the one that matters
+
+Exit 2 is the whole point. A guard that cannot see the numbers and says yes is
+worse than no guard, because it launders an unknown into an approval. So a
+missing file, an unparseable one, a stale one, a null reading, or an
+unidentifiable active account all refuse. The app's own discipline is that a
+reading the server never sent is null and never zero; this is that rule wearing
+an exit code.
+
+The snapshot is written by the Fablemeter menu bar app after every completed
+poll pass (~5 min). It carries no address and no credential by design, and it
+deliberately does NOT live beside the app's account store, which holds live
+rotating OAuth refresh tokens.
+"""
+import argparse, json, os, sys, time
+
+STATE = os.path.expanduser("~/.claude/fablemeter/state.json")
+# Three poll intervals. Two missed passes is a blip; three is a gauge that has
+# stopped being evidence.
+DEFAULT_MAX_AGE = 900
+# Tolerated clock jitter between the app writing and a reader reading.
+CLOCK_SKEW = 120
+
+CLEAR, BELOW, UNKNOWN = 0, 1, 2
+
+
+def load(path=STATE):
+    """-> (state, None) or (None, why). Never raises: every failure is an answer."""
+    try:
+        with open(path) as f:
+            return json.load(f), None
+    except FileNotFoundError:
+        return None, "no snapshot yet (is the Fablemeter app running?)"
+    except Exception as e:
+        return None, f"snapshot unreadable: {e}"
+
+
+def parse_iso(s):
+    """ISO-8601 -> epoch seconds, or None.
+
+    NOT time.mktime: it reads a struct_time as LOCAL time and ignores the
+    offset %z parsed into it, so a UTC stamp comes back skewed by the local
+    offset — and by a DIFFERENT amount under DST, because time.timezone is the
+    standard offset and time.altzone is the summer one. The fleet's Slack
+    watchdog shipped exactly this bug and its cursor landed seven hours in the
+    future. datetime carries the offset through arithmetic; nothing else here
+    has to know about zones at all.
+    """
+    if not isinstance(s, str):
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # The app always stamps UTC; a naive stamp is read as UTC rather than as
+    # wherever this shell happens to be.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def pick(state, account):
+    """-> (row, None) or (None, why). Which account the question is about."""
+    rows = state.get("accounts") or []
+    if not rows:
+        return None, "snapshot holds no accounts"
+    if account:
+        want = account.strip().lower()
+        hits = [r for r in rows
+                if str(r.get("label", "")).lower() == want
+                or str(r.get("nickname", "")).lower() == want]
+        if len(hits) != 1:
+            return None, f"no single account matches {account!r}"
+        return hits[0], None
+    if not state.get("activeResolved"):
+        return None, "active account not identified — pass --account"
+    hits = [r for r in rows if r.get("isActive")]
+    if len(hits) != 1:
+        return None, "active account not identified — pass --account"
+    return hits[0], None
+
+
+def headroom_of(row, bucket):
+    """-> (remaining_percent, None) or (None, why). null is never zero."""
+    b = (row.get("buckets") or {}).get(bucket)
+    if not isinstance(b, dict):
+        return None, f"{bucket}: no bucket"
+    pct = b.get("percent")
+    if pct is None:
+        return None, f"{bucket}: no reading"
+    try:
+        return 100.0 - float(pct), None
+    except (TypeError, ValueError):
+        return None, f"{bucket}: unreadable reading"
+
+
+def decide(state, *, account=None, min_5h=10.0, min_weekly=20.0,
+           now=None, max_age=DEFAULT_MAX_AGE, load_error=None):
+    """Pure. -> (exit_code, message). Every uncertainty is UNKNOWN, never CLEAR."""
+    if state is None:
+        return UNKNOWN, load_error or "no snapshot"
+    now = time.time() if now is None else now
+
+    stamped = parse_iso(state.get("updatedAt"))
+    if stamped is None:
+        return UNKNOWN, "snapshot has no usable timestamp"
+    age = now - stamped
+    if age > max_age:
+        return UNKNOWN, f"snapshot is {int(age)}s old (max {int(max_age)}s) — gauge may be down"
+    # A stamp from the future is not a fresh snapshot, it is a broken clock or a
+    # mangled parse, and "very fresh" is precisely how it looks to an age check.
+    # The fleet's Slack watchdog shipped with this bug in the other direction: a
+    # cursor seven hours ahead matched nothing and printed nothing, which was
+    # indistinguishable from all-clear. Refuse instead.
+    if age < -CLOCK_SKEW:
+        return UNKNOWN, f"snapshot is stamped {int(-age)}s in the future — clock skew?"
+
+    row, why = pick(state, account)
+    if row is None:
+        return UNKNOWN, why
+
+    name = row.get("nickname") or row.get("label") or "account"
+    if row.get("isStale"):
+        return UNKNOWN, f"{name}: last fetch failed, numbers are not live"
+
+    five, why5 = headroom_of(row, "fiveHour")
+    if five is None:
+        return UNKNOWN, f"{name}: {why5}"
+    week, whyw = headroom_of(row, "weekly")
+    if week is None:
+        return UNKNOWN, f"{name}: {whyw}"
+
+    short = [f"5h {five:.0f}% (floor {min_5h:.0f})" if five < min_5h else None,
+             f"weekly {week:.0f}% (floor {min_weekly:.0f})" if week < min_weekly else None]
+    short = [s for s in short if s]
+    if short:
+        return BELOW, f"{name}: below floor — " + ", ".join(short)
+    return CLEAR, f"{name}: clear — 5h {five:.0f}%, weekly {week:.0f}% headroom"
+
+
+def fmt_pct(row, bucket):
+    b = (row.get("buckets") or {}).get(bucket) or {}
+    p = b.get("percent")
+    return "  —" if p is None else f"{float(p):3.0f}%"
+
+
+def show(state, why):
+    if state is None:
+        print(f"fablemeter: {why}", file=sys.stderr)
+        return UNKNOWN
+    stamped = parse_iso(state.get("updatedAt"))
+    age = "unknown age" if stamped is None else f"{int(time.time() - stamped)}s ago"
+    resolved = "" if state.get("activeResolved") else "   (active account unidentified)"
+    print(f"updated {age}{resolved}")
+    for row in state.get("accounts") or []:
+        head = row.get("headroom")
+        head = " —" if head is None else f"{float(head):3.0f}"
+        mark = "*" if row.get("isActive") else " "
+        stale = "  stale" if row.get("isStale") else ""
+        print(f" {mark} {str(row.get('nickname',''))[:12]:<12} {row.get('label','?')}  "
+              f"headroom {head}  5h {fmt_pct(row,'fiveHour')}  "
+              f"wk {fmt_pct(row,'weekly')}  fable {fmt_pct(row,'fable')}"
+              f"  {row.get('verdict','')}{stale}")
+    return CLEAR
+
+
+def selftest():
+    """The decision table, including every path to 2."""
+    now = 1_000_000.0
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+
+    def state(five=50, weekly=50, active=True, resolved=True, stale=False, when=stamp):
+        return {"updatedAt": when, "activeResolved": resolved,
+                "accounts": [{"label": "P", "nickname": "Personal", "isActive": active,
+                              "headroom": 50, "verdict": "Available", "isStale": stale,
+                              "buckets": {"fiveHour": {"percent": five, "resetsAt": None},
+                                          "weekly": {"percent": weekly, "resetsAt": None},
+                                          "fable": {"percent": 0, "resetsAt": None}}}]}
+
+    cases = [
+        ("clears both floors",                  state(50, 50),                    {}, CLEAR),
+        ("exactly on both floors clears",       state(90, 80),                    {}, CLEAR),
+        ("below the 5-hour floor",              state(95, 10),                    {}, BELOW),
+        ("below the weekly floor",              state(10, 85),                    {}, BELOW),
+        ("a reported zero is a real reading",   state(0, 0),                      {}, CLEAR),
+        ("a null 5-hour cannot tell",           state(None, 10),                  {}, UNKNOWN),
+        ("a null weekly cannot tell",           state(10, None),                  {}, UNKNOWN),
+        ("no snapshot cannot tell",             None,                             {}, UNKNOWN),
+        ("a stale snapshot cannot tell",        state(when=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 5000))), {}, UNKNOWN),
+        ("a future stamp cannot tell",          state(when=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 5000))), {}, UNKNOWN),
+        ("no timestamp cannot tell",            state(when=None),                 {}, UNKNOWN),
+        ("an unresolved login cannot tell",     state(resolved=False),            {}, UNKNOWN),
+        ("no active row cannot tell",           state(active=False),              {}, UNKNOWN),
+        ("a failing fetch cannot tell",         state(stale=True),                {}, UNKNOWN),
+        ("--account rescues an unresolved one", state(resolved=False),  {"account": "P"}, CLEAR),
+        ("--account matches on nickname",       state(resolved=False), {"account": "personal"}, CLEAR),
+        ("--account naming nobody cannot tell", state(),                {"account": "Z"}, UNKNOWN),
+    ]
+    bad = 0
+
+    # Parsing is pinned against a KNOWN epoch, never against a round trip
+    # through parse_iso itself: the first version of this test generated its
+    # stamps with the same broken helper it was testing, so both sides were an
+    # hour wrong and agreed with each other.
+    pins = [
+        ("UTC 'Z' parses to the right instant", parse_iso("2026-09-23T14:47:01Z"), 1790174821.0),
+        ("an explicit offset parses too",       parse_iso("2026-09-23T07:47:01-07:00"), 1790174821.0),
+        ("a naive stamp is read as UTC",        parse_iso("2026-09-23T14:47:01"), 1790174821.0),
+        ("junk does not parse",                 parse_iso("not a date"), None),
+    ]
+    for name, got, want in pins:
+        ok = got == want
+        bad += not ok
+        print(f"{'PASS' if ok else 'FAIL'}  {name}  -> {got}")
+
+    # And the whole point of the clock: a snapshot written right now is fresh.
+    fresh = decide(
+        {"updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+         "activeResolved": True,
+         "accounts": [{"label": "P", "nickname": "Personal", "isActive": True,
+                       "headroom": 90, "verdict": "Available", "isStale": False,
+                       "buckets": {"fiveHour": {"percent": 5}, "weekly": {"percent": 5},
+                                   "fable": {"percent": 5}}}]},
+        min_5h=10, min_weekly=20)[0]
+    bad += fresh != CLEAR
+    print(f"{'PASS' if fresh == CLEAR else 'FAIL'}  a snapshot written now reads as fresh  -> {fresh}")
+
+    for name, st, kw, want in cases:
+        got, msg = decide(st, now=now, min_5h=10, min_weekly=20,
+                          load_error="no snapshot", **kw)
+        ok = got == want
+        bad += not ok
+        print(f"{'PASS' if ok else 'FAIL'}  {name}  -> {got} ({msg})")
+    print(f"\nfablemeter selftest: {'all checks passed' if not bad else f'{bad} failure(s)'}")
+    return 0 if not bad else 1
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--guard", action="store_true")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--min-5h", type=float, default=10.0)
+    p.add_argument("--min-weekly", type=float, default=20.0)
+    p.add_argument("--account")
+    p.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE)
+    p.add_argument("--state", default=STATE)
+    a = p.parse_args()
+
+    if a.selftest:
+        return selftest()
+
+    state, why = load(a.state)
+
+    if a.json:
+        if state is None:
+            print(f"fablemeter: {why}", file=sys.stderr)
+            return UNKNOWN
+        json.dump(state, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return CLEAR
+
+    if a.guard:
+        code, msg = decide(state, account=a.account, min_5h=a.min_5h,
+                           min_weekly=a.min_weekly, max_age=a.max_age, load_error=why)
+        print(msg, file=sys.stderr if code else sys.stdout)
+        return code
+
+    return show(state, why)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

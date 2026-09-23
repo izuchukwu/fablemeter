@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 // MARK: - Model
 
@@ -338,7 +341,7 @@ enum UsageClient {
         req.setValue(Constants.betaVersion, forHTTPHeaderField: "anthropic-beta")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let (data, response) = try await URLSession.shared.data(for: req)
+        let (data, response) = try await HTTP.data(for: req)
         let http = response as? HTTPURLResponse
         let code = http?.statusCode ?? 0
         switch code {

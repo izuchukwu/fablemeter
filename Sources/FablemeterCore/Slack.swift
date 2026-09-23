@@ -1,5 +1,7 @@
 import Foundation
-import os
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 // MARK: - Slack mirror
 
@@ -47,8 +49,17 @@ enum Slack {
     /// Re-read per post rather than cached: dropping a token in while the app
     /// runs should start the mirror, and taking it away should stop it, with no
     /// relaunch either way. The file is tiny and a warning is rare.
-    static func config() -> SlackConfig? {
-        guard let data = try? Data(contentsOf: file) else { return nil }
+    /// Environment first, for the headless server (`FABLEMETER_SLACK_TOKEN` +
+    /// `FABLEMETER_SLACK_CHANNEL`, or `FABLEMETER_SLACK_CONFIG` naming a file),
+    /// then `slack.json` beside the account store as before. The menu bar app
+    /// is launched without any of these set, so it reads exactly what it did.
+    static func config(environment: [String: String] = ProcessInfo.processInfo.environment) -> SlackConfig? {
+        if let token = environment["FABLEMETER_SLACK_TOKEN"], !token.isEmpty,
+           let channel = environment["FABLEMETER_SLACK_CHANNEL"], !channel.isEmpty {
+            return SlackConfig(token: token, channel: channel)
+        }
+        let path = environment["FABLEMETER_SLACK_CONFIG"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) } ?? file
+        guard let data = try? Data(contentsOf: path) else { return nil }
         return SlackConfig.decode(data)
     }
 
@@ -76,20 +87,20 @@ enum Slack {
         )
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await HTTP.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             if let json, json["ok"] as? Bool == true { return true }
             // Slack's `error` is a fixed vocabulary of slugs, so it is safe to
             // log; the body it came in is not, and never goes near this line.
             let slug = (json?["error"] as? String) ?? "no ok field"
-            Log.usage.notice("slack: post refused, HTTP \(status, privacy: .public) \(slug, privacy: .public)")
+            Log.usage.notice("slack: post refused, HTTP \(status) \(slug)")
             return false
         } catch {
             // The URL error code, not the message: a message can name the host,
             // the proxy, or the request.
             let code = (error as? URLError)?.code.rawValue ?? -1
-            Log.usage.notice("slack: post failed, URLError \(code, privacy: .public)")
+            Log.usage.notice("slack: post failed, URLError \(code)")
             return false
         }
     }
@@ -97,7 +108,7 @@ enum Slack {
     /// Said once per launch. A machine with no token would otherwise write this
     /// line on every warning forever, which is how a normal condition turns
     /// into noise.
-    private static let missingLogged = OSAllocatedUnfairLock(initialState: false)
+    private static let missingLogged = Locked(initialState: false)
 
     private static func noteMissingConfigOnce() {
         let first = missingLogged.withLock { logged -> Bool in

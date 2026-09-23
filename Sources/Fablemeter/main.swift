@@ -1,4 +1,5 @@
 import AppKit
+@testable import FablemeterCore
 
 let arguments = Set(CommandLine.arguments.dropFirst())
 
@@ -28,6 +29,17 @@ if arguments.contains("--slack-test") {
     var status: Int32 = 1
     Task {
         status = await SlackTest.run()
+        semaphore.signal()
+    }
+    semaphore.wait()
+    exit(status)
+}
+
+if arguments.contains("--oob-test") {
+    let semaphore = DispatchSemaphore(value: 0)
+    var status: Int32 = 1
+    Task {
+        status = await OOBTest.run()
         semaphore.signal()
     }
     semaphore.wait()
