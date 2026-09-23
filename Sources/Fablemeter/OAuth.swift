@@ -298,6 +298,17 @@ extension OAuth {
     static func signIn(
         persistRefreshToken: ((String) throws -> Void)? = nil
     ) async throws -> (email: String, refreshToken: String) {
+        let result = try await signInIdentified(persistRefreshToken: persistRefreshToken)
+        return (result.email ?? "Claude account", result.refreshToken)
+    }
+
+    /// The same sign-in, reporting who it actually signed in as: the email and
+    /// the Anthropic account UUID, each nil when neither the token response nor
+    /// the profile said. Promotion needs both to be sure the person signed into
+    /// the account they meant to, rather than trusting a placeholder.
+    static func signInIdentified(
+        persistRefreshToken: ((String) throws -> Void)? = nil
+    ) async throws -> (email: String?, refreshToken: String, accountId: String?) {
         let verifier = PKCE.randomBase64URL(bytes: 64)
         let challenge = PKCE.challenge(for: verifier)
         let state = PKCE.randomBase64URL(bytes: 32)
@@ -344,11 +355,14 @@ extension OAuth {
         let bundle = try await exchange(code: code, verifier: verifier, redirectURI: redirectURI, state: state)
         guard let refresh = bundle.refreshToken else { throw OAuthError.malformed }
         try persistRefreshToken?(refresh)
-        var email = bundle.email
-        if email == nil || email?.isEmpty == true {
-            email = try? await fetchProfileEmail(accessToken: bundle.accessToken)
+        var email = bundle.email?.isEmpty == false ? bundle.email : nil
+        var accountId = AccountIdentity.normalize(bundle.accountId)
+        if email == nil || accountId == nil,
+           let profile = try? await fetchProfile(accessToken: bundle.accessToken) {
+            if email == nil, let found = profile.email, !found.isEmpty { email = found }
+            if accountId == nil { accountId = AccountIdentity.normalize(profile.accountId) }
         }
-        return (email ?? "Claude account", refresh)
+        return (email, refresh, accountId)
     }
 
 }

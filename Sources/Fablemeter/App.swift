@@ -33,6 +33,16 @@ final class AppState: ObservableObject {
     /// which bricks nothing, and it cannot push anyway. Connect it (⋯ menu) to
     /// make it a proper follower.
     @Published private(set) var isFollowingServer = false
+    /// The last answer from `/api/state`: who the server is and which machines
+    /// have checked in. The Server submenu is drawn from this and nothing else,
+    /// so opening the menu never waits on the network.
+    @Published private(set) var remote: RemoteState?
+    /// The server's snapshot, rebuilt for drawing while this Mac follows.
+    @Published private(set) var followed: FollowedSnapshot?
+    @Published private(set) var hasWebKey = false
+    @Published private(set) var isPromoting = false
+    /// "Signing into Personal (1 of 3)…" while a promotion runs.
+    @Published private(set) var promotionStep: String?
     /// Whether the gauge counts Fable in its minimum — see
     /// `UsageSnapshot.headroom(fableFirst:)`. On by default, and `object(forKey:)`
     /// rather than `bool(forKey:)` on purpose: an absent key means the default,
@@ -85,6 +95,9 @@ final class AppState: ObservableObject {
     private var isPassRunning = false
     private var roleMemory: RoleMemory?
     private var lastFollowCheck: Date = .distantPast
+    private var remoteFetchedAt: Date = .distantPast
+    private var lastBackgroundCheck: Date = .distantPast
+    private var promoteTask: Task<Void, Never>?
     private var loggedNoKey = false
     private let identity = IdentityResolver()
 
@@ -98,6 +111,7 @@ final class AppState: ObservableObject {
             return
         }
         accounts = Store.load()
+        hasWebKey = PushKeyStore.standard.currentKey() != nil
         pusher = Pusher()
         localState = LocalStateWriter()
         // A follower that restarts stays a follower, before anything else can
@@ -113,6 +127,7 @@ final class AppState: ObservableObject {
             await self?.settleRoleAtLaunch()
             while !Task.isCancelled {
                 await self?.followIfFollowing()
+                await self?.refreshRemoteIfDue()
                 await self?.refresh(reason: .scheduled)
                 // Unconditional, and outside every branch above it: there is no
                 // path through this loop that gets back to the top without
@@ -127,13 +142,21 @@ final class AppState: ObservableObject {
         }
     }
 
-    var canAddAccount: Bool { !isDemo && !isSigningIn }
+    /// A promotion owns the sign-in while it runs: a second browser flow would
+    /// race it for the loopback listener and the person's attention.
+    var canAddAccount: Bool { !isDemo && !isSigningIn && !isPromoting }
 
     /// What the status item draws, one cell per account. `headroom` is the last
     /// reading that arrived even when the newest attempt failed, so a 429 dims
     /// the gauge's track rather than emptying it.
     var barCells: [BarCell] {
-        accounts.map { account in
+        if isFollowingServer, let followed, !followed.accounts.isEmpty {
+            let now = Date()
+            return followed.accounts.map {
+                BarCell.cell(character: $0.character, state: followed.state(for: $0, now: now), fableFirst: isFableFirst)
+            }
+        }
+        return accounts.map { account in
             // Derived from the snapshot on every draw, so an account flips to
             // yellow the moment Fable hits 100% and back the moment its week
             // resets — no relaunch, and per account. The Fable-first toggle
@@ -165,6 +188,8 @@ final class AppState: ObservableObject {
     func refresh(reason: RefreshReason) async {
         guard !isDemo else { return }
         guard !isFollowingServer else { return }
+        // A promotion is re-signing accounts; nothing may refresh underneath it.
+        guard !isPromoting else { return }
         guard !accounts.isEmpty else {
             lastUpdated = Date()
             return
@@ -338,7 +363,9 @@ final class AppState: ObservableObject {
     }
 
     private func webClient() -> WebClient? {
-        guard let key = PushKeyStore.standard.currentKey() else {
+        let key = PushKeyStore.standard.currentKey()
+        if hasWebKey != (key != nil) { hasWebKey = key != nil }
+        guard let key else {
             if !loggedNoKey {
                 loggedNoKey = true
                 Log.role.notice("role: no web key — cannot learn this Mac's role; polling as before. Connect from the ⋯ menu.")
@@ -371,6 +398,9 @@ final class AppState: ObservableObject {
     }
 
     private func apply(_ remote: RemoteState, machineId: String) {
+        self.remote = remote
+        remoteFetchedAt = Date()
+        followed = remote.snapshot.map(FollowedSnapshot.decode)
         let election = remote.election(machineId: machineId)
         remember(RoleMemory.stance(for: election))
         if StartupRole.mayPoll(live: election, remembered: roleMemory?.stance) {
@@ -385,13 +415,29 @@ final class AppState: ObservableObject {
     /// hand it to the fleet's state file (the server's `updatedAt`, the server's
     /// nulls), and show any warning the server fired in the last half hour that
     /// this Mac has not shown. Never touches Anthropic or a token.
-    func followIfFollowing() async {
+    func followIfFollowing(force: Bool = false) async {
         guard isFollowingServer, !isDemo else { return }
-        guard Date().timeIntervalSince(lastFollowCheck) >= 30 else { return }
+        guard force || Date().timeIntervalSince(lastFollowCheck) >= 30 else { return }
         lastFollowCheck = Date()
         guard let client = webClient(),
               let remote = try? await OAuth.firstOf(timeout: 10, { try await client.state() })
         else { return }
+        apply(remote, machineId: client.machineId)
+    }
+
+    /// Keeps the Server submenu current without anyone opening it. A follower
+    /// already asks every 30 s; a server or unelected Mac asks before every
+    /// poll pass anyway, so this only fills gaps, at most every 5 minutes.
+    func refreshRemoteIfDue() async {
+        guard !isDemo, !isPromoting else { return }
+        let now = Date()
+        // Every five minutes at most: the key read can touch the Keychain, and
+        // the machine list changes when someone promotes, not by the minute.
+        guard now.timeIntervalSince(lastBackgroundCheck) >= 300 else { return }
+        lastBackgroundCheck = now
+        guard let client = webClient(), !isFollowingServer,
+              now.timeIntervalSince(remoteFetchedAt) >= 300 else { return }
+        guard let remote = try? await OAuth.firstOf(timeout: 10, { try await client.state() }) else { return }
         apply(remote, machineId: client.machineId)
     }
 
@@ -421,6 +467,9 @@ final class AppState: ObservableObject {
             // never due — the control must never be left spinning.
             defer { isManualRefreshing = false }
             let started = Date()
+            // A follower's refresh is asking the web for the server's latest,
+            // never Anthropic.
+            if isFollowingServer { await followIfFollowing(force: true) }
             await refresh(reason: .manual)
             // A cached or instantly-failing pass returns in milliseconds; the
             // spinner still has to be seen to mean anything.
@@ -459,6 +508,22 @@ final class AppState: ObservableObject {
         if let error = error as? OAuthError { return error.displayText }
         if let error = error as? ConnectError { return error.displayText }
         return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+
+    /// A promotion's failure, in the same short vocabulary as everything else
+    /// on screen: never a response body, never Foundation's own sentence.
+    nonisolated static func promotionMessage(for error: Error) -> String {
+        if let error = error as? PromoteError { return error.errorDescription ?? "Promotion failed" }
+        let text: String
+        switch error {
+        case WebError.keyRejected: text = "Fablemeter Web rejected this Mac's key — connect again"
+        case WebError.status(let code): text = "Fablemeter Web answered \(code)"
+        case WebError.malformed, WebError.notServer: text = "Unexpected answer from Fablemeter Web"
+        case let error as OAuthError: text = error.displayText
+        case let error as ConnectError: text = error.displayText
+        default: text = NetworkFailure.text(for: error) ?? NetworkFailure.genericText
+        }
+        return "\(text) — nothing was promoted"
     }
 
     nonisolated static func outcome(for error: Error) -> FetchOutcome {
@@ -514,13 +579,16 @@ final class AppState: ObservableObject {
     /// no relaunch, nothing else to do. Failures land in the same banner as
     /// sign-in failures, in the same vetted vocabulary.
     func connectWeb() {
-        guard !isDemo, !isConnectingWeb else { return }
+        guard !isDemo, !isConnectingWeb, !isPromoting else { return }
         isConnectingWeb = true
         signInError = nil
         Task {
             do {
                 try await Connect.run()
                 Log.push.notice("connect: key stored")
+                hasWebKey = true
+                remoteFetchedAt = .distantPast
+                lastBackgroundCheck = .distantPast
             } catch {
                 signInError = Self.signInMessage(for: error)
             }
@@ -533,7 +601,7 @@ final class AppState: ObservableObject {
     /// keeps its id, nickname, label and place in the order; only the
     /// credential underneath it is replaced.
     func signInAgain(_ account: Account) {
-        guard !isDemo, !isSigningIn else { return }
+        guard !isDemo, !isSigningIn, !isPromoting else { return }
         isSigningIn = true
         signInError = nil
         let id = account.id
@@ -635,6 +703,267 @@ final class AppState: ObservableObject {
         persistAccounts { stored in
             guard let i = stored.firstIndex(where: { $0.id == account.id }) else { return }
             stored[i].nickname = normalized
+        }
+    }
+
+    // MARK: What the popover and the menu bar draw
+
+    /// The server's rows while this Mac follows and the server has reported;
+    /// nil otherwise, which means "draw this Mac's own accounts".
+    func followedRows(now: Date) -> [DisplayRow]? {
+        guard isFollowingServer, let followed, !followed.accounts.isEmpty else { return nil }
+        // The email line is this Mac's own knowledge, matched on the account
+        // UUID — the payload never carries an address, and a label match could
+        // put one account's address on another's numbers.
+        let ids = isDemo ? [:] : AccountIdentity.load()
+        return followed.accounts.map { row in
+            let local = row.accountId.flatMap { id in
+                accounts.first { ids[$0.id] == id }
+            }
+            return DisplayRow(
+                id: "server:\(row.rowId)", label: row.label, nickname: row.nickname,
+                email: local?.email, state: followed.state(for: row, now: now), local: nil
+            )
+        }
+    }
+
+    func displayRows(now: Date) -> [DisplayRow] {
+        followedRows(now: now) ?? accounts.map { account in
+            DisplayRow(
+                id: account.id.uuidString, label: account.label, nickname: account.nickname,
+                email: account.email, state: states[account.id], local: account
+            )
+        }
+    }
+
+    /// The footer's line: whose numbers these are and how old.
+    func footerText(now: Date) -> String {
+        if let promotionStep { return promotionStep }
+        if isSigningIn { return "Signing in…" }
+        if followedRows(now: now) != nil, let followed {
+            let source = remote?.server?.machine ?? followed.machine ?? "server"
+            return "From \(source) · updated \(Format.relative(followed.updatedAt, from: now))"
+        }
+        return "Updated \(Format.relative(lastUpdated, from: now))"
+    }
+
+    var serverMenuItems: [ServerMenuItem] {
+        ServerMenuModel.items(
+            hasKey: hasWebKey, remote: remote,
+            machineId: isDemo ? Self.demoMachineId : MachineIdentity.id(),
+            promotion: isPromoting ? (promotionStep ?? "Starting…") : nil,
+            // Not `isDemo`: `promoteThisMac` refuses a demo build itself, and
+            // the render must show the item as the real menu does.
+            busy: isSigningIn || isConnectingWeb
+        )
+    }
+
+    // MARK: Promotion
+
+    /// "Make This Mac the Server": every account signs in again here, one at a
+    /// time, then — only then — the web is told. See `PromoteSequence`.
+    func promoteThisMac() {
+        guard !isDemo, !isPromoting, !isSigningIn, !isConnectingWeb, let client = webClient() else { return }
+        isPromoting = true
+        promotionStep = nil
+        signInError = nil
+        promoteTask = Task { [weak self] in
+            await self?.runPromotion(client: client)
+            self?.isPromoting = false
+            self?.promotionStep = nil
+            self?.promoteTask = nil
+        }
+    }
+
+    func cancelPromotion() {
+        promoteTask?.cancel()
+    }
+
+    private func runPromotion(client: WebClient) async {
+        // A pass already under way finishes first; `refresh` refuses to start
+        // another while `isPromoting` is set, so from here on nothing on this
+        // Mac refreshes a token but the sign-ins below.
+        var waited = 0
+        while isPassRunning && waited < 1200 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            waited += 1
+        }
+        let before = roleMemory?.stance
+        await inheritServerNames(client: client)
+        let outcome = await PromoteSequence.run(
+            accounts: accounts,
+            progress: { [weak self] index, count, account in
+                await self?.showStep(PromoteSequence.stepText(nickname: account.nickname, index: index, count: count))
+            },
+            signIn: { [weak self] account in
+                guard let self else { throw CancellationError() }
+                try await self.reSign(account)
+            },
+            promote: { _ = try await client.promote() },
+            describe: { AppState.promotionMessage(for: $0) }
+        )
+        let after = PromoteSequence.stanceAfter(outcome, before: before)
+        switch outcome {
+        case .promoted:
+            remember(after ?? .server)
+            Log.role.notice("role: promoted — this Mac is the server")
+            leaveFollowerMode()
+            promotionStep = nil
+            isPromoting = false
+            remoteFetchedAt = .distantPast
+            lastBackgroundCheck = .distantPast
+            await refreshRemoteIfDue()
+            await refresh(reason: .manual)
+        case .cancelled:
+            Log.role.notice("role: promotion cancelled — nothing was promoted")
+        case .failed(let message):
+            // The reason goes to the banner only: it can name an address, and
+            // the log has never carried one.
+            Log.role.notice("role: promotion failed — nothing was promoted")
+            signInError = message
+        }
+    }
+
+    private func showStep(_ text: String) { promotionStep = text }
+
+    /// One account, signed in again on this Mac. The account's cross-process
+    /// refresh lock is held for the whole of it, so no refresh — this app's or
+    /// any other process's — can spend the account's token while its
+    /// replacement is being issued. The fresh token is on disk the instant it
+    /// exists, before anything else is awaited.
+    private func reSign(_ account: Account) async throws {
+        let lock: RefreshLock?
+        do {
+            lock = try RefreshLock.acquire(for: account.id, in: Store.directory)
+        } catch {
+            throw PromoteError.busy(account.nickname)
+        }
+        defer { lock?.release() }
+        await vault.forget(account.id)
+        let id = account.id
+        let result = try await OAuth.signInIdentified(persistRefreshToken: { token in
+            try Store.updateRefreshToken(id: id, to: token)
+        })
+        let expectedId = AccountIdentity.load()[id]
+        let sameAccount: Bool
+        if let expectedId, let got = result.accountId {
+            sameAccount = expectedId == got
+        } else if let email = result.email {
+            sameAccount = email.caseInsensitiveCompare(account.email) == .orderedSame
+        } else {
+            sameAccount = false
+        }
+        // Whatever happened, the row now holds this sign-in's token, so it says
+        // whose it is rather than keeping an address that is no longer true.
+        let email = result.email ?? account.email
+        try Store.mutate { stored in
+            guard let i = stored.firstIndex(where: { $0.id == id }) else { return }
+            stored[i].email = email
+            stored[i].refreshToken = result.refreshToken
+        }
+        if let i = accounts.firstIndex(where: { $0.id == id }) {
+            accounts[i].email = email
+            accounts[i].refreshToken = result.refreshToken
+        }
+        AccountIdentity.remember(id, accountId: result.accountId)
+        await vault.reset(id)
+        states[id]?.needsSignIn = false
+        retry[id] = nil
+        lastAttempt[id] = nil
+        guard result.email != nil || result.accountId != nil else { throw PromoteError.unidentified }
+        guard sameAccount else { throw PromoteError.wrongAccount(expected: account.nickname, got: email) }
+    }
+
+    /// Before promoting away from another server, take its names for the same
+    /// accounts — matched on the Anthropic account UUID, never the label — so
+    /// the letters agents already pass as `--account` keep meaning the same
+    /// accounts. A label another account here already uses is left alone.
+    private func inheritServerNames(client: WebClient) async {
+        guard let fresh = try? await OAuth.firstOf(timeout: 10, { try await client.state() }) else { return }
+        remote = fresh
+        remoteFetchedAt = Date()
+        guard case .other = fresh.election(machineId: client.machineId),
+              let rows = fresh.snapshot?["accounts"] as? [[String: Any]] else { return }
+        let ids = AccountIdentity.load()
+        for row in rows {
+            guard let accountId = AccountIdentity.normalize(row["accountId"] as? String),
+                  let local = accounts.first(where: { ids[$0.id] == accountId }) else { continue }
+            if let nickname = row["nickname"] as? String, nickname != local.nickname {
+                setNickname(nickname, for: local)
+            }
+            if let label = row["label"] as? String, label != local.label {
+                let taken = Set(accounts.filter { $0.id != local.id }.map(\.label))
+                if PromoteLabels.isFree(label, taken: taken) { setLabel(label, for: local) }
+            }
+        }
+    }
+
+    nonisolated static let demoMachineId = "DEMO-THIS-MAC"
+
+    /// `--render-popover` only: the server/follower states worth eyeballing,
+    /// seeded with fixture machines and a fixture server snapshot. Refused
+    /// outside a demo build, so nothing real can be dressed up as one of these.
+    enum DemoRole: String, CaseIterable {
+        case unelected
+        case server
+        case following
+        case noKey = "no-key"
+        case promoting
+    }
+
+    func applyDemoRole(_ role: DemoRole, now: Date = Date()) {
+        guard isDemo else { return }
+        let me = Self.demoMachineId
+        let fleet: [(String, String)] = [(me, "Izu's MacBook Pro"), ("DEMO-FLY", "fly-iconic"), ("DEMO-MINI", "Studio Mac mini")]
+        func iso(_ offset: TimeInterval) -> String { ISODate.string(now.addingTimeInterval(offset)) }
+        func bucket(_ percent: Any, _ reset: TimeInterval?) -> [String: Any] {
+            ["percent": percent, "resetsAt": reset.map { iso($0) } ?? NSNull()]
+        }
+        let snapshot: [String: Any] = [
+            "updatedAt": iso(-120), "machine": "fly-iconic", "machineId": "DEMO-FLY",
+            "accounts": [
+                ["id": "S1", "label": "P", "nickname": "Personal", "headroom": 71, "verdict": "Available", "isStale": false,
+                 "buckets": ["fiveHour": bucket(29, 4000), "weekly": bucket(10, 300_000), "fable": bucket(3, 300_000)]],
+                ["id": "S2", "label": "C", "nickname": "Charm", "headroom": 0, "verdict": "Blocked", "isStale": false,
+                 "buckets": ["fiveHour": bucket(0, nil), "weekly": bucket(100, 200_000), "fable": bucket(100, 200_000)]],
+                ["id": "S3", "label": "I", "nickname": "Iconic", "headroom": 0, "verdict": "Blocked", "isStale": false,
+                 "buckets": ["fiveHour": bucket(NSNull(), nil), "weekly": bucket(100, 200_000), "fable": bucket(100, 200_000)]],
+            ] as [[String: Any]],
+        ]
+        func remoteState(server: String?, withSnapshot: Bool) -> RemoteState? {
+            var json: [String: Any] = [
+                "machines": fleet.map { ["machineId": $0.0, "machine": $0.1, "lastSeen": iso(-60), "role": "server"] },
+            ]
+            if let server {
+                json["server"] = ["machineId": server, "machine": fleet.first { $0.0 == server }?.1 ?? server, "since": iso(-3600)]
+                json["you"] = ["role": server == me ? "server" : "follower"]
+            }
+            if withSnapshot { json["snapshot"] = snapshot }
+            return (try? JSONSerialization.data(withJSONObject: json)).flatMap(RemoteState.decode)
+        }
+        isFollowingServer = false
+        followed = nil
+        isPromoting = false
+        promotionStep = nil
+        switch role {
+        case .noKey:
+            hasWebKey = false
+            remote = nil
+        case .unelected:
+            hasWebKey = true
+            remote = remoteState(server: nil, withSnapshot: false)
+        case .server:
+            hasWebKey = true
+            remote = remoteState(server: me, withSnapshot: false)
+        case .following, .promoting:
+            hasWebKey = true
+            remote = remoteState(server: "DEMO-FLY", withSnapshot: true)
+            followed = remote?.snapshot.map(FollowedSnapshot.decode)
+            isFollowingServer = true
+            if role == .promoting {
+                isPromoting = true
+                promotionStep = PromoteSequence.stepText(nickname: "Charm", index: 2, count: 3)
+            }
         }
     }
 
@@ -786,4 +1115,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.state = state
         self.statusBar = StatusBarController(state: state)
     }
+}
+
+/// Why a promotion stopped, in the app's short vocabulary. Nothing here is a
+/// response body.
+enum PromoteError: LocalizedError {
+    case busy(String)
+    case unidentified
+    case wrongAccount(expected: String, got: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .busy(let name): return "\(name) is being refreshed elsewhere — try again"
+        case .unidentified: return "Could not identify the account — nothing was promoted"
+        case .wrongAccount(let expected, let got): return "Signed in as \(got), not \(expected) — nothing was promoted"
+        }
+    }
+}
+
+/// One row as the popover and the menu bar draw it: this Mac's own account, or
+/// — while following — a row the server measured. `local` is nil for the
+/// latter, which is what makes a row read-only: nothing on a server row can
+/// rename, reorder, reconnect or sign out an account this Mac does not hold.
+struct DisplayRow: Identifiable {
+    let id: String
+    let label: String
+    let nickname: String
+    let email: String?
+    let state: AccountState?
+    let local: Account?
+
+    var character: Character { label.first ?? "?" }
 }

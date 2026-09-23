@@ -19,6 +19,9 @@ enum CoreChecks {
         startup(check)
         wire(check)
         slackConfig(check)
+        followerDrawing(check)
+        serverMenu(check)
+        promoteSequence(check)
         HTTPSeamCheck.run(check)
     }
 

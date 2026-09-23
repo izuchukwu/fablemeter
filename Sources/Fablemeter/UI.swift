@@ -211,8 +211,7 @@ struct LabelToken: View {
 struct AccountRow: View {
     enum Field: Hashable { case label, name }
 
-    let account: Account
-    let state: AccountState?
+    let row: DisplayRow
     let now: Date
     /// The verdict word is the gauge's reading put into words, so it follows
     /// the same policy the gauge does — the metric rows underneath do not: the
@@ -241,6 +240,10 @@ struct AccountRow: View {
     @State private var nameDraft = ""
     @FocusState private var focus: Field?
 
+    private var state: AccountState? { row.state }
+    /// A row the server measured: nothing on it acts on an account this Mac
+    /// does not hold.
+    private var isReadOnly: Bool { row.local == nil }
     private var headroom: Double? { state?.snapshot?.headroom(fableFirst: fableFirst) }
     private var isUnreachable: Bool { state?.isUnreachable == true }
     private var needsSignIn: Bool { state?.needsSignIn == true }
@@ -261,13 +264,13 @@ struct AccountRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             LabelToken(
-                character: account.label,
+                character: row.label,
                 draft: $labelDraft,
                 isEditing: $editingLabel,
                 focus: $focus,
                 commit: commitLabel
             )
-            .onTapGesture(perform: beginLabelEdit)
+            .onTapGesture { if !isReadOnly { beginLabelEdit() } }
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -278,13 +281,13 @@ struct AccountRow: View {
                             .focused($focus, equals: .name)
                             .onSubmit(commitName)
                     } else {
-                        Text(account.nickname)
+                        Text(row.nickname)
                             .font(.system(size: 12, weight: .semibold))
                             .lineLimit(1)
-                            .onTapGesture(count: 2, perform: beginNameEdit)
+                            .onTapGesture(count: 2) { if !isReadOnly { beginNameEdit() } }
                     }
                     Spacer(minLength: 6)
-                    if needsSignIn {
+                    if needsSignIn && !isReadOnly {
                         Button("Reconnect", action: signIn)
                             .buttonStyle(PressableButtonStyle())
                             .font(.system(size: 11))
@@ -299,11 +302,13 @@ struct AccountRow: View {
                     }
                 }
 
-                Text(account.email)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                if let email = row.email {
+                    Text(email)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
 
                 if showsMetrics {
                     VStack(alignment: .leading, spacing: 3) {
@@ -333,15 +338,19 @@ struct AccountRow: View {
         .padding(.bottom, showsMetrics ? 19 : 17)
         .contentShape(Rectangle())
         .contextMenu {
-            Button("Reconnect Account…", action: signIn).disabled(isSigningIn)
-            Divider()
-            Button("Set Label…", action: beginLabelEdit)
-            Button("Rename…", action: beginNameEdit)
-            Divider()
-            Button("Move Up", action: moveUp).disabled(!canMoveUp)
-            Button("Move Down", action: moveDown).disabled(!canMoveDown)
-            Divider()
-            Button("Sign Out", action: signOut)
+            // A server row belongs to the server; there is nothing here to do
+            // to it.
+            if !isReadOnly {
+                Button("Reconnect Account…", action: signIn).disabled(isSigningIn)
+                Divider()
+                Button("Set Label…", action: beginLabelEdit)
+                Button("Rename…", action: beginNameEdit)
+                Divider()
+                Button("Move Up", action: moveUp).disabled(!canMoveUp)
+                Button("Move Down", action: moveDown).disabled(!canMoveDown)
+                Divider()
+                Button("Sign Out", action: signOut)
+            }
         }
         .onChange(of: focus) { old, _ in
             if old == .label { commitLabel() }
@@ -361,7 +370,7 @@ struct AccountRow: View {
     }
 
     private func beginLabelEdit() {
-        labelDraft = account.label
+        labelDraft = row.label
         editingLabel = true
         focus = .label
     }
@@ -374,7 +383,7 @@ struct AccountRow: View {
     }
 
     private func beginNameEdit() {
-        nameDraft = account.nickname
+        nameDraft = row.nickname
         editingName = true
         focus = .name
     }
@@ -471,7 +480,7 @@ struct PopoverView: View {
     /// The account currently lifted out of the list, if any.
     @State private var draggingID: UUID?
 
-    private var canReorder: Bool { state.accounts.count > 1 }
+    private var canReorder: Bool { !state.isFollowingServer && state.accounts.count > 1 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -485,35 +494,9 @@ struct PopoverView: View {
 
             TimelineView(.periodic(from: .now, by: 30)) { context in
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(state.accounts.enumerated()), id: \.element.id) { index, account in
+                    ForEach(Array(state.displayRows(now: context.date).enumerated()), id: \.element.id) { index, row in
                         if index > 0 { Divider() }
-                        AccountRow(
-                            account: account,
-                            state: state.state(for: account),
-                            now: context.date,
-                            fableFirst: state.isFableFirst,
-                            dismissToken: dismissToken,
-                            canMoveUp: state.canMove(account, by: -1),
-                            canMoveDown: state.canMove(account, by: 1),
-                            setLabel: { state.setLabel($0, for: account) },
-                            setNickname: { state.setNickname($0, for: account) },
-                            moveUp: { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: -1) } },
-                            moveDown: { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: 1) } },
-                            isSigningIn: state.isSigningIn,
-                            signIn: { state.signInAgain(account) },
-                            signOut: { state.remove(account) }
-                        )
-                        .modifier(LiftEffect(isLifted: draggingID == account.id))
-                        .onDrag(if: canReorder) {
-                            draggingID = account.id
-                            return NSItemProvider(object: account.id.uuidString as NSString)
-                        }
-                        .onDrop(
-                            of: [.text],
-                            delegate: AccountDropDelegate(
-                                target: account, state: state, draggingID: $draggingID
-                            )
-                        )
+                        rowView(row, now: context.date)
                     }
                 }
             }
@@ -542,6 +525,39 @@ struct PopoverView: View {
         .onDisappear {
             draggingID = nil
             removeClickMonitor()
+        }
+    }
+
+    @ViewBuilder
+    private func rowView(_ row: DisplayRow, now: Date) -> some View {
+        let base = AccountRow(
+            row: row,
+            now: now,
+            fableFirst: state.isFableFirst,
+            dismissToken: dismissToken,
+            canMoveUp: row.local.map { state.canMove($0, by: -1) } ?? false,
+            canMoveDown: row.local.map { state.canMove($0, by: 1) } ?? false,
+            setLabel: { value in if let account = row.local { state.setLabel(value, for: account) } },
+            setNickname: { value in if let account = row.local { state.setNickname(value, for: account) } },
+            moveUp: { if let account = row.local { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: -1) } } },
+            moveDown: { if let account = row.local { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: 1) } } },
+            isSigningIn: state.isSigningIn || state.isPromoting,
+            signIn: { if let account = row.local { state.signInAgain(account) } },
+            signOut: { if let account = row.local { state.remove(account) } }
+        )
+        if let account = row.local {
+            base
+                .modifier(LiftEffect(isLifted: draggingID == account.id))
+                .onDrag(if: canReorder) {
+                    draggingID = account.id
+                    return NSItemProvider(object: account.id.uuidString as NSString)
+                }
+                .onDrop(
+                    of: [.text],
+                    delegate: AccountDropDelegate(target: account, state: state, draggingID: $draggingID)
+                )
+        } else {
+            base
         }
     }
 
@@ -578,11 +594,13 @@ struct PopoverView: View {
             }
 
             HStack(spacing: 10) {
-                if !state.accounts.isEmpty {
-                    Text(state.isSigningIn ? "Signing in…" : "Updated \(Format.relative(state.lastUpdated))")
+                if !state.accounts.isEmpty || state.isFollowingServer {
+                    Text(state.footerText(now: Date()))
                         .font(.system(size: 11))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
 
                 Spacer(minLength: 4)
@@ -601,6 +619,7 @@ struct PopoverView: View {
                             .disabled(!state.canAddAccount)
                         Button("Connect to Fablemeter Web…") { state.connectWeb() }
                             .disabled(state.isDemo || state.isConnectingWeb)
+                        Menu("Server") { ServerMenuContent(state: state) }
                         Divider()
                         if LoginItem.isAvailable {
                             Toggle("Start on Login", isOn: Binding(
@@ -633,5 +652,33 @@ struct PopoverView: View {
         .focusEffectDisabled()
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+    }
+}
+
+
+/// The Server submenu, drawn from what the background poll already cached —
+/// opening it never touches the network. One item can be clicked, and only
+/// ever for this Mac; every other machine is listed for reference.
+struct ServerMenuContent: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        ForEach(Array(state.serverMenuItems.enumerated()), id: \.offset) { _, item in
+            switch item {
+            case .caption(let text):
+                Button(text) {}.disabled(true)
+            case .machine(let title, let isServer):
+                Toggle(title, isOn: .constant(isServer)).disabled(true)
+            case .divider:
+                Divider()
+            case .makeThisMacServer(let enabled):
+                Button("Make This Mac the Server") { state.promoteThisMac() }.disabled(!enabled)
+            case .connect:
+                Button("Connect to Fablemeter Web…") { state.connectWeb() }
+                    .disabled(state.isDemo || state.isConnectingWeb)
+            case .cancelPromotion:
+                Button("Cancel Promotion") { state.cancelPromotion() }
+            }
+        }
     }
 }

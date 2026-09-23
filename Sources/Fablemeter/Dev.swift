@@ -2105,6 +2105,72 @@ enum SelfTest {
         // be unproven here, or the other way round.
         CoreChecks.run { name, ok, detail in check(name, ok, detail) }
 
+        // MARK: Following a server, as the Mac draws it
+        //
+        // The core proves the snapshot decodes; this proves the Mac draws from
+        // it — the gauge, the rows, the footer — and that nothing on a server
+        // row can act on an account this Mac holds. The selftest runs on the
+        // main thread, where AppState lives.
+        MainActor.assumeIsolated {
+            let follow = AppState(demo: true, demoCount: 3)
+            follow.applyDemoRole(.following)
+            let now = Date()
+            let cells = follow.barCells
+            check("follower: the gauge draws the server's accounts, not this Mac's",
+                  cells.map(\.character) == ["P", "C", "I"], "\(cells.map(\.character))")
+            check("follower: gauge headroom comes from the server's numbers",
+                  cells.map(\.headroom) == [71, 0, 0], "\(cells.map(\.headroom))")
+            check("follower: a fresh server snapshot draws painted, not hollow",
+                  cells.allSatisfy { !$0.isUnreachable }, "")
+            let rows = follow.displayRows(now: now)
+            check("follower: every server row is read-only (no local account behind it)",
+                  rows.count == 3 && rows.allSatisfy { $0.local == nil }, "")
+            check("follower: a null reading on the server stays a dash here",
+                  rows.last?.state?.snapshot?.fiveHour?.percent == nil
+                  && MetricDisplay.percentText(rows.last?.state?.snapshot?.fiveHour) == "—", "")
+            check("follower: a reported zero on the server stays 0% here",
+                  MetricDisplay.percentText(rows[1].state?.snapshot?.fiveHour) == "0%", "")
+            check("follower: the footer names the server and the server's age",
+                  follow.footerText(now: now).hasPrefix("From fly-iconic · updated"), follow.footerText(now: now))
+            check("follower: the menu offers promoting this Mac, enabled",
+                  follow.serverMenuItems.last == .makeThisMacServer(enabled: true), "")
+
+            let old = AppState(demo: true, demoCount: 3)
+            old.applyDemoRole(.following, now: now.addingTimeInterval(-20 * 60))
+            check("follower: a server snapshot 22 minutes old goes hollow, numbers kept",
+                  old.barCells.allSatisfy(\.isUnreachable) && old.barCells.first?.headroom == 71, "")
+            check("follower: stale rows say so in one word",
+                  old.displayRows(now: now).first?.state?.error == FollowedSnapshot.staleText, "")
+
+            let own = AppState(demo: true, demoCount: 3)
+            own.applyDemoRole(.unelected)
+            check("unelected: this Mac draws its own accounts, which stay editable",
+                  own.displayRows(now: now).allSatisfy { $0.local != nil }, "")
+            check("unelected: the footer is this Mac's own update time",
+                  own.footerText(now: now).hasPrefix("Updated"), own.footerText(now: now))
+
+            let promoting = AppState(demo: true, demoCount: 3)
+            promoting.applyDemoRole(.promoting)
+            check("promoting: the footer shows the step",
+                  promoting.footerText(now: now) == "Signing into Charm (2 of 3)…", promoting.footerText(now: now))
+            check("promoting: the menu shows the step and Cancel, and nothing to click twice",
+                  promoting.serverMenuItems == [.caption("Signing into Charm (2 of 3)…"), .divider, .cancelPromotion], "")
+
+            check("promote: a rejected key reads as an instruction, not a code",
+                  AppState.promotionMessage(for: WebError.keyRejected) == "Fablemeter Web rejected this Mac's key — connect again — nothing was promoted", "")
+            check("promote: a timeout uses the app's own word, never Foundation's sentence",
+                  AppState.promotionMessage(for: URLError(.timedOut)) == "Timed out — nothing was promoted",
+                  AppState.promotionMessage(for: URLError(.timedOut)))
+            check("promote: signing into the wrong account says so and promotes nothing",
+                  AppState.promotionMessage(for: PromoteError.wrongAccount(expected: "Charm", got: "a@b.example"))
+                  == "Signed in as a@b.example, not Charm — nothing was promoted", "")
+
+            let noKey = AppState(demo: true, demoCount: 3)
+            noKey.applyDemoRole(.noKey)
+            check("no key: the menu points at Connect and offers nothing else",
+                  noKey.serverMenuItems == [.caption(ServerMenuModel.notConnectedText), .connect], "")
+        }
+
         print(failures == 0 ? "\nselftest: all checks passed" : "\nselftest: \(failures) failure(s)")
         return failures == 0 ? 0 : 1
     }
@@ -2344,7 +2410,96 @@ enum RenderPopover {
             }
             window.orderOut(nil)
         }
+        renderRoles(into: url)
         return 0
+    }
+
+    /// The server/follower states: the popover for each, plus a picture of the
+    /// Server submenu's items. A live NSMenu cannot be captured off screen, so
+    /// the submenu is drawn from the very model the real menu is built from —
+    /// same items, same order, same checkmarks, same enabled states.
+    @MainActor
+    static func renderRoles(into url: URL) {
+        for role in AppState.DemoRole.allCases {
+            let state = AppState(demo: true, demoCount: 3)
+            state.applyDemoRole(role)
+            let names: [NSAppearance.Name] = role == .following ? [.aqua, .darkAqua] : [.aqua]
+            for name in names {
+                let backdrop = name == .darkAqua ? NSColor(white: 0.13, alpha: 1) : NSColor(white: 0.96, alpha: 1)
+                snapshot(PopoverView(state: state), appearance: name, backdrop: backdrop,
+                         to: url.appendingPathComponent("popover-role-\(role.rawValue)\(name == .darkAqua ? "-dark" : "").png"))
+            }
+            snapshot(ServerMenuPreview(items: state.serverMenuItems), appearance: .aqua,
+                     backdrop: NSColor(white: 0.96, alpha: 1),
+                     to: url.appendingPathComponent("server-menu-\(role.rawValue).png"))
+        }
+    }
+
+    @MainActor
+    static func snapshot<V: View>(_ view: V, appearance name: NSAppearance.Name, backdrop: NSColor, to file: URL) {
+        guard let appearance = NSAppearance(named: name) else { return }
+        let host = NSHostingView(rootView: view)
+        host.appearance = appearance
+        host.wantsLayer = true
+        host.layer?.backgroundColor = backdrop.cgColor
+        let size = host.fittingSize
+        host.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.appearance = appearance
+        window.backgroundColor = backdrop
+        window.contentView = host
+        window.orderFront(nil)
+        host.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.7))
+        host.layoutSubtreeIfNeeded()
+        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
+        host.cacheDisplay(in: host.bounds, to: rep)
+        if let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: file)
+            print("wrote \(file.path)  \(Int(size.width))x\(Int(size.height))")
+        }
+        window.orderOut(nil)
+    }
+}
+
+/// A picture of the Server submenu for `--render-popover`, drawn from the same
+/// `ServerMenuItem` list the real menu uses.
+struct ServerMenuPreview: View {
+    let items: [ServerMenuItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                switch item {
+                case .caption(let text): row(text, enabled: false, checked: false)
+                case .machine(let title, let isServer): row(title, enabled: false, checked: isServer)
+                case .divider: Divider().padding(.vertical, 5).padding(.horizontal, 10)
+                case .makeThisMacServer(let enabled): row("Make This Mac the Server", enabled: enabled, checked: false)
+                case .connect: row("Connect to Fablemeter Web…", enabled: true, checked: false)
+                case .cancelPromotion: row("Cancel Promotion", enabled: true, checked: false)
+                }
+            }
+        }
+        .padding(.vertical, 5)
+        .frame(width: 290, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color(nsColor: .windowBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.12)))
+        .padding(12)
+    }
+
+    private func row(_ text: String, enabled: Bool, checked: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "checkmark")
+                .font(.system(size: 11, weight: .semibold))
+                .opacity(checked ? 1 : 0)
+                .frame(width: 14)
+            Text(text).lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 13))
+        .foregroundStyle(enabled ? Color.primary : Color.secondary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
     }
 }
 
