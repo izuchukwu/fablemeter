@@ -62,7 +62,7 @@ enum CoreChecks {
               meServerNoYou.election(machineId: upper) == .thisMachine, "")
         let otherServerNoYou = remote(["server": ["machineId": otherLower, "machine": "fly"], "machines": []])!
         check("machine id: mixed case never makes this machine the server",
-              otherServerNoYou.election(machineId: upper.uppercased()) != .thisMachine
+              otherServerNoYou.election(machineId: "aAaAaAaA-1111-2222-3333-444444444444") != .thisMachine
                 && !RoleDecision.shouldPoll(remote: otherServerNoYou, machineId: upper, lastDecision: true), "")
         let followerSaysWeb = remote(["server": ["machineId": lower, "machine": "mac"],
                                       "you": ["role": "follower"], "machines": []])!
@@ -95,6 +95,12 @@ enum CoreChecks {
             .appendingPathComponent("fablemeter-machineid-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         MachineIdentity.directoryOverride = dir
+        // Restored on every exit from here, so no later edit can leave the
+        // real machine-id reachable to a write meant for the temp directory.
+        defer {
+            MachineIdentity.directoryOverride = saved
+            try? FileManager.default.removeItem(at: dir)
+        }
         let file = dir.appendingPathComponent("machine-id")
         try? (upper + "\n").write(to: file, atomically: true, encoding: .utf8)
         let read = MachineIdentity.id()
@@ -104,8 +110,6 @@ enum CoreChecks {
         try? FileManager.default.removeItem(at: file)
         let minted = MachineIdentity.id()
         check("machine id: a fresh id is minted lowercase", minted == minted.lowercased() && UUID(uuidString: minted) != nil, "")
-        MachineIdentity.directoryOverride = saved
-        try? FileManager.default.removeItem(at: dir)
     }
 
     // MARK: Paste-back sign-in
