@@ -201,3 +201,21 @@ extension CoreChecks {
               empty.withLock { $0 } == .failed(PromoteSequence.noAccountsText), "")
     }
 }
+
+extension CoreChecks {
+    // MARK: A boolean is never a percent
+
+    static func numberShapes(_ check: Check) {
+        let json = #"{"t": true, "f": false, "one": 1, "zero": 0, "half": 0.5, "null": null}"#
+        let parsed = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
+        check("number: a JSON true is not a reading", FollowedSnapshot.number(parsed["t"]) == nil,
+              String(describing: FollowedSnapshot.number(parsed["t"])))
+        check("number: a JSON false is not a reading", FollowedSnapshot.number(parsed["f"]) == nil,
+              String(describing: FollowedSnapshot.number(parsed["f"])))
+        check("number: a JSON 1 is still 1", FollowedSnapshot.number(parsed["one"]) == 1, "")
+        check("number: a JSON 0 is still 0, never mistaken for false", FollowedSnapshot.number(parsed["zero"]) == 0,
+              String(describing: FollowedSnapshot.number(parsed["zero"])))
+        check("number: a fraction survives", FollowedSnapshot.number(parsed["half"]) == 0.5, "")
+        check("number: null stays nil", FollowedSnapshot.number(parsed["null"]) == nil, "")
+    }
+}

@@ -288,27 +288,29 @@ final class LoopbackCallback: @unchecked Sendable {
 }
 
 extension OAuth {
-    /// Full interactive PKCE sign-in. Returns the account email and a refresh token.
-    ///
-    /// - Parameter persistRefreshToken: called the instant the token exists and
-    ///   before anything else is awaited, so re-authentication cannot lose a
-    ///   freshly issued token to the profile lookup that follows it. Throwing
-    ///   from it fails the sign-in, which is the honest outcome: an unpersisted
-    ///   refresh token is a dead account.
-    static func signIn(
-        persistRefreshToken: ((String) throws -> Void)? = nil
-    ) async throws -> (email: String, refreshToken: String) {
-        let result = try await signInIdentified(persistRefreshToken: persistRefreshToken)
-        return (result.email ?? "Claude account", result.refreshToken)
+    /// What an interactive sign-in produced: the fresh refresh token and whose
+    /// it is — the address and the Anthropic account UUID, each nil when
+    /// neither the token response nor the profile said.
+    struct SignedIn {
+        let email: String?
+        let refreshToken: String
+        let accountId: String?
     }
 
-    /// The same sign-in, reporting who it actually signed in as: the email and
-    /// the Anthropic account UUID, each nil when neither the token response nor
-    /// the profile said. Promotion needs both to be sure the person signed into
-    /// the account they meant to, rather than trusting a placeholder.
-    static func signInIdentified(
-        persistRefreshToken: ((String) throws -> Void)? = nil
-    ) async throws -> (email: String?, refreshToken: String, accountId: String?) {
+    /// Full interactive PKCE sign-in.
+    ///
+    /// - Parameter decide: handed the fresh token together with whose it is,
+    ///   only once both are known and before this returns. It is where the
+    ///   caller checks the account against the row it meant and persists, or
+    ///   throws, persisting nothing. A fresh sign-in spends an authorization
+    ///   code, never the stored refresh token, so refusing here costs the row
+    ///   nothing. The old order, write first and check second, is how a
+    ///   wrong-account sign-in overwrote a row's only token (see `SignInCheck`).
+    ///   Identity comes from the token response itself where it can; the one
+    ///   await before `decide` is the profile lookup when the response left
+    ///   something out, and a crash inside it leaves the row's existing token
+    ///   untouched rather than half-replaced.
+    static func signIn(decide: ((SignedIn) throws -> Void)? = nil) async throws -> SignedIn {
         let verifier = PKCE.randomBase64URL(bytes: 64)
         let challenge = PKCE.challenge(for: verifier)
         let state = PKCE.randomBase64URL(bytes: 32)
@@ -354,7 +356,6 @@ extension OAuth {
 
         let bundle = try await exchange(code: code, verifier: verifier, redirectURI: redirectURI, state: state)
         guard let refresh = bundle.refreshToken else { throw OAuthError.malformed }
-        try persistRefreshToken?(refresh)
         var email = bundle.email?.isEmpty == false ? bundle.email : nil
         var accountId = AccountIdentity.normalize(bundle.accountId)
         if email == nil || accountId == nil,
@@ -362,7 +363,9 @@ extension OAuth {
             if email == nil, let found = profile.email, !found.isEmpty { email = found }
             if accountId == nil { accountId = AccountIdentity.normalize(profile.accountId) }
         }
-        return (email, refresh, accountId)
+        let result = SignedIn(email: email, refreshToken: refresh, accountId: accountId)
+        try decide?(result)
+        return result
     }
 
 }

@@ -52,6 +52,11 @@ cd ~/fablemeter
 It builds the release binary, **refuses to install it if its own selftest
 fails**, and installs:
 
+> Building by hand: always `swift build -c release --product fablemeter-server`.
+> A bare `swift build` fails on Linux with `no such module 'AppKit'`, because
+> the package also holds the macOS menu bar app. That error is expected and
+> says nothing about the server; the installer already passes `--product`.
+
 | Path | What |
 | --- | --- |
 | `~/.local/bin/fablemeter-server` | the daemon + CLI |
@@ -122,6 +127,8 @@ The first usage lines arrive within one poll cycle (up to ~5 minutes).
 | log: `needs sign-in` | that account's sign-in is dead; run `promote` again |
 | guard exits 2 | no/stale state file, a null reading, or unknown active account — pass `--account` |
 | guard exits 2 on a follower | the active account is matched by Anthropic account id; the server's rows carry none (an older server build, or its profile lookup failed) or this machine is signed into an account the server does not track — pass `--account` |
+| `promote`: "that was X, not Y" | the browser was still signed into another account. The row keeps its sign-in; sign out of X in the browser and run `promote` again |
+| bare `swift build` fails with `no such module 'AppKit'` | expected on Linux; build with `--product fablemeter-server` |
 | `promote`: "the daemon is running" | stop it (`systemctl --user stop fablemeter`, or kill `fablemeter-supervise`), promote, start it again |
 | a Mac's gauges read "Following server" | expected once this machine is promoted: that Mac stopped polling |
 

@@ -22,6 +22,8 @@ enum CoreChecks {
         followerDrawing(check)
         serverMenu(check)
         promoteSequence(check)
+        signInIdentity(check)
+        numberShapes(check)
         HTTPSeamCheck.run(check)
     }
 

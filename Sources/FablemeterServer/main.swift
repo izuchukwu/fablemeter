@@ -86,6 +86,25 @@ func webClient() -> WebClient? {
 
 /// One paste-back sign-in. Returns the credentials; persisting is the
 /// caller's job, done the moment this returns.
+/// The rows as disk knows them, with the identity each has learned.
+func identityRows() -> [SignInCheck.Row] {
+    let ids = AccountIdentity.load()
+    return Store.load().map { SignInCheck.Row(id: $0.id, accountId: ids[$0.id], email: $0.email) }
+}
+
+/// A sign-in that turned out to be another row's account goes to that row.
+/// `promote` holds the daemon lock for its whole run, so nothing on this
+/// machine is refreshing that row; the per-account lock is taken anyway, the
+/// same way the vault takes it. Returns whether it landed.
+func refresh(_ owner: UUID, with result: OOB.SignedIn) -> Bool {
+    let lock: RefreshLock?
+    do { lock = try RefreshLock.acquire(for: owner, in: Store.directory) } catch { return false }
+    defer { lock?.release() }
+    do { try Store.updateRefreshToken(id: owner, to: result.refreshToken) } catch { return false }
+    AccountIdentity.remember(owner, accountId: result.accountId)
+    return true
+}
+
 func signIn(heading: String) async -> OOB.SignedIn? {
     while true {
         let attempt = OOB.begin()
@@ -194,9 +213,31 @@ case "promote":
                 print("  skipped \(account.nickname); it keeps its current sign-in")
                 continue
             }
-            if ActiveAccount.normalize(result.email) != ActiveAccount.normalize(account.email) {
-                let answer = ask("  That signed in as \(result.email), not \(account.email). Replace anyway? [y/N] ")
-                guard answer.lowercased().hasPrefix("y") else { print("  kept the old sign-in"); continue }
+            // Judged before anything is written. The wrong account never lands
+            // in this row: it would report that account's usage under this
+            // row's letter, which is what `fablemeter --guard --account` reads.
+            let rows = identityRows()
+            let target = rows.first(where: { $0.id == account.id })
+                ?? SignInCheck.Row(id: account.id, accountId: AccountIdentity.load()[account.id], email: account.email)
+            switch SignInCheck.verdict(target: target, accountId: result.accountId, email: result.email, rows: rows) {
+            case .match, .establish:
+                break
+            case .belongsTo(let owner):
+                let ownerName = Store.load().first(where: { $0.id == owner })?.nickname ?? "another account"
+                if refresh(owner, with: result) {
+                    print("  ✗ that was \(ownerName), not \(account.nickname) — \(ownerName)'s sign-in was refreshed instead")
+                } else {
+                    print("  ✗ that was \(ownerName), not \(account.nickname)")
+                }
+                print("    \(account.nickname) keeps its current sign-in. Sign out of \(ownerName) in the browser and run promote again.")
+                continue
+            case .mismatch:
+                print("  ✗ that signed in as \(result.email), not \(account.nickname) (\(account.email))")
+                print("    \(account.nickname) keeps its current sign-in. To track \(result.email), add it as a new account below.")
+                continue
+            case .unidentified:
+                print("  ✗ could not tell which account that was — \(account.nickname) keeps its current sign-in")
+                continue
             }
             do {
                 // Persisted the moment it exists, under the daemon lock, so no
@@ -220,6 +261,18 @@ case "promote":
             guard wantsMore else { break }
             let n = Store.load().count + 1
             guard let result = await signIn(heading: "Account \(n)") else { continue }
+            switch SignInCheck.verdict(target: nil, accountId: result.accountId, email: result.email, rows: identityRows()) {
+            case .establish:
+                break
+            case .belongsTo(let owner):
+                let ownerName = Store.load().first(where: { $0.id == owner })?.nickname ?? "That account"
+                let refreshed = refresh(owner, with: result)
+                print("  ✗ \(ownerName) is already here\(refreshed ? " — its sign-in was refreshed" : "")")
+                continue
+            case .match, .mismatch, .unidentified:
+                print("  ✗ could not tell which account that was — nothing was added")
+                continue
+            }
             let known = result.accountId.flatMap { serverNames[$0] }
             if let known { print("  The current server calls this account \(known.nickname) (\(known.label)).") }
             let defaultNickname = known?.nickname ?? Account.localPart(of: result.email)

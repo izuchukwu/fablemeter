@@ -416,7 +416,7 @@ final class AppState: ObservableObject {
     /// nulls), and show any warning the server fired in the last half hour that
     /// this Mac has not shown. Never touches Anthropic or a token.
     func followIfFollowing(force: Bool = false) async {
-        guard isFollowingServer, !isDemo else { return }
+        guard isFollowingServer, !isDemo, !isPromoting else { return }
         guard force || Date().timeIntervalSince(lastFollowCheck) >= 30 else { return }
         lastFollowCheck = Date()
         guard let client = webClient(),
@@ -434,9 +434,10 @@ final class AppState: ObservableObject {
         // Every five minutes at most: the key read can touch the Keychain, and
         // the machine list changes when someone promotes, not by the minute.
         guard now.timeIntervalSince(lastBackgroundCheck) >= 300 else { return }
+        // The cheap reasons to skip come first, so they never spend the slot.
+        guard !isFollowingServer, now.timeIntervalSince(remoteFetchedAt) >= 300 else { return }
         lastBackgroundCheck = now
-        guard let client = webClient(), !isFollowingServer,
-              now.timeIntervalSince(remoteFetchedAt) >= 300 else { return }
+        guard let client = webClient() else { return }
         guard let remote = try? await OAuth.firstOf(timeout: 10, { try await client.state() }) else { return }
         apply(remote, machineId: client.machineId)
     }
@@ -516,6 +517,7 @@ final class AppState: ObservableObject {
         if let error = error as? PromoteError { return error.errorDescription ?? "Promotion failed" }
         let text: String
         switch error {
+        case let refusal as SignInRefusal: text = refusal.errorDescription ?? "Sign-in refused"
         case WebError.keyRejected: text = "Fablemeter Web rejected this Mac's key — connect again"
         case WebError.status(let code): text = "Fablemeter Web answered \(code)"
         case WebError.malformed, WebError.notServer: text = "Unexpected answer from Fablemeter Web"
@@ -555,18 +557,18 @@ final class AppState: ObservableObject {
         signInError = nil
         Task {
             do {
-                let (email, refreshToken) = try await OAuth.signIn()
-                let account = Account(email: email, refreshToken: refreshToken)
-                // Disk first: the token it carries exists nowhere else.
-                try Store.mutate { stored in
-                    stored.removeAll { $0.email.caseInsensitiveCompare(email) == .orderedSame }
-                    stored.append(account)
-                }
-                accounts = accounts.filter {
-                    $0.email.caseInsensitiveCompare(email) != .orderedSame
-                } + [account]
+                // The account is checked against every row here before it is
+                // written: a second copy of an account already present is
+                // refused, and its fresh token goes to the row that holds it.
+                _ = try await OAuth.signIn(decide: Self.decideForNewAccount())
+                let known = Set(accounts.map(\.id))
+                accounts += Store.load().filter { !known.contains($0.id) }
                 isSigningIn = false
                 await refresh(reason: .manual)
+            } catch let refusal as SignInRefusal {
+                await absorb(refusal)
+                signInError = Self.signInMessage(for: refusal)
+                isSigningIn = false
             } catch {
                 signInError = Self.signInMessage(for: error)
                 isSigningIn = false
@@ -607,30 +609,10 @@ final class AppState: ObservableObject {
         let id = account.id
         Task {
             do {
-                // The new token goes to disk the instant it exists, under this
-                // account's own id, before the profile lookup that follows.
-                let (email, refreshToken) = try await OAuth.signIn(persistRefreshToken: { token in
-                    try Store.updateRefreshToken(id: id, to: token)
-                })
-                guard let index = accounts.firstIndex(where: { $0.id == id }) else {
-                    isSigningIn = false
-                    return
-                }
-                let clash = accounts.contains {
-                    $0.id != id && $0.email.caseInsensitiveCompare(email) == .orderedSame
-                }
-                guard !clash else {
-                    signInError = "\(email) is already signed in."
-                    isSigningIn = false
-                    return
-                }
-                try Store.mutate { stored in
-                    guard let idx = stored.firstIndex(where: { $0.id == id }) else { return }
-                    stored[idx].email = email
-                    stored[idx].refreshToken = refreshToken
-                }
-                accounts[index].email = email
-                accounts[index].refreshToken = refreshToken
+                // Checked before it is written: a sign-in as some other account
+                // leaves this row's credential exactly as it was.
+                _ = try await OAuth.signIn(decide: Self.decideForRow(account))
+                syncFromDisk(id)
                 states[id]?.needsSignIn = false
                 states[id]?.error = nil
                 retry[id] = nil
@@ -638,6 +620,10 @@ final class AppState: ObservableObject {
                 await vault.reset(id)
                 isSigningIn = false
                 await refresh(reason: .manual)
+            } catch let refusal as SignInRefusal {
+                await absorb(refusal)
+                signInError = Self.signInMessage(for: refusal)
+                isSigningIn = false
             } catch {
                 signInError = Self.signInMessage(for: error)
                 isSigningIn = false
@@ -645,7 +631,108 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: Sign-in identity
+    //
+    // Every interactive sign-in is judged by `SignInCheck` BEFORE anything is
+    // written, inside the sign-in's `decide` step. A sign-in spends an
+    // authorization code, never the stored refresh token, so refusing one costs
+    // the row nothing; writing first and checking second is how a wrong-account
+    // sign-in once replaced a row's only token and made the guard judge another
+    // account under its letter.
+
+    /// The rows as disk knows them, with the identity each has learned.
+    nonisolated static func identityRows() -> [SignInCheck.Row] {
+        let ids = AccountIdentity.load()
+        return Store.load().map { SignInCheck.Row(id: $0.id, accountId: ids[$0.id], email: $0.email) }
+    }
+
+    /// A sign-in that turned out to be another row's account: its token goes to
+    /// that row, never the one it was meant for, under that row's own refresh
+    /// lock. A row that is mid-refresh keeps the credential it has and the
+    /// token is dropped. Synchronous, because it runs inside `decide`.
+    nonisolated static func route(_ signedIn: OAuth.SignedIn, to owner: UUID) -> Bool {
+        let lock: RefreshLock?
+        do { lock = try RefreshLock.acquire(for: owner, in: Store.directory) } catch { return false }
+        defer { lock?.release() }
+        do { try Store.updateRefreshToken(id: owner, to: signedIn.refreshToken) } catch { return false }
+        AccountIdentity.remember(owner, accountId: signedIn.accountId)
+        return true
+    }
+
+    /// `decide` for signing an existing row in again. Writes only when the
+    /// verdict says the account is this row's (or the row never had an
+    /// identity and this sign-in defines it); everything else throws having
+    /// written nothing to the row.
+    nonisolated static func decideForRow(_ target: Account) -> (OAuth.SignedIn) throws -> Void {
+        let id = target.id
+        let name = target.nickname
+        let fallbackEmail = target.email
+        return { signedIn in
+            var rows = identityRows()
+            if !rows.contains(where: { $0.id == id }) {
+                rows.append(SignInCheck.Row(id: id, accountId: AccountIdentity.load()[id], email: fallbackEmail))
+            }
+            let row = rows.first(where: { $0.id == id })!
+            switch SignInCheck.verdict(target: row, accountId: signedIn.accountId, email: signedIn.email, rows: rows) {
+            case .match, .establish:
+                try Store.mutate { stored in
+                    guard let i = stored.firstIndex(where: { $0.id == id }) else { return }
+                    stored[i].refreshToken = signedIn.refreshToken
+                    if let email = signedIn.email, SignInCheck.isRealEmail(email) { stored[i].email = email }
+                }
+                AccountIdentity.remember(id, accountId: signedIn.accountId)
+            case .belongsTo(let owner):
+                let routed = route(signedIn, to: owner)
+                let ownerName = Store.load().first(where: { $0.id == owner })?.nickname ?? "another account"
+                throw SignInRefusal.otherRow(expected: name, owner: ownerName, ownerID: owner, routed: routed)
+            case .mismatch:
+                throw SignInRefusal.wrongAccount(expected: name, got: signedIn.email ?? "another account")
+            case .unidentified:
+                throw SignInRefusal.unidentified
+            }
+        }
+    }
+
+    /// `decide` for Add Account: a new row, unless the account is already here.
+    nonisolated static func decideForNewAccount() -> (OAuth.SignedIn) throws -> Void {
+        return { signedIn in
+            switch SignInCheck.verdict(target: nil, accountId: signedIn.accountId, email: signedIn.email, rows: identityRows()) {
+            case .establish:
+                // Disk first: the token it carries exists nowhere else.
+                let account = Account(email: signedIn.email ?? SignInCheck.placeholderEmail, refreshToken: signedIn.refreshToken)
+                try Store.mutate { $0.append(account) }
+                AccountIdentity.remember(account.id, accountId: signedIn.accountId)
+            case .belongsTo(let owner):
+                let routed = route(signedIn, to: owner)
+                let ownerName = Store.load().first(where: { $0.id == owner })?.nickname ?? "That account"
+                throw SignInRefusal.alreadyHere(owner: ownerName, ownerID: owner, routed: routed)
+            case .match, .mismatch, .unidentified:
+                throw SignInRefusal.unidentified
+            }
+        }
+    }
+
+    /// After a refusal that handed the token to another row, that row reads its
+    /// new credential from disk on its next refresh.
+    private func absorb(_ refusal: SignInRefusal) async {
+        guard let owner = refusal.routedTo else { return }
+        syncFromDisk(owner)
+        await vault.reset(owner)
+        states[owner]?.needsSignIn = false
+        retry[owner] = nil
+        lastAttempt[owner] = nil
+    }
+
+    /// The in-memory row catches up with what a sign-in just wrote to disk.
+    private func syncFromDisk(_ id: UUID) {
+        guard let stored = Store.load().first(where: { $0.id == id }),
+              let i = accounts.firstIndex(where: { $0.id == id }) else { return }
+        accounts[i].email = stored.email
+        accounts[i].refreshToken = stored.refreshToken
+    }
+
     func remove(_ account: Account) {
+        guard !isPromoting else { return }
         accounts.removeAll { $0.id == account.id }
         states[account.id] = nil
         lastAttempt[account.id] = nil
@@ -788,8 +875,15 @@ final class AppState: ObservableObject {
             try? await Task.sleep(nanoseconds: 100_000_000)
             waited += 1
         }
+        // Still running after two minutes: stop here rather than sign in
+        // alongside it. Nothing has been touched yet.
+        guard !isPassRunning else {
+            Log.role.notice("role: promotion refused — a refresh is still running")
+            signInError = PromoteError.passBusy.errorDescription
+            return
+        }
         let before = roleMemory?.stance
-        await inheritServerNames(client: client)
+        let renamed = await inheritServerNames(client: client)
         let outcome = await PromoteSequence.run(
             accounts: accounts,
             progress: { [weak self] index, count, account in
@@ -815,8 +909,10 @@ final class AppState: ObservableObject {
             await refreshRemoteIfDue()
             await refresh(reason: .manual)
         case .cancelled:
+            restoreNames(renamed)
             Log.role.notice("role: promotion cancelled — nothing was promoted")
         case .failed(let message):
+            restoreNames(renamed)
             // The reason goes to the banner only: it can name an address, and
             // the log has never carried one.
             Log.role.notice("role: promotion failed — nothing was promoted")
@@ -841,59 +937,63 @@ final class AppState: ObservableObject {
         defer { lock?.release() }
         await vault.forget(account.id)
         let id = account.id
-        let result = try await OAuth.signInIdentified(persistRefreshToken: { token in
-            try Store.updateRefreshToken(id: id, to: token)
-        })
-        let expectedId = AccountIdentity.load()[id]
-        let sameAccount: Bool
-        if let expectedId, let got = result.accountId {
-            sameAccount = expectedId == got
-        } else if let email = result.email {
-            sameAccount = email.caseInsensitiveCompare(account.email) == .orderedSame
-        } else {
-            sameAccount = false
+        do {
+            // Judged before anything is written: the wrong account leaves this
+            // row's token, address and account id exactly as they were.
+            _ = try await OAuth.signIn(decide: Self.decideForRow(account))
+        } catch let refusal as SignInRefusal {
+            await absorb(refusal)
+            throw refusal
         }
-        // Whatever happened, the row now holds this sign-in's token, so it says
-        // whose it is rather than keeping an address that is no longer true.
-        let email = result.email ?? account.email
-        try Store.mutate { stored in
-            guard let i = stored.firstIndex(where: { $0.id == id }) else { return }
-            stored[i].email = email
-            stored[i].refreshToken = result.refreshToken
-        }
-        if let i = accounts.firstIndex(where: { $0.id == id }) {
-            accounts[i].email = email
-            accounts[i].refreshToken = result.refreshToken
-        }
-        AccountIdentity.remember(id, accountId: result.accountId)
+        syncFromDisk(id)
         await vault.reset(id)
         states[id]?.needsSignIn = false
         retry[id] = nil
         lastAttempt[id] = nil
-        guard result.email != nil || result.accountId != nil else { throw PromoteError.unidentified }
-        guard sameAccount else { throw PromoteError.wrongAccount(expected: account.nickname, got: email) }
     }
 
     /// Before promoting away from another server, take its names for the same
     /// accounts — matched on the Anthropic account UUID, never the label — so
     /// the letters agents already pass as `--account` keep meaning the same
     /// accounts. A label another account here already uses is left alone.
-    private func inheritServerNames(client: WebClient) async {
-        guard let fresh = try? await OAuth.firstOf(timeout: 10, { try await client.state() }) else { return }
+    private func inheritServerNames(client: WebClient) async -> [(id: UUID, nickname: String, label: String)] {
+        guard let fresh = try? await OAuth.firstOf(timeout: 10, { try await client.state() }) else { return [] }
         remote = fresh
         remoteFetchedAt = Date()
         guard case .other = fresh.election(machineId: client.machineId),
-              let rows = fresh.snapshot?["accounts"] as? [[String: Any]] else { return }
+              let rows = fresh.snapshot?["accounts"] as? [[String: Any]] else { return [] }
+        var before: [(id: UUID, nickname: String, label: String)] = []
         let ids = AccountIdentity.load()
         for row in rows {
             guard let accountId = AccountIdentity.normalize(row["accountId"] as? String),
                   let local = accounts.first(where: { ids[$0.id] == accountId }) else { continue }
+            let original = (id: local.id, nickname: local.nickname, label: local.label)
+            var changed = false
             if let nickname = row["nickname"] as? String, nickname != local.nickname {
                 setNickname(nickname, for: local)
+                changed = true
             }
             if let label = row["label"] as? String, label != local.label {
                 let taken = Set(accounts.filter { $0.id != local.id }.map(\.label))
-                if PromoteLabels.isFree(label, taken: taken) { setLabel(label, for: local) }
+                if PromoteLabels.isFree(label, taken: taken) {
+                    setLabel(label, for: local)
+                    changed = true
+                }
+            }
+            if changed { before.append(original) }
+        }
+        return before
+    }
+
+    /// A promotion that did not happen leaves this Mac named as it was. In
+    /// reverse, so a label freed by one row is free again for the row that had
+    /// it; only labels this promotion itself assigned are ever in play.
+    private func restoreNames(_ originals: [(id: UUID, nickname: String, label: String)]) {
+        for original in originals.reversed() {
+            guard let account = accounts.first(where: { $0.id == original.id }) else { continue }
+            if account.label != original.label { setLabel(original.label, for: account) }
+            if let current = accounts.first(where: { $0.id == original.id }), current.nickname != original.nickname {
+                setNickname(original.nickname, for: current)
             }
         }
     }
@@ -1121,14 +1221,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// response body.
 enum PromoteError: LocalizedError {
     case busy(String)
-    case unidentified
-    case wrongAccount(expected: String, got: String)
+    /// A poll pass was still running after the two-minute wait.
+    case passBusy
 
     var errorDescription: String? {
         switch self {
         case .busy(let name): return "\(name) is being refreshed elsewhere — try again"
-        case .unidentified: return "Could not identify the account — nothing was promoted"
-        case .wrongAccount(let expected, let got): return "Signed in as \(got), not \(expected) — nothing was promoted"
+        case .passBusy: return "A refresh is still running — try again, nothing was promoted"
+        }
+    }
+}
+
+/// Why an interactive sign-in wrote nothing to the row it was meant for. The
+/// row keeps the credential it had: a sign-in spends an authorization code,
+/// not the stored refresh token.
+enum SignInRefusal: LocalizedError, Equatable {
+    /// An account no row here holds.
+    case wrongAccount(expected: String, got: String)
+    /// Another row's account; its token went to that row when `routed`.
+    case otherRow(expected: String, owner: String, ownerID: UUID, routed: Bool)
+    /// Add Account with an account already here; refreshed in place when `routed`.
+    case alreadyHere(owner: String, ownerID: UUID, routed: Bool)
+    /// Neither an account id nor a real address came back.
+    case unidentified
+
+    var routedTo: UUID? {
+        switch self {
+        case .otherRow(_, _, let id, true), .alreadyHere(_, let id, true): return id
+        default: return nil
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .wrongAccount(let expected, let got):
+            return "That was \(got), not \(expected) — sign in as \(expected)"
+        case .otherRow(let expected, let owner, _, _):
+            return "That was \(owner), not \(expected) — sign in as \(expected)"
+        case .alreadyHere(let owner, _, let routed):
+            return routed ? "\(owner) is already here — its sign-in was refreshed" : "\(owner) is already here"
+        case .unidentified:
+            return "Could not identify the account — nothing was saved"
         }
     }
 }

@@ -74,12 +74,32 @@ struct FollowedSnapshot {
     /// bridges to NSNumber, Linux may hand back Swift natives. NSNull matches
     /// none of these, so a null reading stays nil.
     static func number(_ any: Any?) -> Double? {
+        // A JSON `true` arrives on Apple platforms as an NSNumber that `as
+        // Double` happily bridges to 1.0. A boolean is not a reading.
+        if isBoolean(any) { return nil }
         switch any {
         case let value as Double: return value.isFinite ? value : nil
         case let value as Int: return Double(value)
         case let value as NSNumber: return value.doubleValue.isFinite ? value.doubleValue : nil
         default: return nil
         }
+    }
+
+    /// True for a JSON boolean on either platform: a Swift `Bool` (Linux),
+    /// or Foundation's boolean NSNumber (Apple, where `true` also bridges to
+    /// `Int` and `Double`). A JSON `0` or `1` is a number, never a boolean.
+    static func isBoolean(_ any: Any?) -> Bool {
+        guard let any else { return false }
+        if type(of: any) == Bool.self { return true }
+        #if canImport(Darwin)
+        if let n = any as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() { return true }
+        #else
+        if let n = any as? NSNumber {
+            let kind = String(cString: n.objCType)
+            return kind == "c" || kind == "B"
+        }
+        #endif
+        return false
     }
 
     func isOld(now: Date) -> Bool {

@@ -2162,8 +2162,14 @@ enum SelfTest {
                   AppState.promotionMessage(for: URLError(.timedOut)) == "Timed out — nothing was promoted",
                   AppState.promotionMessage(for: URLError(.timedOut)))
             check("promote: signing into the wrong account says so and promotes nothing",
-                  AppState.promotionMessage(for: PromoteError.wrongAccount(expected: "Charm", got: "a@b.example"))
-                  == "Signed in as a@b.example, not Charm — nothing was promoted", "")
+                  AppState.promotionMessage(for: SignInRefusal.wrongAccount(expected: "Charm", got: "a@b.example"))
+                  == "That was a@b.example, not Charm — sign in as Charm — nothing was promoted",
+                  AppState.promotionMessage(for: SignInRefusal.wrongAccount(expected: "Charm", got: "a@b.example")))
+            check("promote: a refresh still running after the wait refuses before touching anything",
+                  AppState.promotionMessage(for: PromoteError.passBusy)
+                  == "A refresh is still running — try again, nothing was promoted", "")
+
+            SignInWriteChecks.run(check)
 
             let noKey = AppState(demo: true, demoCount: 3)
             noKey.applyDemoRole(.noKey)
@@ -2817,5 +2823,142 @@ enum CallbackLoop {
         }
         check("an idle browser socket does not cost the next flow its port",
               idle == "port \(Constants.callbackPorts[0])", idle ?? "HUNG")
+    }
+}
+
+
+// MARK: - A sign-in is judged before it is written
+
+/// Drives the real `decide` steps — the ones Reconnect, promotion and Add
+/// Account hand to `OAuth.signIn` — against a sandboxed store and identity
+/// file. No browser, no network: the sign-in's result is handed in directly,
+/// which is exactly what `OAuth.signIn` does once the exchange returns.
+enum SignInWriteChecks {
+    static func run(_ check: (String, Bool, String) -> Void) {
+        let sandbox = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fablemeter-signin-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        let savedStore = Store.directoryOverride
+        let savedMachine = MachineIdentity.directoryOverride
+        Store.directoryOverride = sandbox
+        MachineIdentity.directoryOverride = sandbox
+        defer {
+            Store.directoryOverride = savedStore
+            MachineIdentity.directoryOverride = savedMachine
+            try? FileManager.default.removeItem(at: sandbox)
+        }
+
+        let personalId = "5b2d6c1e-9f1a-4c3b-8e7d-2a1b3c4d5e6f"
+        let charmId = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+        let strangerId = "11111111-2222-4333-8444-555555555555"
+
+        func seed() -> (p: Account, c: Account) {
+            let p = Account(email: "izu@personal.test", nickname: "Personal", label: "P", refreshToken: "p-old")
+            let c = Account(email: "izu@charm.test", nickname: "Charm", label: "C", refreshToken: "c-old")
+            try? FileManager.default.removeItem(at: AccountIdentity.file)
+            try? Store.save([p, c])
+            AccountIdentity.remember(p.id, accountId: personalId)
+            AccountIdentity.remember(c.id, accountId: charmId)
+            return (p, c)
+        }
+        func row(_ id: UUID) -> Account? { Store.load().first { $0.id == id } }
+        func attempt(_ decide: (OAuth.SignedIn) throws -> Void, _ signedIn: OAuth.SignedIn) -> Error? {
+            do { try decide(signedIn); return nil } catch { return error }
+        }
+
+        // The review's scenario: "Signing into Charm (2 of 3)", browser still Personal.
+        do {
+            let (p, c) = seed()
+            let error = attempt(AppState.decideForRow(c),
+                                OAuth.SignedIn(email: "izu@personal.test", refreshToken: "fresh", accountId: personalId))
+            check("sign-in as Personal while meaning Charm leaves Charm's token untouched",
+                  row(c.id)?.refreshToken == "c-old", row(c.id)?.refreshToken ?? "nil")
+            check("…and Charm's address and account id untouched",
+                  row(c.id)?.email == "izu@charm.test" && AccountIdentity.load()[c.id] == charmId, "")
+            check("…the fresh token goes to Personal's own row instead",
+                  row(p.id)?.refreshToken == "fresh", row(p.id)?.refreshToken ?? "nil")
+            check("…and the sign-in is refused, naming both accounts",
+                  (error as? SignInRefusal) == .otherRow(expected: "Charm", owner: "Personal", ownerID: p.id, routed: true)
+                  && (error as? LocalizedError)?.errorDescription == "That was Personal, not Charm — sign in as Charm",
+                  String(describing: error))
+        }
+        // An account nothing here holds.
+        do {
+            let (p, c) = seed()
+            let error = attempt(AppState.decideForRow(c),
+                                OAuth.SignedIn(email: "who@else.test", refreshToken: "fresh", accountId: strangerId))
+            check("a stranger's sign-in writes nothing to any row",
+                  row(c.id)?.refreshToken == "c-old" && row(p.id)?.refreshToken == "p-old"
+                  && AccountIdentity.load()[c.id] == charmId, "")
+            check("…and is refused as the wrong account",
+                  (error as? SignInRefusal) == .wrongAccount(expected: "Charm", got: "who@else.test"), String(describing: error))
+        }
+        // The right account.
+        do {
+            let (_, c) = seed()
+            let error = attempt(AppState.decideForRow(c),
+                                OAuth.SignedIn(email: "izu@charm.test", refreshToken: "fresh", accountId: charmId))
+            check("the right account persists into its row", error == nil && row(c.id)?.refreshToken == "fresh",
+                  String(describing: error))
+        }
+        // Nothing checkable came back.
+        do {
+            let (p, c) = seed()
+            let error = attempt(AppState.decideForRow(c),
+                                OAuth.SignedIn(email: nil, refreshToken: "fresh", accountId: nil))
+            check("an unidentified sign-in writes nothing",
+                  row(c.id)?.refreshToken == "c-old" && row(p.id)?.refreshToken == "p-old", "")
+            check("…and says it could not identify the account",
+                  (error as? SignInRefusal) == .unidentified, String(describing: error))
+        }
+        // A row nothing was ever known about: the first identified sign-in defines it.
+        do {
+            let (p, _) = seed()
+            let blank = Account(email: SignInCheck.placeholderEmail, nickname: "Mystery", label: "M", refreshToken: "m-old")
+            try? Store.mutate { $0.append(blank) }
+            let error = attempt(AppState.decideForRow(blank),
+                                OAuth.SignedIn(email: "who@else.test", refreshToken: "fresh", accountId: strangerId))
+            check("a row with no known identity is established by its first identified sign-in",
+                  error == nil && row(blank.id)?.refreshToken == "fresh"
+                  && row(blank.id)?.email == "who@else.test" && AccountIdentity.load()[blank.id] == strangerId,
+                  String(describing: error))
+            let again = attempt(AppState.decideForRow(blank),
+                                OAuth.SignedIn(email: "izu@personal.test", refreshToken: "other", accountId: personalId))
+            check("…and once established, it refuses another account like any row",
+                  again != nil && row(blank.id)?.refreshToken == "fresh" && row(p.id)?.refreshToken == "other", "")
+        }
+        // Another row's account, while that row is mid-refresh.
+        do {
+            let (p, c) = seed()
+            let held = try? RefreshLock.acquire(for: p.id, in: Store.directory)
+            let error = attempt(AppState.decideForRow(c),
+                                OAuth.SignedIn(email: "izu@personal.test", refreshToken: "fresh", accountId: personalId))
+            held?.release()
+            check("a row mid-refresh keeps its credential; the misdirected token is dropped",
+                  row(p.id)?.refreshToken == "p-old" && row(c.id)?.refreshToken == "c-old", "")
+            check("…and the refusal says it did not land",
+                  (error as? SignInRefusal)?.routedTo == nil, String(describing: error))
+        }
+        // Add Account.
+        do {
+            let (p, _) = seed()
+            let error = attempt(AppState.decideForNewAccount(),
+                                OAuth.SignedIn(email: "new@one.test", refreshToken: "n-1", accountId: strangerId))
+            let added = Store.load().first { $0.email == "new@one.test" }
+            check("add account: a new account is appended with its id remembered",
+                  error == nil && Store.load().count == 3 && added.map { AccountIdentity.load()[$0.id] == strangerId } == true,
+                  String(describing: error))
+            let dup = attempt(AppState.decideForNewAccount(),
+                              OAuth.SignedIn(email: "izu@personal.test", refreshToken: "p-new", accountId: personalId))
+            check("add account: a second copy of an account already here is refused",
+                  Store.load().count == 3, "count \(Store.load().count)")
+            check("…and refreshes the existing row in place instead",
+                  row(p.id)?.refreshToken == "p-new"
+                  && (dup as? SignInRefusal) == .alreadyHere(owner: "Personal", ownerID: p.id, routed: true),
+                  String(describing: dup))
+            let blind = attempt(AppState.decideForNewAccount(), OAuth.SignedIn(email: nil, refreshToken: "x", accountId: nil))
+            check("add account: an unidentified sign-in is never stored under a placeholder",
+                  Store.load().count == 3 && (blind as? SignInRefusal) == .unidentified, "")
+        }
     }
 }
