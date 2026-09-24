@@ -24,6 +24,7 @@ enum CoreChecks {
         promoteSequence(check)
         signInIdentity(check)
         numberShapes(check)
+        snapshotSource(check)
         HTTPSeamCheck.run(check)
     }
 

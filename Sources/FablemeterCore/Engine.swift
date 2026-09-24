@@ -51,6 +51,9 @@ final class Engine: @unchecked Sendable {
     private var retry: [UUID: RetrySchedule] = [:]
     private var lastAttempt: [UUID: Date] = [:]
     private var remote: RemoteState?
+    /// Whether the last snapshot followed was the named server's own. Only
+    /// used to log the change once.
+    private var lastSnapshotWasServers = true
     private var lastRemoteCheck: Date = .distantPast
     /// Seeded from `role.json`, never assumed: a follower that restarts while
     /// the web is unreachable must stay a follower.
@@ -257,9 +260,20 @@ final class Engine: @unchecked Sendable {
     // MARK: Follower
 
     private func follow(now: Date) {
-        guard let snapshot = remote?.snapshot else { return }
-        localState.write(followingServer: snapshot, activeAccountId: ActiveAccount.signedInAccountId())
-        let decision = WarningReplay.decide(ServerWarning.decode(snapshot["warnings"]), shown: shown, now: now)
+        guard let remote, let snapshot = remote.snapshot else { return }
+        let fromServer = remote.snapshotIsServers
+        localState.write(
+            followingServer: snapshot, activeAccountId: ActiveAccount.signedInAccountId(), fromServer: fromServer
+        )
+        // Said once per change, not every tick: a new server's first push is
+        // normally a few minutes away, and the file already says stale.
+        if fromServer != lastSnapshotWasServers {
+            lastSnapshotWasServers = fromServer
+            if !fromServer {
+                Log.usage.notice("following: the stored snapshot is not the server's own yet — shown as stale until it pushes")
+            }
+        }
+        let decision = remote.followerWarnings(shown: shown, now: now)
         if !decision.markSeen.isEmpty {
             shown.formUnion(decision.markSeen)
             persistMemory()
@@ -287,10 +301,12 @@ final class LocalStateFile: @unchecked Sendable {
         }
     }
 
-    func write(followingServer snapshot: [String: Any], activeAccountId: String?) {
+    func write(followingServer snapshot: [String: Any], activeAccountId: String?, fromServer: Bool = true) {
         write {
             try JSONSerialization.data(
-                withJSONObject: LocalState.body(followingServer: snapshot, activeAccountId: activeAccountId),
+                withJSONObject: LocalState.body(
+                    followingServer: snapshot, activeAccountId: activeAccountId, fromServer: fromServer
+                ),
                 options: [.sortedKeys, .prettyPrinted]
             )
         }

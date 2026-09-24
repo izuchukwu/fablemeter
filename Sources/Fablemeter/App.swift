@@ -400,7 +400,7 @@ final class AppState: ObservableObject {
     private func apply(_ remote: RemoteState, machineId: String) {
         self.remote = remote
         remoteFetchedAt = Date()
-        followed = remote.snapshot.map(FollowedSnapshot.decode)
+        followed = FollowedSnapshot.followed(from: remote)
         let election = remote.election(machineId: machineId)
         remember(RoleMemory.stance(for: election))
         if StartupRole.mayPoll(live: election, remembered: roleMemory?.stance) {
@@ -444,9 +444,14 @@ final class AppState: ObservableObject {
 
     private func followFrom(_ remote: RemoteState) {
         guard let snapshot = remote.snapshot else { return }
-        localState?.write(followingServer: snapshot, activeAccountId: ActiveAccount.signedInAccountId())
+        localState?.write(
+            followingServer: snapshot, activeAccountId: ActiveAccount.signedInAccountId(),
+            fromServer: remote.snapshotIsServers
+        )
         let shown = Set(roleMemory?.shownWarnings ?? [])
-        let decision = WarningReplay.decide(ServerWarning.decode(snapshot["warnings"]), shown: shown, now: Date())
+        // Empty for a snapshot that is not the server's own: another machine's
+        // warnings are not this server's to announce.
+        let decision = remote.followerWarnings(shown: shown, now: Date())
         guard !decision.markSeen.isEmpty else { return }
         warner.showFromServer(decision.show)
         roleMemory = RoleMemory(
@@ -829,6 +834,9 @@ final class AppState: ObservableObject {
         if isSigningIn { return "Signing in…" }
         if followedRows(now: now) != nil, let followed {
             let source = remote?.server?.machine ?? followed.machine ?? "server"
+            // The numbers on screen are another machine's, kept only so the
+            // popover is not blank; the footer says whose turn it is.
+            guard followed.fromServer else { return "Waiting on \(source)" }
             return "From \(source) · updated \(Format.relative(followed.updatedAt, from: now))"
         }
         return "Updated \(Format.relative(lastUpdated, from: now))"
@@ -1011,7 +1019,10 @@ final class AppState: ObservableObject {
         case promoting
     }
 
-    func applyDemoRole(_ role: DemoRole, now: Date = Date()) {
+    /// `snapshotFrom` names the machine the demo snapshot claims to come from
+    /// (default: the demo server itself), so the selftest can stage the window
+    /// where the stored snapshot is still the previous server's.
+    func applyDemoRole(_ role: DemoRole, now: Date = Date(), snapshotFrom: String = "DEMO-FLY") {
         guard isDemo else { return }
         let me = Self.demoMachineId
         let fleet: [(String, String)] = [(me, "Izu's MacBook Pro"), ("DEMO-FLY", "fly-iconic"), ("DEMO-MINI", "Studio Mac mini")]
@@ -1020,7 +1031,7 @@ final class AppState: ObservableObject {
             ["percent": percent, "resetsAt": reset.map { iso($0) } ?? NSNull()]
         }
         let snapshot: [String: Any] = [
-            "updatedAt": iso(-120), "machine": "fly-iconic", "machineId": "DEMO-FLY",
+            "updatedAt": iso(-120), "machine": "fly-iconic", "machineId": snapshotFrom,
             "accounts": [
                 ["id": "S1", "label": "P", "nickname": "Personal", "headroom": 71, "verdict": "Available", "isStale": false,
                  "buckets": ["fiveHour": bucket(29, 4000), "weekly": bucket(10, 300_000), "fable": bucket(3, 300_000)]],
@@ -1058,7 +1069,7 @@ final class AppState: ObservableObject {
         case .following, .promoting:
             hasWebKey = true
             remote = remoteState(server: "DEMO-FLY", withSnapshot: true)
-            followed = remote?.snapshot.map(FollowedSnapshot.decode)
+            followed = remote.flatMap(FollowedSnapshot.followed(from:))
             isFollowingServer = true
             if role == .promoting {
                 isPromoting = true

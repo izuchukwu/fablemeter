@@ -219,3 +219,103 @@ extension CoreChecks {
         check("number: null stays nil", FollowedSnapshot.number(parsed["null"]) == nil, "")
     }
 }
+
+extension CoreChecks {
+    // MARK: Whose snapshot is it
+
+    /// A push already in flight from the old server can land after a new one
+    /// is promoted. These pin that a follower then shows the stored numbers as
+    /// stale, fails the guard closed, and announces nothing — and that the
+    /// ordinary cases are untouched. Every state arrives through real JSON, so
+    /// the flags are whatever shape this platform's Foundation hands back.
+    static func snapshotSource(_ check: Check) {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func stamp(_ offset: TimeInterval) -> String { ISODate.string(now.addingTimeInterval(offset)) }
+        func snapshot(from machineId: String?, stale: Any? = nil) -> [String: Any] {
+            var payload: [String: Any] = [
+                "updatedAt": stamp(-60), "machine": "old-mac",
+                "accounts": [
+                    ["id": "A", "label": "P", "nickname": "Personal", "headroom": 71, "verdict": "Available",
+                     "isStale": false,
+                     "buckets": ["fiveHour": ["percent": 29, "resetsAt": stamp(3600)],
+                                 "weekly": ["percent": 0, "resetsAt": NSNull()],
+                                 "fable": ["percent": NSNull(), "resetsAt": NSNull()]]],
+                ] as [[String: Any]],
+                "warnings": [["key": "w1", "title": "Personal: 5-hour at 92%", "body": "Resets 5:03 PM",
+                              "firedAt": stamp(-60)]],
+            ]
+            if let machineId { payload["machineId"] = machineId }
+            if let stale { payload["stale"] = stale }
+            return payload
+        }
+        func remote(server: String?, snapshot: [String: Any]?, snapshotStale: Any? = nil) -> RemoteState? {
+            var json: [String: Any] = ["machines": [] as [[String: Any]]]
+            if let server { json["server"] = ["machineId": server, "machine": "fly-iconic"]; json["you"] = ["role": "follower"] }
+            if let snapshot { json["snapshot"] = snapshot }
+            if let snapshotStale { json["snapshotStale"] = snapshotStale }
+            return (try? JSONSerialization.data(withJSONObject: json)).flatMap(RemoteState.decode)
+        }
+        let server = "a1b2c3d4e5f60718"
+
+        let own = remote(server: server, snapshot: snapshot(from: server))
+        check("source: the server's own snapshot is believed", own?.snapshotIsServers == true, "")
+        let ownDrawn = own.flatMap(FollowedSnapshot.followed(from:))
+        check("source: …and drawn live when fresh",
+              ownDrawn.map { $0.state(for: $0.accounts[0], now: now).error == nil } == true, "")
+
+        let other = remote(server: server, snapshot: snapshot(from: "0f0e0d0c0b0a0908"))
+        check("source: another machine's snapshot is not the server's", other?.snapshotIsServers == false, "")
+        let otherDrawn = other.flatMap(FollowedSnapshot.followed(from:))
+        check("source: …so it draws hollow even though it is fresh",
+              otherDrawn.map { $0.state(for: $0.accounts[0], now: now).error == FollowedSnapshot.staleText } == true, "")
+        check("source: …with its numbers kept, not blanked",
+              otherDrawn?.accounts.first?.snapshot.fiveHour?.percent == 29, "")
+        check("source: …and it announces none of the other machine's warnings",
+              other.map { $0.followerWarnings(shown: [], now: now).show.isEmpty } == true, "")
+        check("source: …nor marks them seen, so nothing is lost when the server pushes",
+              other.map { $0.followerWarnings(shown: [], now: now).markSeen.isEmpty } == true, "")
+        check("source: the server's own snapshot still surfaces its fresh warning",
+              own.map { $0.followerWarnings(shown: [], now: now).show.map(\.key) } == ["w1"], "")
+
+        let unsigned = remote(server: server, snapshot: snapshot(from: nil))
+        check("source: a snapshot naming no machine, with a server named, is not believed",
+              unsigned?.snapshotIsServers == false, "")
+
+        let unelected = remote(server: nil, snapshot: snapshot(from: nil))
+        check("source: with nobody elected there is no one to misattribute to",
+              unelected?.snapshotIsServers == true, "")
+        check("source: …and nothing about it draws hollow",
+              unelected.flatMap(FollowedSnapshot.followed(from:)).map { $0.state(for: $0.accounts[0], now: now).error == nil } == true, "")
+
+        check("source: the web's own stale marker is honoured",
+              remote(server: server, snapshot: snapshot(from: server), snapshotStale: true)?.snapshotIsServers == false, "")
+        check("source: a stale flag on the snapshot itself is honoured",
+              remote(server: server, snapshot: snapshot(from: server, stale: true))?.snapshotIsServers == false, "")
+        check("source: a marker that is a number, not a boolean, is no marker",
+              remote(server: server, snapshot: snapshot(from: server), snapshotStale: 1)?.snapshotIsServers == true, "")
+        check("source: an explicit false marker changes nothing",
+              remote(server: server, snapshot: snapshot(from: server), snapshotStale: false)?.snapshotIsServers == true, "")
+        check("source: no snapshot at all is not a server reading", remote(server: server, snapshot: nil)?.snapshotIsServers == false, "")
+
+        // The follower's file: the guard exits 2 on a stale row, so a snapshot
+        // that is not the server's must reach the file with every row stale.
+        let foreign = LocalState.body(followingServer: other?.snapshot ?? [:], activeAccountId: nil, fromServer: false)
+        let foreignRows = (foreign["accounts"] as? [[String: Any]]) ?? []
+        check("source: a foreign snapshot's file marks every row stale, so the guard cannot say go",
+              !foreignRows.isEmpty && foreignRows.allSatisfy { ($0["isStale"] as? Bool) == true }, "")
+        check("source: …and says whose it is not", (foreign["sourceIsServer"] as? Bool) == false, "")
+        check("source: …keeping a null reading null and a zero a zero",
+              ((foreignRows.first?["buckets"] as? [String: Any])?["fable"] as? [String: Any])?["percent"] is NSNull
+              && FollowedSnapshot.number(((foreignRows.first?["buckets"] as? [String: Any])?["weekly"] as? [String: Any])?["percent"]) == 0, "")
+        check("source: …and carrying no warnings", foreign["warnings"] == nil, "")
+        let trusted = LocalState.body(followingServer: own?.snapshot ?? [:], activeAccountId: nil)
+        check("source: the server's own snapshot reaches the file with its rows as the server sent them",
+              ((trusted["accounts"] as? [[String: Any]])?.first?["isStale"] as? Bool) == false
+              && (trusted["sourceIsServer"] as? Bool) == true, "")
+
+        check("flag: true is true", SnapshotSource.isTrue(true), "")
+        check("flag: false, 1, \"true\" and nothing are not",
+              !SnapshotSource.isTrue(false) && !SnapshotSource.isTrue(1) && !SnapshotSource.isTrue("true")
+              && !SnapshotSource.isTrue(nil) && !SnapshotSource.isTrue(NSNumber(value: 1)), "")
+    }
+}

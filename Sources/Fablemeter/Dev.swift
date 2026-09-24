@@ -2142,6 +2142,19 @@ enum SelfTest {
             check("follower: stale rows say so in one word",
                   old.displayRows(now: now).first?.state?.error == FollowedSnapshot.staleText, "")
 
+            // The window after a promote: the web still holds the previous
+            // server's push under the new server's name.
+            let handover = AppState(demo: true, demoCount: 3)
+            handover.applyDemoRole(.following, snapshotFrom: "DEMO-MINI")
+            check("follower: a snapshot from the previous server draws hollow, not live",
+                  handover.barCells.count == 3 && handover.barCells.allSatisfy(\.isUnreachable), "")
+            check("follower: …its numbers are kept, so the popover is not blank",
+                  handover.barCells.first?.headroom == 71, "")
+            check("follower: …every row says stale",
+                  handover.displayRows(now: now).allSatisfy { $0.state?.error == FollowedSnapshot.staleText }, "")
+            check("follower: …and the footer says whose turn it is",
+                  handover.footerText(now: now) == "Waiting on fly-iconic", handover.footerText(now: now))
+
             let own = AppState(demo: true, demoCount: 3)
             own.applyDemoRole(.unelected)
             check("unelected: this Mac draws its own accounts, which stay editable",

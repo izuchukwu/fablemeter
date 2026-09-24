@@ -31,6 +31,9 @@ struct FollowedSnapshot {
     let updatedAt: Date?
     /// The machine that measured, when the payload names it.
     let machine: String?
+    /// False when the snapshot is not the named server's own reading (see
+    /// `SnapshotSource`): its numbers are shown, but hollow, never as live.
+    var fromServer = true
 
     /// The web page's own threshold: past this, the numbers are history and the
     /// gauge goes hollow rather than looking live.
@@ -102,17 +105,26 @@ struct FollowedSnapshot {
         return false
     }
 
+    /// What a follower draws from one `/api/state` answer.
+    static func followed(from remote: RemoteState) -> FollowedSnapshot? {
+        guard let payload = remote.snapshot else { return nil }
+        var followed = decode(payload)
+        followed.fromServer = remote.snapshotIsServers
+        return followed
+    }
+
     func isOld(now: Date) -> Bool {
         guard let updatedAt else { return true }
         return now.timeIntervalSince(updatedAt) > Self.staleAfter
     }
 
     /// What a row draws. The server's numbers always; hollow, with one word
-    /// saying so, when the server's own fetch failed or the snapshot is old.
+    /// saying so, when the server's own fetch failed, the snapshot is old, or
+    /// it is not the server's own reading at all.
     func state(for account: FollowedAccount, now: Date) -> AccountState {
         AccountState(
             snapshot: account.snapshot,
-            error: account.serverStale || isOld(now: now) ? Self.staleText : nil,
+            error: !fromServer || account.serverStale || isOld(now: now) ? Self.staleText : nil,
             needsSignIn: false
         )
     }

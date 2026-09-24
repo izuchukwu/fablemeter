@@ -175,10 +175,12 @@ final class LocalStateWriter {
 
     /// A follower's write: the server's snapshot, with only the active marker
     /// resolved here (by account id — see `LocalState.body(followingServer:)`).
-    func write(followingServer snapshot: [String: Any], activeAccountId: String?) {
+    func write(followingServer snapshot: [String: Any], activeAccountId: String?, fromServer: Bool = true) {
         do {
             let payload = try JSONSerialization.data(
-                withJSONObject: LocalState.body(followingServer: snapshot, activeAccountId: activeAccountId),
+                withJSONObject: LocalState.body(
+                    followingServer: snapshot, activeAccountId: activeAccountId, fromServer: fromServer
+                ),
                 options: [.sortedKeys, .prettyPrinted]
             )
             try FileManager.default.createDirectory(
