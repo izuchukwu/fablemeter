@@ -329,7 +329,7 @@ case "status":
             }
             for m in remote.machines {
                 let when = m.lastSeen.map { Format.relative($0) } ?? "never"
-                let tag = m.machineId == client.machineId ? "  ← this machine" : ""
+                let tag = MachineID.same(m.machineId, client.machineId) ? "  ← this machine" : ""
                 print("          \(m.machine)  \(m.role?.rawValue ?? "-")  seen \(when)\(tag)")
             }
             return 0

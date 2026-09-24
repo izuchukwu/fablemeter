@@ -50,7 +50,8 @@ struct RemoteState {
         // so roles are dropped rather than believed; `election` says which.
         let elected = server != nil
         let machines = ((json["machines"] as? [[String: Any]]) ?? []).compactMap { row -> MachineInfo? in
-            guard let id = row["machineId"] as? String else { return nil }
+            guard let raw = row["machineId"] as? String else { return nil }
+            let id = MachineID.normalize(raw)
             return MachineInfo(
                 machineId: id,
                 machine: (row["machine"] as? String) ?? id,
@@ -66,7 +67,8 @@ struct RemoteState {
     }
 
     static func serverInfo(_ row: [String: Any]) -> ServerInfo? {
-        guard let id = row["machineId"] as? String else { return nil }
+        guard let raw = row["machineId"] as? String else { return nil }
+        let id = MachineID.normalize(raw)
         return ServerInfo(
             machineId: id,
             machine: (row["machine"] as? String) ?? id,
@@ -97,7 +99,7 @@ enum SnapshotSource {
         // Nobody elected: every Mac measures for itself, and there is no one
         // for the snapshot to be wrongly attributed to.
         guard let server else { return true }
-        return (snapshot["machineId"] as? String) == server.machineId
+        return MachineID.same(snapshot["machineId"] as? String, server.machineId)
     }
 
     /// True only for a JSON `true`. A number is not a flag, even 1 — Darwin
@@ -144,7 +146,7 @@ extension RemoteState {
         switch you {
         case .server: return .thisMachine
         case .follower: return .other(server)
-        case nil: return server.machineId == machineId ? .thisMachine : .other(server)
+        case nil: return MachineID.same(server.machineId, machineId) ? .thisMachine : .other(server)
         }
     }
 }
@@ -193,6 +195,12 @@ struct WebClient {
     let key: String
     let machineId: String
     let machine: String
+
+    init(key: String, machineId: String, machine: String) {
+        self.key = key
+        self.machineId = MachineID.normalize(machineId)
+        self.machine = machine
+    }
 
     /// The follower's poll, and the heartbeat that puts every machine in the
     /// menu bar's machine list.

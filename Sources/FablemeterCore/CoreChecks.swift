@@ -25,7 +25,87 @@ enum CoreChecks {
         signInIdentity(check)
         numberShapes(check)
         snapshotSource(check)
+        machineIds(check)
         HTTPSeamCheck.run(check)
+    }
+
+    // MARK: Machine id spelling
+    //
+    // Foundation mints ids in uppercase; the web stores them lowercased. Every
+    // comparison between this machine's id and one the web returned must agree
+    // across that difference, and no spelling may ever turn "someone else is
+    // the server" into "I am".
+
+    static func machineIds(_ check: Check) {
+        let upper = "AAAAAAAA-1111-2222-3333-444444444444"
+        let lower = upper.lowercased()
+        let otherLower = "bbbbbbbb-1111-2222-3333-444444444444"
+        func remote(_ json: [String: Any]) -> RemoteState? {
+            RemoteState.decode(try! JSONSerialization.data(withJSONObject: json))
+        }
+
+        check("machine id: normalize lowercases and trims", MachineID.normalize(" \(upper)\n") == lower, "")
+        check("machine id: same() ignores case", MachineID.same(upper, lower), "")
+        check("machine id: same() never matches a missing id",
+              !MachineID.same(nil, lower) && !MachineID.same(lower, nil) && !MachineID.same(nil, nil), "")
+        check("machine id: same() never matches two empty ids", !MachineID.same("", " "), "")
+
+        let decoded = remote([
+            "server": ["machineId": upper, "machine": "mac"],
+            "machines": [["machineId": upper, "machine": "mac", "role": "server"]],
+        ])!
+        check("machine id: decoding a web answer normalizes server and machine ids",
+              decoded.server?.machineId == lower && decoded.machines.first?.machineId == lower, "")
+
+        let meServerNoYou = remote(["server": ["machineId": lower, "machine": "mac"], "machines": []])!
+        check("machine id: uppercase local id matches the web's lowercase server (no 'you')",
+              meServerNoYou.election(machineId: upper) == .thisMachine, "")
+        let otherServerNoYou = remote(["server": ["machineId": otherLower, "machine": "fly"], "machines": []])!
+        check("machine id: mixed case never makes this machine the server",
+              otherServerNoYou.election(machineId: upper.uppercased()) != .thisMachine
+                && !RoleDecision.shouldPoll(remote: otherServerNoYou, machineId: upper, lastDecision: true), "")
+        let followerSaysWeb = remote(["server": ["machineId": lower, "machine": "mac"],
+                                      "you": ["role": "follower"], "machines": []])!
+        check("machine id: the web's 'you' still outranks any local id comparison",
+              followerSaysWeb.election(machineId: upper) != .thisMachine, "")
+
+        let menuState = remote([
+            "server": ["machineId": otherLower, "machine": "fly"], "you": ["role": "follower"],
+            "machines": [["machineId": otherLower, "machine": "fly", "role": "server"],
+                         ["machineId": lower, "machine": "mac", "role": "follower"]],
+        ])!
+        let rows = ServerMenuModel.machineRows(remote: menuState, machineId: upper)
+        check("machine id: the submenu marks This Mac across the case difference",
+              rows.contains(.machine(title: "mac (This Mac)", isServer: false))
+                && rows.contains(.machine(title: "fly", isServer: true)), "\(rows)")
+        check("machine id: This Mac is marked exactly once",
+              rows.filter { if case .machine(let t, _) = $0 { return t.hasSuffix("(This Mac)") }; return false }.count == 1, "")
+
+        check("machine id: a snapshot is the server's across the case difference",
+              SnapshotSource.isServers(snapshot: ["machineId": upper],
+                                       server: ServerInfo(machineId: lower, machine: "mac", since: nil),
+                                       webSaysStale: false), "")
+        check("machine id: WebClient sends the normalized spelling",
+              WebClient(key: "k", machineId: upper, machine: "mac").machineId == lower, "")
+
+        // The stored id: an older build wrote uppercase. Reading it must give
+        // the same machine, in the one spelling, without rewriting the file.
+        let saved = MachineIdentity.directoryOverride
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fablemeter-machineid-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        MachineIdentity.directoryOverride = dir
+        let file = dir.appendingPathComponent("machine-id")
+        try? (upper + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let read = MachineIdentity.id()
+        let onDisk = try? String(contentsOf: file, encoding: .utf8)
+        check("machine id: an uppercase stored id reads back lowercase", read == lower, "got \(read)")
+        check("machine id: reading never rewrites the stored id", onDisk == upper + "\n", "")
+        try? FileManager.default.removeItem(at: file)
+        let minted = MachineIdentity.id()
+        check("machine id: a fresh id is minted lowercase", minted == minted.lowercased() && UUID(uuidString: minted) != nil, "")
+        MachineIdentity.directoryOverride = saved
+        try? FileManager.default.removeItem(at: dir)
     }
 
     // MARK: Paste-back sign-in

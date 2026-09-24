@@ -183,15 +183,17 @@ enum ServerMenuModel {
     static func machineRows(remote: RemoteState, machineId: String) -> [ServerMenuItem] {
         let serverId = remote.server?.machineId
         var rows = remote.machines.map { ($0.machineId, $0.machine) }
-        if let server = remote.server, !rows.contains(where: { $0.0 == server.machineId }) {
+        if let server = remote.server, !rows.contains(where: { MachineID.same($0.0, server.machineId) }) {
             rows.append((server.machineId, server.machine))
         }
-        func rank(_ id: String) -> Int { id == serverId ? 0 : id == machineId ? 1 : 2 }
+        func isServer(_ id: String) -> Bool { MachineID.same(id, serverId) }
+        func isMe(_ id: String) -> Bool { MachineID.same(id, machineId) }
+        func rank(_ id: String) -> Int { isServer(id) ? 0 : isMe(id) ? 1 : 2 }
         let ordered = rows.enumerated().sorted {
             (rank($0.element.0), $0.offset) < (rank($1.element.0), $1.offset)
         }.map(\.element)
         return ordered.map { id, name in
-            .machine(title: id == machineId ? "\(name) (This Mac)" : name, isServer: id == serverId)
+            .machine(title: isMe(id) ? "\(name) (This Mac)" : name, isServer: isServer(id))
         }
     }
 }

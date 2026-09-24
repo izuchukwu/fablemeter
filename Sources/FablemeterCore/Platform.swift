@@ -117,6 +117,25 @@ enum HTTP {
 /// It lives in `~/.claude/fablemeter/`, beside the fleet's state file, and
 /// deliberately NOT in the account store's directory: nothing new ever goes in
 /// the directory that holds the refresh tokens.
+/// Machine ids have exactly one spelling: lowercase. Foundation mints UUIDs in
+/// uppercase and the web stores them lowercased, so any comparison between an
+/// id this machine holds and one the web returned is only correct after both
+/// pass through here. Normalize at the boundary (minting, reading the file,
+/// decoding a web answer) and compare with `same` everywhere else.
+enum MachineID {
+    static func normalize(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// False when either side is missing: an absent id never matches, so a
+    /// machine can never conclude it is the server from a nil.
+    static func same(_ a: String?, _ b: String?) -> Bool {
+        guard let a, let b else { return false }
+        let x = normalize(a), y = normalize(b)
+        return !x.isEmpty && x == y
+    }
+}
+
 enum MachineIdentity {
     static var directoryOverride: URL?
 
@@ -132,9 +151,12 @@ enum MachineIdentity {
     static func id() -> String {
         if let raw = try? String(contentsOf: file, encoding: .utf8),
            let parsed = UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            return parsed.uuidString
+            // The file may hold the uppercase spelling older builds wrote; it is
+            // the same id, read in the one spelling. Never rewritten, so this
+            // machine stays the machine the web already knows.
+            return MachineID.normalize(parsed.uuidString)
         }
-        let fresh = UUID().uuidString
+        let fresh = MachineID.normalize(UUID().uuidString)
         try? FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o755]
