@@ -5,6 +5,10 @@ import SwiftUI
 
 @MainActor
 final class AppState: ObservableObject {
+    @Published private(set) var codex: CodexReading?
+    @Published private(set) var codexStale = false
+    private var codexAttempt = Date.distantPast
+    private var codexFetching = false
     @Published private(set) var accounts: [Account] = []
     @Published private(set) var states: [UUID: AccountState] = [:]
     @Published private(set) var lastUpdated: Date?
@@ -108,6 +112,7 @@ final class AppState: ObservableObject {
             accounts = seeded.accounts
             states = seeded.states
             lastUpdated = Date()
+            codex = CodexReading(weekly: UsageBucket(id: "codex-weekly", label: "Weekly", percent: 91, resetsAt: Date().addingTimeInterval(86400)), resetCredits: 1)
             return
         }
         accounts = Store.load()
@@ -126,6 +131,7 @@ final class AppState: ObservableObject {
             // finding out by 409 that it should not have.
             await self?.settleRoleAtLaunch()
             while !Task.isCancelled {
+                await self?.refreshCodex()
                 await self?.followIfFollowing()
                 await self?.refreshRemoteIfDue()
                 await self?.refresh(reason: .scheduled)
@@ -140,6 +146,16 @@ final class AppState: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in await self?.refresh(reason: .opportunistic) }
         }
+    }
+
+    private func refreshCodex(force: Bool = false) async {
+        guard !isDemo, !codexFetching, force || Date().timeIntervalSince(codexAttempt) >= 300 else { return }
+        codexFetching = true
+        codexAttempt = Date()
+        let reading = await Task.detached(priority: .utility) { CodexReading.fetch() }.value
+        if let reading { codex = reading; codexStale = false }
+        else { codexStale = true }
+        codexFetching = false
     }
 
     /// A promotion owns the sign-in while it runs: a second browser flow would
@@ -473,6 +489,7 @@ final class AppState: ObservableObject {
             // never due — the control must never be left spinning.
             defer { isManualRefreshing = false }
             let started = Date()
+            await refreshCodex(force: true)
             // A follower's refresh is asking the web for the server's latest,
             // never Anthropic.
             if isFollowingServer { await followIfFollowing(force: true) }
@@ -499,7 +516,7 @@ final class AppState: ObservableObject {
     /// screen has actually gone stale.
     func refreshIfStale() {
         guard !isDemo else { return }
-        Task { await refresh(reason: .opportunistic) }
+        Task { await refreshCodex(); await refresh(reason: .opportunistic) }
     }
 
     private static func load(_ account: Account, vault: TokenVault) async -> FetchOutcome {

@@ -48,6 +48,23 @@ enum SelfTest {
             if !ok { failures += 1 }
         }
 
+        func codexFixture(_ percent: Int, appServer: Bool = false) -> CodexReading? {
+            let json = appServer
+                ? """
+                  {"rail":"app-server","snapshot":{"rateLimits":{"primary":{"usedPercent":10,"windowDurationMins":300},"secondary":{"usedPercent":\(percent),"windowDurationMins":10080,"resetsAt":1790000000}},"rateLimitResetCredits":{"availableCount":1}}}
+                  """
+                : """
+                  {"rail":"http","snapshot":{"rate_limit":{"primary_window":{"used_percent":\(percent),"limit_window_seconds":604800,"reset_at":1790000000}},"rate_limit_reset_credits":{"available_count":0}}}
+                  """
+            return CodexReading.decode(Data(json.utf8))
+        }
+        check("Codex below warning", codexFixture(89)?.verdict == "Available")
+        check("Codex warning boundary", codexFixture(90)?.verdict == "Warning")
+        check("Codex reset boundary", codexFixture(95)?.verdict == "Ask for reset")
+        check("Codex HTTP zero credits and reset", codexFixture(0)?.resetCredits == 0 && codexFixture(0)?.weekly.resetsAt == Date(timeIntervalSince1970: 1790000000))
+        check("Codex app-server secondary week", codexFixture(95, appServer: true)?.resetCredits == 1 && codexFixture(95, appServer: true)?.weekly.percent == 95)
+        check("Codex missing data is unknown", CodexReading.decode(Data("{}".utf8)) == nil)
+
         let stamp = "2026-08-12T01:40:00.087143+00:00"
         let parsed = ISODate.parse(stamp)
         check("microsecond ISO-8601 parses", parsed != nil, parsed.map { "-> \($0)" } ?? "-> nil")

@@ -94,6 +94,18 @@ same curve from 1 minute, capped at 15. The first success clears it all.
 A failed fetch never blanks the display: the last reading stays on screen inside
 a hollow gauge, which is what tells you it is no longer live.
 
+## Codex
+
+The popover also shows this Mac's Codex weekly percentage used, reset time and
+banked reset credits, using `~/.claude/bin/codex-quota --json`. It reads the
+weekly window regardless of whether it is primary or secondary. The row warns
+at 90% used and says **Ask for reset** at 95%. An unavailable reading is shown
+as no data, or as stale if a previous reading exists. It refreshes about every
+five minutes and with manual refresh. Codex is display-only and does not affect
+account switching, cascade, or the CLI guard. The normal `fablemeter` CLI
+output includes the same local reading; `--json` and `--guard` remain Claude
+snapshot operations.
+
 ## Build
 
 ```sh

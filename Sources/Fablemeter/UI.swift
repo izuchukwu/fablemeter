@@ -131,6 +131,7 @@ struct MetricRow: View {
     let now: Date
     /// Passed down from the account: the whole row is as live as its fetch was.
     let isUnreachable: Bool
+    var tintOverride: Color? = nil
 
     /// Columns are sized off the widest string each can hold at its own weight:
     /// `100%` measures 32.2pt at 11pt medium, `Wed 12 PM` 61.2pt at 11pt
@@ -139,7 +140,7 @@ struct MetricRow: View {
     private static let resetWidth: CGFloat = 66
 
     private var percent: Double { bucket?.percent ?? 0 }
-    private var tint: Color { Verdict.color(usedPercent: percent) }
+    private var tint: Color { tintOverride ?? Verdict.color(usedPercent: percent) }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -471,6 +472,43 @@ struct AccountDropDelegate: DropDelegate {
 
 // MARK: - Popover
 
+struct CodexRow: View {
+    let reading: CodexReading?
+    let stale: Bool
+    let now: Date
+
+    private var color: Color {
+        guard let percent = reading?.weekly.percent else { return .secondary }
+        if percent >= 95 { return .red }
+        if percent >= 90 { return .orange }
+        return .secondary
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("C")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .frame(width: 20, height: 20)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.secondary.opacity(0.15)))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("Codex").font(.system(size: 12, weight: .semibold))
+                    Spacer(minLength: 6)
+                    Text(stale ? (reading == nil ? "No data" : "Stale") : (reading?.verdict ?? "—"))
+                        .font(.system(size: 11)).foregroundStyle(stale ? Color.orange : color)
+                }
+                Text(reading?.resetCredits.map { "\($0) reset credit\($0 == 1 ? "" : "s")" } ?? "Reset credits: —")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                MetricRow(title: "Weekly", bucket: reading?.weekly, now: now, isUnreachable: stale, tintOverride: color)
+                    .padding(.top, 5)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 16)
+        .padding(.bottom, 19)
+    }
+}
+
 struct PopoverView: View {
     @ObservedObject var state: AppState
     /// Incremented on every click in the popover; rows watch it to commit and
@@ -498,6 +536,8 @@ struct PopoverView: View {
                         if index > 0 { Divider() }
                         rowView(row, now: context.date)
                     }
+                    if !state.displayRows(now: context.date).isEmpty { Divider() }
+                    CodexRow(reading: state.codex, stale: state.codexStale, now: context.date)
                 }
             }
 
@@ -510,7 +550,7 @@ struct PopoverView: View {
                     .padding(.bottom, 8)
             }
 
-            if !state.accounts.isEmpty || state.signInError != nil { Divider() }
+            Divider()
             footer
         }
         .frame(width: 300)

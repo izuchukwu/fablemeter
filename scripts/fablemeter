@@ -157,9 +157,40 @@ def fmt_pct(row, bucket):
     return "  —" if p is None else f"{float(p):3.0f}%"
 
 
+def codex_line():
+    """Read the local Codex meter for display only; never affects guard decisions."""
+    import subprocess
+    from datetime import datetime
+    try:
+        result = subprocess.run([os.path.expanduser("~/.claude/bin/codex-quota"), "--json"],
+                                capture_output=True, timeout=100, check=True)
+        data = json.loads(result.stdout)
+        http = data["rail"] == "http"
+        if not http and data["rail"] != "app-server":
+            raise ValueError("unknown rail")
+        snap = data["snapshot"]
+        limits = snap["rate_limit" if http else "rateLimits"]
+        keys = ("primary_window", "secondary_window") if http else ("primary", "secondary")
+        window = next(w for key in keys if isinstance((w := limits.get(key)), dict)
+                      and w.get("limit_window_seconds" if http else "windowDurationMins") == (604800 if http else 10080)
+                      and w.get("used_percent" if http else "usedPercent") is not None)
+        used = float(window["used_percent" if http else "usedPercent"])
+        if not 0 <= used <= 100:
+            raise ValueError("invalid percent")
+        reset = window.get("reset_at" if http else "resetsAt")
+        when = datetime.fromtimestamp(reset).astimezone().strftime("%a %d %b %H:%M") if reset else "—"
+        credits = (snap.get("rate_limit_reset_credits" if http else "rateLimitResetCredits") or {}).get("available_count" if http else "availableCount")
+        credits = str(credits) if isinstance(credits, int) and not isinstance(credits, bool) and credits >= 0 else "—"
+        verdict = "Ask for reset" if used >= 95 else "Warning" if used >= 90 else "Available"
+        return f"   Codex           weekly {used:.0f}% used  resets {when}  reset credits {credits}  {verdict}"
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, StopIteration, OverflowError):
+        return "   Codex           weekly —  reset credits —  No data"
+
+
 def show(state, why):
     if state is None:
         print(f"fablemeter: {why}", file=sys.stderr)
+        print(codex_line())
         return UNKNOWN
     stamped = parse_iso(state.get("updatedAt"))
     age = "unknown age" if stamped is None else f"{int(time.time() - stamped)}s ago"
@@ -174,6 +205,7 @@ def show(state, why):
               f"headroom {head}  5h {fmt_pct(row,'fiveHour')}  "
               f"wk {fmt_pct(row,'weekly')}  fable {fmt_pct(row,'fable')}"
               f"  {row.get('verdict','')}{stale}")
+    print(codex_line())
     return CLEAR
 
 
