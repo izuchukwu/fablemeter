@@ -96,9 +96,9 @@ a hollow gauge, which is what tells you it is no longer live.
 
 ## Codex
 
-The popover also shows this Mac's Codex weekly percentage used, reset time and
+The popover also shows this Mac's Codex five-hour and weekly percentages used, reset times and
 banked reset credits, using `~/.claude/bin/codex-quota --json`. It reads the
-weekly window regardless of whether it is primary or secondary. The row warns
+windows regardless of whether they are primary or secondary. An absent five-hour window shows no data. The row warns
 at 90% used and says **Ask for reset** at 95%. An unavailable reading is shown
 as no data, or as stale if a previous reading exists. It refreshes about every
 five minutes and with manual refresh. Codex is display-only and does not affect

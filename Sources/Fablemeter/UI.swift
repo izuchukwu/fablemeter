@@ -499,6 +499,8 @@ struct CodexRow: View {
                 }
                 Text(reading?.resetCredits.map { "\($0) reset credit\($0 == 1 ? "" : "s")" } ?? "Reset credits: —")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
+                MetricRow(title: "5-hour", bucket: reading?.fiveHour, now: now, isUnreachable: stale)
+                    .padding(.top, 5)
                 MetricRow(title: "Weekly", bucket: reading?.weekly, now: now, isUnreachable: stale, tintOverride: color)
                     .padding(.top, 5)
             }

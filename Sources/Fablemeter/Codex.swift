@@ -4,6 +4,7 @@ import Foundation
 /// A local, display-only reading. It never enters account or switching state.
 struct CodexReading {
     let weekly: UsageBucket
+    var fiveHour: UsageBucket? = nil
     let resetCredits: Int?
 
     var verdict: String {
@@ -21,20 +22,25 @@ struct CodexReading {
         guard isHTTP || rail == "app-server" else { return nil }
         let limits = snapshot[isHTTP ? "rate_limit" : "rateLimits"] as? [String: Any] ?? [:]
         let candidates = isHTTP ? ["primary_window", "secondary_window"] : ["primary", "secondary"]
-        for key in candidates {
-            guard let window = limits[key] as? [String: Any],
-                  let duration = JSONScalar.number(window[isHTTP ? "limit_window_seconds" : "windowDurationMins"]),
-                  duration == (isHTTP ? 604800 : 10080),
-                  let percent = JSONScalar.number(window[isHTTP ? "used_percent" : "usedPercent"]),
-                  percent.isFinite, (0...100).contains(percent) else { continue }
-            let epoch = JSONScalar.number(window[isHTTP ? "reset_at" : "resetsAt"])
-            let credits = snapshot[isHTTP ? "rate_limit_reset_credits" : "rateLimitResetCredits"] as? [String: Any]
-            let count = JSONScalar.number(credits?[isHTTP ? "available_count" : "availableCount"])
-            return CodexReading(weekly: UsageBucket(id: "codex-weekly", label: "Weekly", percent: percent,
-                resetsAt: epoch.flatMap { $0.isFinite && $0 > 0 ? Date(timeIntervalSince1970: $0) : nil }),
-                resetCredits: count.flatMap { $0.isFinite && $0 >= 0 && $0 < 1_000_000 && $0.rounded() == $0 ? Int($0) : nil })
+        func bucket(seconds: Double, id: String, label: String) -> UsageBucket? {
+            for key in candidates {
+                guard let window = limits[key] as? [String: Any],
+                      let duration = JSONScalar.number(window[isHTTP ? "limit_window_seconds" : "windowDurationMins"]),
+                      duration == (isHTTP ? seconds : seconds / 60),
+                      let percent = JSONScalar.number(window[isHTTP ? "used_percent" : "usedPercent"]),
+                      percent.isFinite, (0...100).contains(percent) else { continue }
+                let epoch = JSONScalar.number(window[isHTTP ? "reset_at" : "resetsAt"])
+                return UsageBucket(id: id, label: label, percent: percent,
+                    resetsAt: epoch.flatMap { $0.isFinite && $0 > 0 ? Date(timeIntervalSince1970: $0) : nil })
+            }
+            return nil
         }
-        return nil
+        guard let weekly = bucket(seconds: 604800, id: "codex-weekly", label: "Weekly") else { return nil }
+        let credits = snapshot[isHTTP ? "rate_limit_reset_credits" : "rateLimitResetCredits"] as? [String: Any]
+        let count = JSONScalar.number(credits?[isHTTP ? "available_count" : "availableCount"])
+        return CodexReading(weekly: weekly,
+            fiveHour: bucket(seconds: 18000, id: "codex-five-hour", label: "5-hour"),
+            resetCredits: count.flatMap { $0.isFinite && $0 >= 0 && $0 < 1_000_000 && $0.rounded() == $0 ? Int($0) : nil })
     }
 
     static func fetch() -> CodexReading? {
