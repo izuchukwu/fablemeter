@@ -675,6 +675,7 @@ struct PopoverView: View {
                             ))
                         }
                         Toggle("Fable-first", isOn: $state.isFableFirst)
+                        Toggle("Show Codex in Menu Bar", isOn: $state.showsCodexInMenuBar)
                         Menu("Warnings") {
                             Toggle("Warn at 75%", isOn: $state.warnAt75)
                             Toggle("Warn at 90%", isOn: $state.warnAt90)

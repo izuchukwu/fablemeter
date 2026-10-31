@@ -71,8 +71,8 @@ enum SelfTest {
             let codexCell = BarCell(character: BarRenderer.codexCharacter, headroom: 92, isUnreachable: false)
             let plain = BarRenderer.image(for: claude).size.width
             let withCodex = BarRenderer.image(for: claude, codex: codexCell).size.width
-            check("Codex adds one cell plus the separator to the menu bar",
-                  withCodex == plain + BarRenderer.cellWidth + BarRenderer.separatorGap * 2 + BarRenderer.separatorWidth)
+            check("Codex adds exactly one cell to the menu bar, no separator",
+                  withCodex == plain + BarRenderer.cellWidth + BarRenderer.cellSpacing)
             check("Codex letter is X, not a Claude account letter", BarRenderer.codexCharacter == "X")
             check("A healthy Codex gauge keeps the cluster a template image",
                   BarRenderer.image(for: claude, codex: codexCell).isTemplate)

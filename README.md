@@ -96,11 +96,12 @@ a hollow gauge, which is what tells you it is no longer live.
 
 ## Codex
 
-The menu bar shows Codex as one more gauge labelled `X`, to the right of a
-faint, short vertical rule that sets it apart from the Claude accounts. It is
-the same gauge as theirs, measuring Codex's weekly headroom (`100 − weekly%`),
+The menu bar shows Codex as one more gauge labelled `X`, after the Claude
+accounts. It is the same gauge as theirs, measuring Codex's weekly headroom (`100 − weekly%`),
 with the same orange and red tiers and the same hollow track when the newest
-read failed. A Mac with no `codex-quota` draws no Codex gauge and no rule.
+read failed. **Show Codex in Menu Bar** in the `…` menu turns it off and on
+(on by default, remembered across launches). A Mac with no `codex-quota` draws
+no Codex gauge either way.
 
 The popover also shows this Mac's Codex weekly percentage used (and the
 five-hour one, only when Codex reports such a window), reset times and

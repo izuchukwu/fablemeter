@@ -56,6 +56,13 @@ final class AppState: ObservableObject {
         .object(forKey: "fableFirst") as? Bool ?? true {
         didSet { UserDefaults.standard.set(isFableFirst, forKey: "fableFirst") }
     }
+    /// Whether the Codex gauge joins the menu bar cluster. Same absent-key-
+    /// means-default pattern: on unless the user turned it off. The popover's
+    /// Codex row is unaffected.
+    @Published var showsCodexInMenuBar: Bool = UserDefaults.standard
+        .object(forKey: "showCodexInMenuBar") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showsCodexInMenuBar, forKey: "showCodexInMenuBar") }
+    }
     /// The warning toggles, same absent-key-means-default pattern as above.
     /// All default ON: this feature exists because a window went 0 to 100 in
     /// half an hour with nothing said.
@@ -186,11 +193,12 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// The Codex gauge for the menu bar, after the separator: weekly headroom,
+    /// The Codex gauge for the menu bar, after the Claude cells: weekly headroom,
     /// hollow when the newest read failed. `nil` on a machine with no
-    /// `codex-quota`, so a Mac that does not run Codex gets no dead gauge.
+    /// `codex-quota`, so a Mac that does not run Codex gets no dead gauge, and
+    /// `nil` when "Show Codex in Menu Bar" is off.
     var codexCell: BarCell? {
-        guard isDemo || CodexReading.isAvailable else { return nil }
+        guard showsCodexInMenuBar, isDemo || CodexReading.isAvailable else { return nil }
         return BarCell(
             character: BarRenderer.codexCharacter,
             headroom: codex?.weekly.percent.map { max(0, 100 - $0) },
