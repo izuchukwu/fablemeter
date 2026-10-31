@@ -96,9 +96,16 @@ a hollow gauge, which is what tells you it is no longer live.
 
 ## Codex
 
-The popover also shows this Mac's Codex five-hour and weekly percentages used, reset times and
+The menu bar shows Codex as one more gauge labelled `X`, to the right of a
+faint, short vertical rule that sets it apart from the Claude accounts. It is
+the same gauge as theirs, measuring Codex's weekly headroom (`100 − weekly%`),
+with the same orange and red tiers and the same hollow track when the newest
+read failed. A Mac with no `codex-quota` draws no Codex gauge and no rule.
+
+The popover also shows this Mac's Codex weekly percentage used (and the
+five-hour one, only when Codex reports such a window), reset times and
 banked reset credits, using `~/.claude/bin/codex-quota --json`. It reads the
-windows regardless of whether they are primary or secondary. An absent five-hour window shows no data. The row warns
+windows regardless of whether they are primary or secondary. The row warns
 at 90% used and says **Ask for reset** at 95%. An unavailable reading is shown
 as no data, or as stale if a previous reading exists. It refreshes about every
 five minutes and with manual refresh. Codex is display-only and does not affect

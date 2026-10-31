@@ -101,6 +101,21 @@ enum BarRenderer {
     /// An account with nothing left is unusable, so its letter recedes. This is
     /// the "you cannot use this one" signal — the letters never take colour.
     static let blockedGlyphAlpha: CGFloat = 0.38
+    /// The Codex gauge sits after the Claude cluster, behind a faint, short
+    /// vertical rule. Codex is a different product with a different meter, so
+    /// the rule says "this one is not another Claude account" without giving it
+    /// a separate status item. 1pt wide (two pixels at 2x), well under the
+    /// cluster's height, and at the hollow track's strength halved, so it reads
+    /// as a divider and never as a fifth gauge.
+    static let separatorWidth: CGFloat = 1
+    static let separatorHeight: CGFloat = 10
+    static let separatorAlpha: CGFloat = 0.25
+    /// Daylight either side of the rule. The gauge sits 2pt inside its cell, so
+    /// this puts ~5pt between the rule and each neighbouring gauge, matching the
+    /// 5.5pt gauges already keep from each other.
+    static let separatorGap: CGFloat = 3
+    /// Codex's letter in the menu bar. Not `C`: that is a Claude account's.
+    static let codexCharacter: Character = "X"
 
     /// `nil` means healthy — draw monochrome and let the system tint it.
     static func warningColor(for headroom: Double?) -> NSColor? {
@@ -216,9 +231,15 @@ enum BarRenderer {
     ///   current for the menu bar it is drawing into, which is more correct than
     ///   anything this could pin — and pinning it is what required watching
     ///   `effectiveAppearance`, which is what span the redraw loop.
-    static func image(for cells: [BarCell], appearance: NSAppearance? = nil) -> NSImage {
-        guard !cells.isEmpty else { return emptyImage() }
+    /// - Parameter codex: the Codex gauge, drawn after the Claude cells behind
+    ///   a separator. `nil` draws the Claude cluster exactly as before.
+    static func image(
+        for claudeCells: [BarCell], codex: BarCell? = nil, appearance: NSAppearance? = nil
+    ) -> NSImage {
+        guard !claudeCells.isEmpty else { return emptyImage() }
 
+        let cells = claudeCells + (codex.map { [$0] } ?? [])
+        let separatorSpan = codex == nil ? 0 : separatorGap * 2 + separatorWidth - cellSpacing
         let colored = forcesColor(cells)
         let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
         let textHeight = ceil(font.ascender - font.descender)
@@ -226,6 +247,7 @@ enum BarRenderer {
         let width = outerPadding * 2
             + CGFloat(cells.count) * cellWidth
             + CGFloat(cells.count - 1) * cellSpacing
+            + separatorSpan
 
         let image = NSImage(
             size: NSSize(width: width, height: imageHeight), flipped: false
@@ -236,12 +258,28 @@ enum BarRenderer {
                 let radius = barWidth / 2
                 let neutral = neutralColor(colored: colored)
 
+                if codex != nil {
+                    // Centred on the cluster's own middle (gauge over letter),
+                    // not the image's, so it sits level with what it divides.
+                    let lastClaudeEnd = outerPadding
+                        + CGFloat(claudeCells.count) * cellWidth
+                        + CGFloat(claudeCells.count - 1) * cellSpacing
+                    let centerY = baseY + contentHeight / 2
+                    neutral.withAlphaComponent(separatorAlpha).setFill()
+                    NSBezierPath(rect: NSRect(
+                        x: lastClaudeEnd + separatorGap,
+                        y: (centerY - separatorHeight / 2).rounded(),
+                        width: separatorWidth, height: separatorHeight
+                    )).fill()
+                }
+
                 for (index, cell) in cells.enumerated() {
                     // Like the battery icon: the track and the character stay
                     // monochrome, only the level goes orange/red.
                     let level: NSColor = levelColor(for: cell) ?? neutral
 
                     let cellX = outerPadding + CGFloat(index) * (cellWidth + cellSpacing)
+                        + (index >= claudeCells.count ? separatorSpan : 0)
                     let barRect = NSRect(
                         x: cellX + (cellWidth - barWidth) / 2, y: barY,
                         width: barWidth, height: barHeight
@@ -361,6 +399,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     private let popover = NSPopover()
     private var cancellable: AnyCancellable?
     private var renderedCells: [BarCell]?
+    private var renderedCodex: BarCell??
     /// Live only while the popover is open. See `installOutsideClickMonitor`.
     private var outsideClickMonitor: Any?
 
@@ -417,10 +456,12 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     /// cluster costs exactly one comparison per state change and nothing else.
     private func redraw(force: Bool = false) {
         let cells = state.barCells
-        guard force || cells != renderedCells else { return }
+        let codex = state.codexCell
+        guard force || cells != renderedCells || renderedCodex != .some(codex) else { return }
         renderedCells = cells
+        renderedCodex = .some(codex)
         guard let button = statusItem.button else { return }
-        button.image = BarRenderer.image(for: cells)
+        button.image = BarRenderer.image(for: cells, codex: codex)
     }
 
     @objc private func togglePopover() {

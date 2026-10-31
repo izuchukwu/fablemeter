@@ -186,6 +186,18 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// The Codex gauge for the menu bar, after the separator: weekly headroom,
+    /// hollow when the newest read failed. `nil` on a machine with no
+    /// `codex-quota`, so a Mac that does not run Codex gets no dead gauge.
+    var codexCell: BarCell? {
+        guard isDemo || CodexReading.isAvailable else { return nil }
+        return BarCell(
+            character: BarRenderer.codexCharacter,
+            headroom: codex?.weekly.percent.map { max(0, 100 - $0) },
+            isUnreachable: codexStale
+        )
+    }
+
     func state(for account: Account) -> AccountState? { states[account.id] }
 
     // MARK: Refreshing

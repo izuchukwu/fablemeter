@@ -66,6 +66,21 @@ enum SelfTest {
         check("Codex HTTP five-hour secondary", codexFixture(0)?.fiveHour?.percent == 23 && codexFixture(0)?.fiveHour?.resetsAt == Date(timeIntervalSince1970: 1790001000))
         check("Codex app-server five-hour primary", codexFixture(0, appServer: true)?.fiveHour?.percent == 10)
         check("Codex missing data is unknown", CodexReading.decode(Data("{}".utf8)) == nil)
+        do {
+            let claude = [BarCell(character: "I", headroom: 70, isUnreachable: false)]
+            let codexCell = BarCell(character: BarRenderer.codexCharacter, headroom: 92, isUnreachable: false)
+            let plain = BarRenderer.image(for: claude).size.width
+            let withCodex = BarRenderer.image(for: claude, codex: codexCell).size.width
+            check("Codex adds one cell plus the separator to the menu bar",
+                  withCodex == plain + BarRenderer.cellWidth + BarRenderer.separatorGap * 2 + BarRenderer.separatorWidth)
+            check("Codex letter is X, not a Claude account letter", BarRenderer.codexCharacter == "X")
+            check("A healthy Codex gauge keeps the cluster a template image",
+                  BarRenderer.image(for: claude, codex: codexCell).isTemplate)
+            check("A low Codex gauge takes the warning colour",
+                  !BarRenderer.image(for: claude, codex: BarCell(character: "X", headroom: 8, isUnreachable: false)).isTemplate)
+            check("No Claude accounts still draws the empty mark, Codex or not",
+                  BarRenderer.image(for: [], codex: codexCell).size.width == BarRenderer.image(for: []).size.width)
+        }
 
         let stamp = "2026-08-12T01:40:00.087143+00:00"
         let parsed = ISODate.parse(stamp)
@@ -2359,7 +2374,11 @@ enum RenderStates {
             guard let appearance = NSAppearance(named: name) else { continue }
             var bar: NSImage?
             appearance.performAsCurrentDrawingAppearance {
-                bar = BarRenderer.image(for: cells, appearance: appearance)
+                bar = BarRenderer.image(
+                    for: cells,
+                    codex: BarCell(character: BarRenderer.codexCharacter, headroom: 88, isUnreachable: false),
+                    appearance: appearance
+                )
             }
             guard let bar else { continue }
 

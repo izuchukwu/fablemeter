@@ -486,7 +486,7 @@ struct CodexRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Text("C")
+            Text(String(BarRenderer.codexCharacter))
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .frame(width: 20, height: 20)
                 .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.secondary.opacity(0.15)))
@@ -499,8 +499,13 @@ struct CodexRow: View {
                 }
                 Text(reading?.resetCredits.map { "\($0) reset credit\($0 == 1 ? "" : "s")" } ?? "Reset credits: —")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
-                MetricRow(title: "5-hour", bucket: reading?.fiveHour, now: now, isUnreachable: stale)
-                    .padding(.top, 5)
+                // Codex's plan may carry no five-hour window at all; an empty
+                // row for a limit that does not exist is noise, so it only
+                // appears when the server reports one.
+                if let fiveHour = reading?.fiveHour {
+                    MetricRow(title: "5-hour", bucket: fiveHour, now: now, isUnreachable: stale)
+                        .padding(.top, 5)
+                }
                 MetricRow(title: "Weekly", bucket: reading?.weekly, now: now, isUnreachable: stale, tintOverride: color)
                     .padding(.top, 5)
             }
