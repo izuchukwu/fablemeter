@@ -1,3 +1,4 @@
+import Charts
 import AppKit
 @testable import FablemeterCore
 import SwiftUI
@@ -213,6 +214,7 @@ struct AccountRow: View {
     enum Field: Hashable { case label, name }
 
     let row: DisplayRow
+    let history: UsageHistory
     let now: Date
     /// The verdict word is the gauge's reading put into words, so it follows
     /// the same policy the gauge does — the metric rows underneath do not: the
@@ -235,6 +237,8 @@ struct AccountRow: View {
     let signIn: () -> Void
     let signOut: () -> Void
 
+    @State private var expanded = false
+    @State private var historyWindow: HistoryWindow = .fiveHours
     @State private var editingLabel = false
     @State private var editingName = false
     @State private var labelDraft = ""
@@ -328,6 +332,11 @@ struct AccountRow: View {
                     }
                     .padding(.top, 5)
                 }
+                if expanded {
+                    historyGraph
+                        .padding(.top, 10)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
             }
         }
         .padding(.horizontal, 14)
@@ -338,6 +347,10 @@ struct AccountRow: View {
         .padding(.top, 16)
         .padding(.bottom, showsMetrics ? 19 : 17)
         .contentShape(Rectangle())
+        .onTapGesture {
+            guard !editingLabel && !editingName else { return }
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { expanded.toggle() }
+        }
         .contextMenu {
             // A server row belongs to the server; there is nothing here to do
             // to it.
@@ -367,6 +380,50 @@ struct AccountRow: View {
         .onDisappear {
             commitLabel()
             commitName()
+        }
+    }
+
+    private var historyGraph: some View {
+        let points = row.local.map { history.slice(accountID: $0.id, window: historyWindow, now: now) } ?? []
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("5-hour usage")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Picker("History window", selection: $historyWindow) {
+                    ForEach(HistoryWindow.allCases, id: \.self) { window in
+                        Text(window.rawValue).tag(window)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 120)
+            }
+            if points.isEmpty {
+                Text(row.local == nil ? "History unavailable for server accounts" : "No history yet")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 70)
+            } else {
+                Chart(points.indices, id: \.self) { index in
+                    let point = points[index]
+                    LineMark(x: .value("Time", point.date), y: .value("Used", point.percent))
+                    PointMark(x: .value("Time", point.date), y: .value("Used", point.percent))
+                        .symbolSize(points.count == 1 ? 20 : 0)
+                }
+                .chartXScale(domain: now.addingTimeInterval(-historyWindow.duration)...now)
+                .chartYScale(domain: 0...100)
+                .chartXAxis(.hidden)
+                .chartYAxis {
+                    AxisMarks(position: .leading, values: [0, 50, 100]) { value in
+                        AxisGridLine()
+                        AxisValueLabel { if let number = value.as(Int.self) { Text("\(number)%").font(.system(size: 9)) } }
+                    }
+                }
+                .frame(height: 70)
+                Text("History since " + points[0].date.formatted(date: .abbreviated, time: .shortened))
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -574,6 +631,7 @@ struct PopoverView: View {
     private func rowView(_ row: DisplayRow, now: Date) -> some View {
         let base = AccountRow(
             row: row,
+            history: state.history,
             now: now,
             fableFirst: state.isFableFirst,
             dismissToken: dismissToken,
