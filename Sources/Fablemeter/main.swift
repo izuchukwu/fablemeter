@@ -1,7 +1,45 @@
 import AppKit
 @testable import FablemeterCore
+import UserNotifications
 
 let arguments = Set(CommandLine.arguments.dropFirst())
+
+// Invoked by the local cascade only after a swap has been read back. Reuse
+// this bundle's notification permission and the existing Slack destination.
+if arguments.contains("--notify-swap") {
+    struct SwapNotice: Decodable { let id: String; let title: String; let body: String }
+    guard let notice = try? JSONDecoder().decode(
+        SwapNotice.self, from: FileHandle.standardInput.readDataToEndOfFile()
+    ) else { print("swap-notify: invalid notice"); exit(1) }
+    let semaphore = DispatchSemaphore(value: 0)
+    Task.detached {
+        async let slack = Slack.post(title: notice.title, body: notice.body)
+        var native = false
+        if Bundle.main.bundlePath.hasSuffix(".app") {
+            let center = UNUserNotificationCenter.current()
+            do {
+                if try await center.requestAuthorization(options: [.alert, .sound]) {
+                    let content = UNMutableNotificationContent()
+                    content.title = notice.title
+                    content.body = notice.body
+                    content.sound = .default
+                    try await center.add(UNNotificationRequest(
+                        identifier: notice.id, content: content, trigger: nil
+                    ))
+                    native = true
+                }
+            } catch { /* Report status without exposing message contents. */ }
+        }
+        let sent = await slack
+        print("swap-notify: Slack \(sent ? "accepted" : "failed"), macOS \(native ? "accepted" : "denied or failed")")
+        semaphore.signal()
+    }
+    if semaphore.wait(timeout: .now() + 25) == .timedOut {
+        print("swap-notify: timed out")
+        exit(1)
+    }
+    exit(0)
+}
 
 if arguments.contains("--selftest") {
     exit(SelfTest.run())
