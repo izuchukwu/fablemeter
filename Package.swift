@@ -38,6 +38,7 @@ let package = Package(
             dependencies: ["FablemeterCore"],
             path: "Sources/Fablemeter"
         ),
+        .testTarget(name: "FablemeterCoreTests", dependencies: ["FablemeterCore"]),
         .executableTarget(
             name: "FablemeterServer",
             dependencies: ["FablemeterCore"],
