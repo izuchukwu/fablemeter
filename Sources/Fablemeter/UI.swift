@@ -237,6 +237,7 @@ struct AccountRow: View {
     let signIn: () -> Void
     let signOut: () -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expanded = false
     @State private var historyWindow: HistoryWindow = .fiveHours
     @State private var editingLabel = false
@@ -267,6 +268,20 @@ struct AccountRow: View {
     }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            accountBlock
+            historyGraph
+                .padding(.leading, 44)
+                .padding(.trailing, 14)
+                .padding(.top, 10)
+                .frame(height: expanded ? 130 : 0, alignment: .top)
+                .clipped()
+                .allowsHitTesting(expanded)
+                .accessibilityHidden(!expanded)
+        }
+    }
+
+    private var accountBlock: some View {
         HStack(alignment: .top, spacing: 10) {
             LabelToken(
                 character: row.label,
@@ -332,11 +347,6 @@ struct AccountRow: View {
                     }
                     .padding(.top, 5)
                 }
-                if expanded {
-                    historyGraph
-                        .padding(.top, 10)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                }
             }
         }
         .padding(.horizontal, 14)
@@ -349,7 +359,7 @@ struct AccountRow: View {
         .contentShape(Rectangle())
         .onTapGesture {
             guard !editingLabel && !editingName else { return }
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { expanded.toggle() }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.25)) { expanded.toggle() }
         }
         .contextMenu {
             // A server row belongs to the server; there is nothing here to do
