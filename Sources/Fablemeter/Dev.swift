@@ -2521,6 +2521,60 @@ enum RenderPopover {
 
 /// A picture of the Server submenu for `--render-popover`, drawn from the same
 /// `ServerMenuItem` list the real menu uses.
+/// The ⋯ menu's "Reset 5-Hour Window" submenu, drawn from the same budget
+/// the real menu is built from (a live NSMenu cannot be captured off screen).
+struct BudgetMenuPreview: View {
+    let rows: [(String, String)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Reset 5-Hour Window").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 14).padding(.vertical, 4)
+            item("All Accounts")
+            Divider().padding(.vertical, 5).padding(.horizontal, 10)
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in item("\(row.0)  \(row.1)") }
+        }
+        .padding(.vertical, 5)
+        .frame(width: 220, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color(nsColor: .windowBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.12)))
+        .padding(12)
+    }
+
+    private func item(_ text: String) -> some View {
+        Text(text).font(.system(size: 13)).monospacedDigit().lineLimit(1)
+            .padding(.horizontal, 14).padding(.vertical, 3)
+    }
+}
+
+enum RenderLive {
+    /// Reads `state.json` and `fablemeter budget --json`; never polls or writes.
+    @MainActor
+    static func run(to file: String) -> Int32 {
+        guard let data = try? Data(contentsOf: LocalState.file),
+              let snapshot = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            print("render-live: no state.json"); return 1
+        }
+        let entries = Budget.fetch() ?? [:]
+        let state = AppState(demo: true)
+        state.applyLiveSnapshot(snapshot, budget: entries)
+        let rows = state.displayRows(now: Date()).compactMap { row in
+            state.budget(for: row.label).map { (row.nickname, $0.text) }
+        }
+        let view = HStack(alignment: .top, spacing: 0) {
+            PopoverView(state: state)
+            VStack(alignment: .leading, spacing: 0) {
+                Spacer().frame(height: 40)
+                BudgetMenuPreview(rows: rows)
+            }
+        }
+        RenderPopover.snapshot(view, appearance: .aqua, backdrop: NSColor(white: 0.96, alpha: 1),
+                               to: URL(fileURLWithPath: file))
+        print("wrote \(file)")
+        return 0
+    }
+}
+
 struct ServerMenuPreview: View {
     let items: [ServerMenuItem]
 

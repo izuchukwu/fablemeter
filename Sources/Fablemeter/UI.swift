@@ -125,6 +125,11 @@ enum MetricDisplay {
     }
 }
 
+enum UsageColumns {
+    static let percent: CGFloat = 44
+    static let reset: CGFloat = 66
+}
+
 struct MetricRow: View {
     let title: String
     let bucket: UsageBucket?
@@ -133,11 +138,10 @@ struct MetricRow: View {
     let isUnreachable: Bool
     var tintOverride: Color? = nil
 
-    /// Columns are sized off the widest string each can hold at its own weight:
-    /// `100%` measures 32.2pt at 11pt medium, `Wed 12 PM` 61.2pt at 11pt
-    /// regular. Both are pinned so neither can ever wrap again.
-    private static let percentWidth: CGFloat = 36
-    private static let resetWidth: CGFloat = 66
+    /// Share column widths with the budget row so every percentage and reset
+    /// lines up, including a budget percentage above 100%.
+    private static let percentWidth: CGFloat = UsageColumns.percent
+    private static let resetWidth: CGFloat = UsageColumns.reset
 
     private var percent: Double { bucket?.percent ?? 0 }
     private var tint: Color { tintOverride ?? Verdict.color(usedPercent: percent) }
@@ -209,15 +213,65 @@ struct LabelToken: View {
 
 // MARK: - Account
 
+/// The self-imposed 5-hour budget, drawn in the metric rows' own grammar: the
+/// meter and percentage show the share of the cap spent; the last column
+/// says when the window ends.
+struct BudgetRow: View {
+    let entry: BudgetEntry
+    let now: Date
+    let isUnreachable: Bool
+
+    private var tint: Color {
+        if entry.capped { return .red }
+        if entry.fractionOfCap >= 80 { return .orange }
+        return .secondary
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("5h")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(width: 44, alignment: .leading)
+            UsageMeter(
+                percent: entry.fractionOfCap,
+                tint: tint == .secondary ? Color.primary.opacity(0.55) : tint,
+                isUnreachable: isUnreachable || entry.usedPercent == nil
+            )
+            Text(entry.text)
+                .font(.system(size: 11, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(tint)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: UsageColumns.percent, alignment: .trailing)
+            Text(entry.active ? Format.resetStamp(entry.windowEnd, from: now) : "idle")
+                .font(.system(size: 11))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: UsageColumns.reset, alignment: .trailing)
+        }
+    }
+}
+
 struct AccountRow: View {
     enum Field: Hashable { case label, name }
 
     let row: DisplayRow
+    var isActive = false
     let now: Date
+    /// The account's 5-hour budget, when the CLI reports one.
+    var budget: BudgetEntry? = nil
+    var resetWindow: (() -> Void)? = nil
+    var selectAccount: (() -> Void)? = nil
+    var canSelectAccount = false
     /// The verdict word is the gauge's reading put into words, so it follows
     /// the same policy the gauge does — the metric rows underneath do not: the
     /// Fable row keeps printing whatever the server said either way.
     let fableFirst: Bool
+    var showsFableBars = true
     /// Bumped when something outside the row is clicked — the cue to commit any
     /// in-place edit and give up focus.
     let dismissToken: Int
@@ -259,6 +313,7 @@ struct AccountRow: View {
     private var verdict: (text: String, color: Color) {
         if let error = state?.error { return (error, .orange) }
         guard state?.snapshot != nil else { return ("—", .secondary) }
+        if budget?.capped == true { return ("Capped", .red) }
         return (Verdict.word(headroom: headroom), Verdict.color(headroom: headroom))
     }
 
@@ -275,6 +330,7 @@ struct AccountRow: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    HStack(alignment: .center, spacing: 4) {
                     if editingName {
                         TextField("", text: $nameDraft)
                             .textFieldStyle(.plain)
@@ -286,6 +342,13 @@ struct AccountRow: View {
                             .font(.system(size: 12, weight: .semibold))
                             .lineLimit(1)
                             .onTapGesture(count: 2) { if !isReadOnly { beginNameEdit() } }
+                    }
+                    if isActive {
+                        Circle()
+                            .fill(Color.secondary.opacity(0.55))
+                            .frame(width: 5, height: 5)
+                            .accessibilityLabel("Active account")
+                    }
                     }
                     Spacer(minLength: 6)
                     if needsSignIn && !isReadOnly {
@@ -313,18 +376,21 @@ struct AccountRow: View {
 
                 if showsMetrics {
                     VStack(alignment: .leading, spacing: 3) {
-                        MetricRow(
-                            title: "5-hour", bucket: state?.snapshot?.fiveHour,
-                            now: now, isUnreachable: isUnreachable
-                        )
+                        if let budget {
+                            BudgetRow(entry: budget, now: now, isUnreachable: isUnreachable)
+                        } else {
+                            MetricRow(title: "5h", bucket: nil, now: now, isUnreachable: isUnreachable)
+                        }
                         MetricRow(
                             title: "Weekly", bucket: state?.snapshot?.weekly,
                             now: now, isUnreachable: isUnreachable
                         )
-                        MetricRow(
-                            title: "Fable", bucket: state?.snapshot?.fable,
-                            now: now, isUnreachable: isUnreachable
-                        )
+                        if showsFableBars {
+                            MetricRow(
+                                title: "Fable", bucket: state?.snapshot?.fable,
+                                now: now, isUnreachable: isUnreachable
+                            )
+                        }
                     }
                     .padding(.top, 5)
                 }
@@ -339,6 +405,15 @@ struct AccountRow: View {
         .padding(.bottom, showsMetrics ? 19 : 17)
         .contentShape(Rectangle())
         .contextMenu {
+            if let selectAccount {
+                Button("Use This Account", action: selectAccount).disabled(!canSelectAccount)
+                Divider()
+            }
+            // The budget is this Mac's own, so even a server row can reset it.
+            if let resetWindow, budget != nil {
+                Button("Reset 5-Hour Window", action: resetWindow)
+                if !isReadOnly { Divider() }
+            }
             // A server row belongs to the server; there is nothing here to do
             // to it.
             if !isReadOnly {
@@ -497,8 +572,10 @@ struct CodexRow: View {
                     Text(stale ? (reading == nil ? "No data" : "Stale") : (reading?.verdict ?? "—"))
                         .font(.system(size: 11)).foregroundStyle(stale ? Color.orange : color)
                 }
-                Text(reading?.resetCredits.map { "\($0) reset credit\($0 == 1 ? "" : "s")" } ?? "Reset credits: —")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                if let credits = reading?.resetCredits {
+                    Text("\(credits) reset credit\(credits == 1 ? "" : "s")")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
                 // Codex's plan may carry no five-hour window at all; an empty
                 // row for a limit that does not exist is noise, so it only
                 // appears when the server reports one.
@@ -567,6 +644,7 @@ struct PopoverView: View {
         .onAppear {
             draggingID = nil
             state.refreshIfStale()
+            Task { await state.refreshBudget(force: true) }
             installClickMonitor()
         }
         .onDisappear {
@@ -579,8 +657,14 @@ struct PopoverView: View {
     private func rowView(_ row: DisplayRow, now: Date) -> some View {
         let base = AccountRow(
             row: row,
+            isActive: state.isActiveAccount(row),
             now: now,
+            budget: state.budget(for: row.label),
+            resetWindow: { state.resetBudgetWindow(label: row.label) },
+            selectAccount: { state.selectAccount(label: row.label) },
+            canSelectAccount: state.canSelectAccount,
             fableFirst: state.isFableFirst,
+            showsFableBars: state.showsFableBars,
             dismissToken: dismissToken,
             canMoveUp: row.local.map { state.canMove($0, by: -1) } ?? false,
             canMoveDown: row.local.map { state.canMove($0, by: 1) } ?? false,
@@ -662,6 +746,15 @@ struct PopoverView: View {
                     )
 
                     Menu {
+                        Menu("Switch Account") {
+                            ForEach(state.displayRows(now: Date()), id: \.id) { row in
+                                Button { state.selectAccount(label: row.label) } label: {
+                                    if state.isActiveAccount(row) { Label(row.nickname, systemImage: "checkmark") }
+                                    else { Text(row.nickname) }
+                                }
+                            }
+                        }
+                        .disabled(!state.canSelectAccount)
                         Button("Add Account…") { state.addAccount() }
                             .disabled(!state.canAddAccount)
                         Button("Connect to Fablemeter Web…") { state.connectWeb() }
@@ -674,8 +767,22 @@ struct PopoverView: View {
                                 set: { LoginItem.set($0) }
                             ))
                         }
+                        Toggle("Show Fable Usage Bars", isOn: $state.showsFableBars)
                         Toggle("Fable-first", isOn: $state.isFableFirst)
                         Toggle("Show Codex in Menu Bar", isOn: $state.showsCodexInMenuBar)
+                        if !state.budget.isEmpty {
+                            Menu("Reset 5-Hour Window") {
+                                Button("All Accounts") { state.resetBudgetWindow(label: nil) }
+                                Divider()
+                                ForEach(state.displayRows(now: Date())) { row in
+                                    if let entry = state.budget(for: row.label) {
+                                        Button("\(row.nickname)  \(entry.text)") {
+                                            state.resetBudgetWindow(label: row.label)
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         Menu("Warnings") {
                             Toggle("Warn at 75%", isOn: $state.warnAt75)
                             Toggle("Warn at 90%", isOn: $state.warnAt90)

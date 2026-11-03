@@ -12,6 +12,13 @@ if let index = CommandLine.arguments.firstIndex(of: "--render") {
     exit(MainActor.assumeIsolated { RenderStates.run(into: directory) })
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--render-live") {
+    let file = CommandLine.arguments.dropFirst(index + 1).first ?? "fablemeter-live.png"
+    let application = NSApplication.shared
+    application.setActivationPolicy(.prohibited)
+    exit(MainActor.assumeIsolated { RenderLive.run(to: file) })
+}
+
 if let index = CommandLine.arguments.firstIndex(of: "--render-popover") {
     let directory = CommandLine.arguments.dropFirst(index + 1).first ?? "."
     let application = NSApplication.shared

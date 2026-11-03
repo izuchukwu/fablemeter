@@ -21,6 +21,11 @@ struct BarCell: Equatable {
     /// where `headroom` says how much of it is left and `isUnreachable` says how
     /// old that is.
     let isFableExhausted: Bool
+    /// The account has spent its self-imposed 5-hour budget. The letter dims
+    /// exactly like a blocked account's: agents treat it as unusable until its
+    /// window resets, so the menu bar says the same.
+    var isCapped: Bool = false
+    var isActive: Bool = false
 
     /// The track is drawn hollow rather than painted. Two ways to earn it, and
     /// they are the same statement: there is no live reading behind this gauge.
@@ -40,12 +45,14 @@ struct BarCell: Equatable {
         character: Character,
         headroom: Double?,
         isUnreachable: Bool,
-        isFableExhausted: Bool = false
+        isFableExhausted: Bool = false,
+        isCapped: Bool = false
     ) {
         self.character = character
         self.headroom = headroom
         self.isUnreachable = isUnreachable
         self.isFableExhausted = isFableExhausted
+        self.isCapped = isCapped
     }
 
     /// How an account's state becomes a cell, under a policy. Pure, and the one
@@ -55,13 +62,14 @@ struct BarCell: Equatable {
     /// fact about the account, it just is not something this gauge is measuring,
     /// so the letter must not go yellow over it.
     static func cell(
-        character: Character, state: AccountState?, fableFirst: Bool
+        character: Character, state: AccountState?, fableFirst: Bool, isCapped: Bool = false
     ) -> BarCell {
         BarCell(
             character: character,
             headroom: state?.snapshot?.headroom(fableFirst: fableFirst),
             isUnreachable: state?.isUnreachable == true,
-            isFableExhausted: fableFirst && state?.snapshot?.isFableExhausted == true
+            isFableExhausted: fableFirst && state?.snapshot?.isFableExhausted == true,
+            isCapped: isCapped
         )
     }
 }
@@ -90,7 +98,7 @@ enum BarRenderer {
     static let outerPadding: CGFloat = 2.5
     static let gap: CGFloat = 1.5
     static let fontSize: CGFloat = 8
-    static let imageHeight: CGFloat = 22
+    static let imageHeight: CGFloat = 26
     static let minimumFill: CGFloat = 1.5
     /// The painted track, when the reading is live.
     static let trackAlpha: CGFloat = 0.20
@@ -300,6 +308,10 @@ enum BarRenderer {
                     // second answer can retire the first. A blocked account has
                     // no limit left to point at, so it takes the plain dimmed
                     // letter whether or not its Fable week is gone.
+                    if cell.isActive {
+                        neutral.withAlphaComponent(0.45).setFill()
+                        NSBezierPath(roundedRect: NSRect(x: cellX + (cellWidth - 4) / 2, y: 0.5, width: 4, height: 1), xRadius: 0.5, yRadius: 0.5).fill()
+                    }
                     let glyphInk = glyphColor(
                         colored: colored,
                         fableExhausted: cell.isFableExhausted,
@@ -309,7 +321,7 @@ enum BarRenderer {
                     let attributes: [NSAttributedString.Key: Any] = [
                         .font: font,
                         .foregroundColor: glyphInk.withAlphaComponent(
-                            glyphAlpha(headroom: cell.headroom)
+                            cell.isCapped ? blockedGlyphAlpha : glyphAlpha(headroom: cell.headroom)
                         )
                     ]
                     let size = glyph.size(withAttributes: attributes)
@@ -405,6 +417,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             MainActor.assumeIsolated { self?.closeIfShown() }
         }
         redraw(force: true)
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.redraw() }
+        }
     }
 
     /// Assigns a new image **only when the cells actually changed**, and that
