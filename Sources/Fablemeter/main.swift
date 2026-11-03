@@ -41,6 +41,12 @@ if arguments.contains("--notify-swap") {
     exit(0)
 }
 
+if arguments.contains("--check-expansion") {
+    let application = NSApplication.shared
+    application.setActivationPolicy(.accessory)
+    exit(MainActor.assumeIsolated { ExpansionCheck.run() })
+}
+
 if arguments.contains("--selftest") {
     exit(SelfTest.run())
 }

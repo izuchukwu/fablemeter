@@ -292,7 +292,8 @@ struct AccountRow: View {
     let signOut: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var expanded = false
+    @Environment(\.historyViewport) private var historyViewport
+    @StateObject private var expansion = HistoryExpansion()
     @State private var historyWindow: HistoryWindow = .fiveHours
     @State private var editingLabel = false
     @State private var editingName = false
@@ -325,14 +326,22 @@ struct AccountRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             accountBlock
+                .background(LayoutFrameProbe(id: "account-\(row.id)"))
             historyGraph
                 .padding(.leading, 44)
                 .padding(.trailing, 14)
                 .padding(.top, 10)
-                .frame(height: expanded ? 130 : 0, alignment: .top)
+                .frame(height: 130, alignment: .top)
+                .opacity(expansion.opacity)
+                .frame(height: expansion.height, alignment: .top)
                 .clipped()
-                .allowsHitTesting(expanded)
-                .accessibilityHidden(!expanded)
+                .background(LayoutFrameProbe(id: "graph-\(row.id)"))
+                .allowsHitTesting(expansion.expanded)
+                .accessibilityHidden(!expansion.expanded)
+        }
+        .onAppear {
+            expansion.viewport = historyViewport
+            if ExpansionCheck.enabled { ExpansionCheck.expansions["\(row.id)"] = expansion }
         }
     }
 
@@ -425,7 +434,7 @@ struct AccountRow: View {
         .contentShape(Rectangle())
         .onTapGesture {
             guard !editingLabel && !editingName else { return }
-            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.25)) { expanded.toggle() }
+            expansion.toggle(reduceMotion: reduceMotion)
         }
         .contextMenu {
             if let selectAccount {
@@ -465,6 +474,7 @@ struct AccountRow: View {
         .onDisappear {
             commitLabel()
             commitName()
+            expansion.finish()
         }
     }
 

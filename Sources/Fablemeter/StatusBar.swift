@@ -399,8 +399,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
 
-        let host = NSHostingController(rootView: PopoverView(state: state))
-        host.sizingOptions = [.preferredContentSize]
+        let host = PopoverScrollController(rootView: PopoverView(state: state))
         popover.contentViewController = host
         popover.behavior = .transient
         popover.animates = false
@@ -466,6 +465,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         state.refreshIfStale()
         NSApp.activate(ignoringOtherApps: true)
+        (popover.contentViewController as? PopoverScrollController<PopoverView>)?.prepareForDisplay()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
         installOutsideClickMonitor()

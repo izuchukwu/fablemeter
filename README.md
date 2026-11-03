@@ -174,6 +174,7 @@ without a relaunch.
 | Flag | What it does |
 | --- | --- |
 | `--selftest` | Decodes an embedded usage fixture, walks the polling and backoff schedules, and exercises token rotation — single-flight refresh, persist-before-return, and the terminal `needs sign-in` state — with no network. Also runs the callback-loop checks below, so consecutive reconnects stay covered. |
+| `--check-expansion` | Opens a real popover with demo accounts, samples account and popover screen frames on each display callback during expansion and collapse, and checks anchoring, translation, monotonic height, delayed opacity, reversal and Reduce Motion. Prints every sample and exits nonzero on failure. Requires a macOS GUI session. |
 | `--callback-loop [cycles] [delayMs]` | Runs the sign-in's loopback listener over and over in one process — bind, receive the redirect, tear down — plus an abandoned flow that never gets a redirect. No browser, no credentials. This is the second reconnect in a session, on its own. |
 | `--slack-test` | Posts one line to the Slack channel in `slack.json` and exits 0 if Slack took it, 1 if there is no readable config or the post was refused. Proves the mirror without waiting for a real threshold to be crossed. |
 | `--probe` | Reads Claude Code's existing access token read-only and prints live parsed buckets. Never writes or refreshes it. |
