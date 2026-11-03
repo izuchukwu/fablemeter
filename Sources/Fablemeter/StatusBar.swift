@@ -310,7 +310,7 @@ enum BarRenderer {
                     // letter whether or not its Fable week is gone.
                     if cell.isActive {
                         neutral.withAlphaComponent(0.45).setFill()
-                        NSBezierPath(roundedRect: NSRect(x: cellX + (cellWidth - 4) / 2, y: 0.5, width: 4, height: 1), xRadius: 0.5, yRadius: 0.5).fill()
+                        NSBezierPath(roundedRect: NSRect(x: cellX + (cellWidth - 4.5) / 2, y: 0.5, width: 4.5, height: 1), xRadius: 0.5, yRadius: 0.5).fill()
                     }
                     let glyphInk = glyphColor(
                         colored: colored,
