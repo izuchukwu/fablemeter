@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Explicit user selection from the menu; reuse the CLI's verified swap API.
+
+The CLI's agent entry point is reserved for Icon. A person clicking the menu
+is logged as the user, without impersonating an agent. Preserve its locks,
+credential preflight, backups, readback, Personal guard and audit log.
+"""
+import os
+import runpy
+import sys
+
+
+def main():
+    if len(sys.argv) != 2 or not sys.argv[1].strip():
+        print("Choose an account in Fablemeter.", file=sys.stderr)
+        return 1
+    api = runpy.run_path(os.path.expanduser("~/.claude/bin/fablemeter"))
+    try:
+        return api["swap_to"](
+            api["real_ctx"](), sys.argv[1], who="user: Fablemeter menu",
+            why="User explicitly selected this account in Fablemeter",
+            personal_first=True, cooldown_min=0,
+        )
+    except api["SwapError"] as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
