@@ -310,7 +310,17 @@ enum BarRenderer {
                     // letter whether or not its Fable week is gone.
                     if cell.isActive {
                         neutral.withAlphaComponent(0.45).setFill()
-                        NSBezierPath(roundedRect: NSRect(x: cellX + (cellWidth - 4.5) / 2, y: 0.5, width: 4.5, height: 1), xRadius: 0.5, yRadius: 0.5).fill()
+                        var activeRect = NSRect(
+                            x: cellX + (cellWidth - 5) / 2, y: 0.5, width: 5, height: 1
+                        )
+                        // Centre to the nearest device pixel. The wider mark
+                        // otherwise starts halfway through a Retina pixel.
+                        if let context = NSGraphicsContext.current?.cgContext {
+                            var pixels = context.convertToDeviceSpace(activeRect)
+                            pixels.origin.x.round()
+                            activeRect = context.convertToUserSpace(pixels)
+                        }
+                        NSBezierPath(roundedRect: activeRect, xRadius: 0.5, yRadius: 0.5).fill()
                     }
                     let glyphInk = glyphColor(
                         colored: colored,
