@@ -11,6 +11,7 @@ final class AppState: ObservableObject {
     private var codexFetching = false
     @Published private(set) var accounts: [Account] = []
     @Published private(set) var states: [UUID: AccountState] = [:]
+    @Published private(set) var history = UsageHistory()
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var isRefreshing = false
     /// True only while a refresh the *user* asked for is in flight. The footer's
@@ -289,6 +290,13 @@ final class AppState: ObservableObject {
         case .success(let snapshot):
             schedule.recordSuccess()
             lastUpdated = Date()
+            if !isDemo, let percent = snapshot.fiveHour?.percent {
+                do {
+                    try history.record(UsageSample(accountID: account.id, date: snapshot.fetchedAt, percent: percent))
+                } catch {
+                    Log.usage.error("Could not save usage history")
+                }
+            }
             // The poll already happened, so the shape of what it decoded is
             // free to record — and it is the only way to tell a null percent
             // from a reported zero without spending another refresh token.

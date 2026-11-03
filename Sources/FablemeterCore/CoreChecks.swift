@@ -12,6 +12,7 @@ enum CoreChecks {
     typealias Check = (_ name: String, _ ok: Bool, _ detail: String) -> Void
 
     static func run(_ check: Check) {
+        historyChecks(check)
         oob(check)
         roles(check)
         replay(check)
@@ -27,6 +28,29 @@ enum CoreChecks {
         snapshotSource(check)
         machineIds(check)
         HTTPSeamCheck.run(check)
+    }
+
+    static func historyChecks(_ check: Check) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("history.json")
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let a = UUID(), b = UUID()
+        var history = UsageHistory(file: file, now: now)
+        do {
+            try history.record(UsageSample(accountID: a, date: now.addingTimeInterval(-6 * 3600), percent: 25), now: now)
+            try history.record(UsageSample(accountID: a, date: now.addingTimeInterval(-3600), percent: 40), now: now)
+            try history.record(UsageSample(accountID: b, date: now, percent: 50), now: now)
+            let loaded = UsageHistory(file: file, now: now)
+            check("history: persists and isolates accounts", loaded.samples.count == 3 && loaded.slice(accountID: b, window: .week, now: now).count == 1, "")
+            check("history: slices windows", loaded.slice(accountID: a, window: .fiveHours, now: now).count == 1 && loaded.slice(accountID: a, window: .day, now: now).count == 2, "")
+            let later = now.addingTimeInterval(7 * 24 * 3600 + 1)
+            var pruned = UsageHistory(file: file, now: later)
+            try pruned.record(UsageSample(accountID: a, date: later, percent: 0), now: later)
+            check("history: prunes and persists retention", UsageHistory(file: file, now: later).samples.count == 1, "")
+        } catch {
+            check("history: persistence", false, "\(error)")
+        }
     }
 
     // MARK: Machine id spelling
