@@ -401,6 +401,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
 
         let host = PopoverScrollController(rootView: PopoverView(state: state))
         popover.contentViewController = host
+        host.popover = popover
         popover.behavior = .transient
         popover.animates = false
         popover.delegate = self

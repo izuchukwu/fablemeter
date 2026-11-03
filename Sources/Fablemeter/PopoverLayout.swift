@@ -2,16 +2,17 @@ import AppKit
 import QuartzCore
 import SwiftUI
 
-/// A popover keeps the size chosen when it opens. Only the scroll document
-/// grows. In particular, NSPopover never receives an animated ideal size.
+/// The display-link transaction sizes both the graph and its popover. AppKit
+/// resizing is immediate; scrolling starts only at the available screen height.
 @MainActor
 final class PopoverScrollController<Content: View>: NSViewController {
     let scroll = NSScrollView()
     let document: PopoverDocument<AnyView>
     let viewport = HistoryViewport()
+    weak var popover: NSPopover?
     private let maximumHeight: CGFloat
 
-    init(rootView: Content, maximumHeight: CGFloat = 650) {
+    init(rootView: Content, maximumHeight: CGFloat = .greatestFiniteMagnitude) {
         self.maximumHeight = maximumHeight
         document = PopoverDocument(rootView: AnyView(rootView.frame(maxHeight: .infinity, alignment: .top).environment(\.historyViewport, viewport)))
         super.init(nibName: nil, bundle: nil)
@@ -33,11 +34,26 @@ final class PopoverScrollController<Content: View>: NSViewController {
 
     func prepareForDisplay() {
         scroll.contentView.scroll(to: .zero)
-        let available = (NSScreen.main?.visibleFrame.height ?? 800) - 60
-        let height = min(max(160, document.fittingSize.height), min(maximumHeight, available))
+        let height = min(max(160, document.fittingSize.height), heightLimit)
         preferredContentSize = NSSize(width: 300, height: height)
         scroll.frame.size = preferredContentSize
         layoutDocument()
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        // NSPopover establishes its final anchor and chrome after appearance.
+        DispatchQueue.main.async { [weak self] in self?.layoutDocument() }
+    }
+
+    private var heightLimit: CGFloat {
+        let screen = view.window?.screen ?? NSScreen.main
+        // Include the popover chrome when measuring space below its fixed top.
+        if let window = view.window, let screen {
+            let chrome = window.frame.height - scroll.frame.height
+            return floor(min(maximumHeight, window.frame.maxY - screen.visibleFrame.minY - chrome))
+        }
+        return min(maximumHeight, (screen?.visibleFrame.height ?? 800) - 40)
     }
 
     private var layingOut = false
@@ -46,14 +62,26 @@ final class PopoverScrollController<Content: View>: NSViewController {
         layingOut = true
         defer { layingOut = false }
         let origin = scroll.contentView.bounds.origin
-        // Reserve each changing graph's maximum size BEFORE its first layout.
-        // This prevents hosting's minimum-size overflow from centering a frame
-        // that is briefly smaller than the new intrinsic size. Drop the reserve
-        // at rest, retaining only enough trailing space to preserve scroll offset.
-        let height = max(document.fittingSize.height + CGFloat(viewport.animations) * 130,
-                         scroll.contentSize.height + origin.y)
-        document.frame.size = NSSize(width: 300, height: height)
+        let top = view.window?.frame.maxY
+        // Give hosting enough room to flush the new SwiftUI phase without
+        // minimum-size overflow translating the entire stack.
+        document.frame.size.height = max(document.frame.height, document.fittingSize.height + 130)
         document.layoutSubtreeIfNeeded()
+        let naturalHeight = document.fittingSize.height
+        let height = min(max(160, naturalHeight), heightLimit)
+        preferredContentSize = NSSize(width: 300, height: height)
+        popover?.contentSize = preferredContentSize
+        scroll.frame.size = NSSize(width: 300, height: height)
+        if let top, let window = view.window, abs(window.frame.maxY - top) > 0.001 {
+            var frame = window.frame
+            frame.origin.y = top - frame.height
+            window.setFrame(frame, display: false, animate: false)
+        }
+        // Keep a scrolled click stationary even when collapse reduces the
+        // document below the old scroll offset. The extra space is trailing.
+        document.frame.size = NSSize(width: 300, height: max(naturalHeight, height + origin.y))
+        document.layoutSubtreeIfNeeded()
+        scroll.hasVerticalScroller = naturalHeight > height + 0.5
         scroll.contentView.scroll(to: origin)
         scroll.reflectScrolledClipView(scroll.contentView)
     }
@@ -101,7 +129,9 @@ final class HistoryExpansion: NSObject, ObservableObject {
     var afterFrame: (() -> Void)?
     weak var viewport: HistoryViewport?
 
-    var height: CGFloat { 130 * (1 - pow(1 - phase, 3)) }
+    // NSPopover rounds its window size to whole points. Quantize the shared
+    // geometry here so hosting and the window always use the same height.
+    var height: CGFloat { (130 * (1 - pow(1 - phase, 3))).rounded() }
     var opacity: Double { max(0, min(1, (phase - 1.0 / 3) * 1.5)) }
     var isAnimating: Bool { link != nil }
 
@@ -111,6 +141,7 @@ final class HistoryExpansion: NSObject, ObservableObject {
         to = expanded ? 1 : 0
         if reduceMotion {
             phase = to
+            viewport?.changed?()
             afterFrame?()
             return
         }
@@ -140,6 +171,7 @@ final class HistoryExpansion: NSObject, ObservableObject {
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) { phase = from + (to - from) * fraction }
+        viewport?.changed?()
         afterFrame?()
         if fraction >= 1 { stop() }
     }

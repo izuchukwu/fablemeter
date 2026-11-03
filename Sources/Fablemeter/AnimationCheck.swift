@@ -14,15 +14,31 @@ enum ExpansionCheck {
         NSApp.finishLaunching()
         NSApp.activate(ignoringOtherApps: true)
         enabled = true
+        let failures = runScenario(maximumHeight: .greatestFiniteMagnitude)
+            + runScenario(maximumHeight: 350)
+            + runScenario(maximumHeight: .greatestFiniteMagnitude, overflow: true)
+        print("Expansion check: \(failures) failures")
+        return failures == 0 ? 0 : 1
+    }
+
+    private static func runScenario(maximumHeight: CGFloat, overflow: Bool = false) -> Int {
+        probes.removeAll()
+        expansions.removeAll()
+        print("SCENARIO maximumHeight=\(maximumHeight) overflow=\(overflow)")
         let state = AppState(demo: true, demoCount: 3)
         let rows = state.displayRows(now: Date())
-        let host = PopoverScrollController(rootView: PopoverView(state: state), maximumHeight: 350)
+        let screen = NSScreen.main!.visibleFrame
+        // A tall trailing section exercises the real screen boundary without
+        // depending on the user's monitor size or changing production fixtures.
+        let host = PopoverScrollController(
+            rootView: PopoverView(state: state).padding(.bottom, overflow ? screen.height : 0),
+            maximumHeight: maximumHeight)
         let popover = NSPopover()
         popover.contentViewController = host
+        host.popover = popover
         popover.behavior = .applicationDefined
         popover.animates = false
         // A dedicated anchor avoids hidden status items on crowded menu bars.
-        let screen = NSScreen.main!.visibleFrame
         let anchorWindow = NSWindow(contentRect: NSRect(x: screen.midX, y: screen.maxY - 30, width: 30, height: 24),
                                     styleMask: [.borderless], backing: .buffered, defer: false)
         let button = NSButton(frame: NSRect(x: 0, y: 0, width: 30, height: 24))
@@ -42,15 +58,22 @@ enum ExpansionCheck {
             guard let view = probes[key], let window = view.window else { return .zero }
             return window.convertToScreen(view.convert(view.bounds, to: nil))
         }
-        // First row, middle row and the last row with the viewport scrolled:
-        // the latter catches automatic scroll clamping on collapse.
-        for index in rows.indices {
+        // Exercise first, middle and last rows, including scrolled collapse.
+        let capped = host.scroll.hasVerticalScroller
+        check(capped == (overflow || maximumHeight == 350), "scrolling enabled only for content beyond the height cap")
+        if overflow, let window = host.view.window {
+            check(abs(window.frame.minY - screen.minY) <= 0.5, "oversized popover reaches the actual visible screen boundary")
+        }
+        let indices = [0, rows.count / 2, rows.count - 1]
+        for index in indices {
             let id = "\(rows[index].id)"
             guard let expansion = expansions[id], let window = host.view.window else {
                 check(false, "missing real row or popover: shown=\(popover.isShown) window=\(String(describing: host.view.window)) expansions=\(expansions.keys) size=\(host.document.frame)"); continue
             }
-            if index == rows.count - 1 {
-                host.scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, host.document.frame.height - host.scroll.contentSize.height)))
+            if capped && index == rows.count - 1 {
+                let rowTop = probes["account-\(id)"].map { host.document.convert($0.bounds, from: $0).minY } ?? 0
+                let offset = min(max(0, rowTop - 50), max(0, host.document.frame.height - host.scroll.contentSize.height))
+                host.scroll.contentView.scroll(to: NSPoint(x: 0, y: offset))
                 host.scroll.reflectScrolledClipView(host.scroll.contentView)
                 settle()
                 check(host.scroll.contentView.bounds.origin.y > 0, "last row exercised at a nonzero scroll offset")
@@ -80,7 +103,15 @@ enum ExpansionCheck {
                 expansion.afterFrame = nil
                 check(!expansion.isAnimating && samples.count >= 8, "row \(index) \(direction) sampled every display callback")
                 check(samples.allSatisfy { $0.1 == anchor }, "row \(index) \(direction) clicked screen frame invariant")
-                check(samples.allSatisfy { $0.2 == initialPopover }, "row \(index) \(direction) popover frame constant (monotonic height)")
+                check(samples.allSatisfy { $0.2.minY >= screen.minY - 0.5 }, "popover fits visible screen height")
+                check(samples.allSatisfy { abs($0.2.maxY - initialPopover.maxY) <= 0.5 }, "row \(index) \(direction) popover top constant")
+                let popoverHeights = samples.map { $0.2.height }
+                check(zip(popoverHeights, popoverHeights.dropFirst()).allSatisfy {
+                    direction == "expand" ? $1 >= $0 - 0.5 : $1 <= $0 + 0.5
+                }, "popover height monotonic")
+                if let first = samples.first, let last = samples.last {
+                    check(abs(abs(last.2.height - first.2.height) - (capped ? 0 : 130)) <= 0.5, "popover travel matches graph or screen cap")
+                }
                 let heights = samples.map { $0.3 }
                 let pairs = zip(heights, heights.dropFirst())
                 check(pairs.allSatisfy { direction == "expand" ? $1 >= $0 - 0.01 : $1 <= $0 + 0.01 }, "graph height monotonic")
@@ -88,7 +119,11 @@ enum ExpansionCheck {
                 check(samples.allSatisfy { $0.5 > 1.0 / 3 || $0.6 == 0 }, "contents remain transparent for first third")
                 check(abs((heights.last ?? -1) - (direction == "expand" ? 130 : 0)) < 0.01, "graph reaches endpoint")
                 if index + 1 < rows.count, let first = samples.first {
-                    check(samples.allSatisfy { abs(($0.4 - first.4) + ($0.3 - first.3)) < 0.02 }, "following row translates by exactly graph height")
+                    if capped {
+                        check(samples.allSatisfy { abs(($0.4 - first.4) + ($0.3 - first.3)) <= 0.5 }, "overflow rows follow graph while popover remains capped")
+                    } else {
+                        check(samples.allSatisfy { abs(($0.4 - first.4) - ($0.2.minY - first.2.minY)) <= 0.5 }, "following row Y follows popover bottom within 0.5pt")
+                    }
                 }
                 print("SAMPLES row=\(index) \(direction): ms,row[x y w h],popover[x y w h],graphH,belowY,phase,opacity")
                 for s in samples {
@@ -99,6 +134,9 @@ enum ExpansionCheck {
                 }
             }
         }
+        host.scroll.contentView.scroll(to: .zero)
+        host.scroll.reflectScrolledClipView(host.scroll.contentView)
+        settle()
         if let first = rows.first, let expansion = expansions["\(first.id)"], let window = host.view.window {
             let anchor = frame("account-\(first.id)")
             let popoverFrame = window.frame
@@ -107,7 +145,7 @@ enum ExpansionCheck {
             expansion.afterFrame = {
                 window.displayIfNeeded()
                 reversedFrames += 1
-                stable = stable && frame("account-\(first.id)") == anchor && window.frame == popoverFrame
+                stable = stable && frame("account-\(first.id)") == anchor && abs(window.frame.maxY - popoverFrame.maxY) <= 0.5
             }
             expansion.toggle()
             RunLoop.main.run(until: Date().addingTimeInterval(0.1))
@@ -115,7 +153,7 @@ enum ExpansionCheck {
             expansion.toggle()
             check(expansion.phase == phase, "mid-flight reversal keeps the current height and opacity")
             RunLoop.main.run(until: Date().addingTimeInterval(0.3))
-            check(stable && reversedFrames >= 8 && expansion.phase == 0, "reversal keeps row and popover fixed through every frame")
+            check(stable && reversedFrames >= 8 && expansion.phase == 0, "reversal keeps clicked row and popover top fixed through every frame")
             expansion.afterFrame = nil
             expansion.toggle(reduceMotion: true)
             window.displayIfNeeded()
@@ -129,8 +167,7 @@ enum ExpansionCheck {
         }
         popover.close()
         anchorWindow.close()
-        print("Expansion check: \(failures) failures")
-        return failures == 0 ? 0 : 1
+        return failures
     }
 }
 
