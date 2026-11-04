@@ -177,7 +177,12 @@ final class AppState: ObservableObject {
         codexFetching = true
         codexAttempt = Date()
         let reading = await Task.detached(priority: .utility) { CodexReading.fetch() }.value
-        if let reading { codex = reading; codexStale = false }
+        if let reading {
+            codex = reading; codexStale = false
+            do {
+                try history.record(accountID: UsageHistory.codexID, date: Date(), fiveHour: reading.fiveHour?.percent, weekly: reading.weekly.percent)
+            } catch { Log.usage.error("Could not save usage history: \(error.localizedDescription)") }
+        }
         else { codexStale = true }
         codexFetching = false
     }
@@ -377,11 +382,11 @@ final class AppState: ObservableObject {
         case .success(let snapshot):
             schedule.recordSuccess()
             lastUpdated = Date()
-            if !isDemo, let percent = snapshot.fiveHour?.percent {
+            if !isDemo {
                 do {
-                    try history.record(UsageSample(accountID: account.id, date: snapshot.fetchedAt, percent: percent))
+                    try history.record(accountID: account.id, date: snapshot.fetchedAt, fiveHour: snapshot.fiveHour?.percent, weekly: snapshot.weekly?.percent)
                 } catch {
-                    Log.usage.error("Could not save usage history")
+                    Log.usage.error("Could not save usage history: \(error.localizedDescription)")
                 }
             }
             // The poll already happened, so the shape of what it decoded is
