@@ -169,6 +169,21 @@ and the app says so once in the log, the same way a denied notification does.
 It is re-read per warning, so dropping it in or taking it away takes effect
 without a relaunch.
 
+## Signed-out accounts
+
+The CLI's saved login for an account (what the cascade and `fablemeter swap` switch with)
+is a separate credential from the one this app polls with, so an account can show live
+numbers and still be one the cascade refuses. The popover asks `fablemeter swap --health`
+(offline, read-only, no credential in the output) about once a minute and on every manual
+refresh. An expired, unreadable or missing saved login shows **Signed out** in the status
+slot, in the same red as Blocked, with a **Reconnect** button on the email line:
+
+- the live account runs `fablemeter swap --save <label>` (no browser)
+- any other runs `fablemeter swap --enroll <label> --force` (one browser approval)
+
+The row shows progress, then **Reconnected** or the CLI's own reason, and re-reads health
+afterward. `--render-reconnect <dir>` draws every state with stubbed CLI seams.
+
 ## Flags
 
 | Flag | What it does |
@@ -181,6 +196,7 @@ without a relaunch.
 | (always on) | Every successful poll writes one line to the unified log describing the shape of what it decoded — which `kind`s came back, each reading as a number or `null`, whether a reset window was present, and the headroom it resolved to. Read it with `log show --predicate 'subsystem == "com.izu.fablemeter"' --last 30m`. It names the account by its menu bar letter and nothing else; no part of `accounts.json` and no credential goes near it. |
 | `--demo` | Eight fake in-memory accounts, for looking at the drawing: blocked, rate limited, healthy, one whose credential the server has rejected, one with Fable spent, one with Fable spent *and* nothing else left, one the server reports as untouched (`0%` everywhere, Available), and one the server reports nothing about (dashes everywhere, No data). |
 | `--render-popover <dir>` | Writes the popover itself in both appearances, without a menu bar or a click. |
+| `--render-reconnect <dir>` | Draws the signed-out row, the reconnect in flight, a failed reconnect and the row after a reconnect, in both appearances, against stubbed CLI seams. No login is read. |
 | `--render <dir>` | Writes the menu bar image for every state in both appearances. The real menu bar takes its appearance from the desktop picture behind it, so a dark wallpaper otherwise makes the light case impossible to see on screen. |
 
 ## Caveat

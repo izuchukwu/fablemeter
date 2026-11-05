@@ -290,6 +290,11 @@ struct AccountRow: View {
     let isSigningIn: Bool
     let signIn: () -> Void
     let signOut: () -> Void
+    /// The CLI's saved login for this account (what the cascade switches
+    /// with), which is not the credential this app polls with.
+    var savedLogin: SavedLoginHealth? = nil
+    var reconnect: ReconnectProgress? = nil
+    var reconnectSavedLogin: () -> Void = {}
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.historyViewport) private var historyViewport
@@ -315,7 +320,15 @@ struct AccountRow: View {
     /// still shows the last reading that arrived, and this says why it may be
     /// old. That is the whole message — no sentence underneath it. A dead
     /// credential takes the same slot, as the action itself rather than a word.
+    private var isSavedLoginOut: Bool { !isReadOnly && savedLogin?.isSignedOut == true }
+    private var isReconnecting: Bool { if case .running = reconnect { return true }; return false }
+
     private var verdict: (text: String, color: Color) {
+        if case .done? = reconnect { return ("Reconnected", .secondary) }
+        if isSavedLoginOut {
+            if case .failed(let why)? = reconnect { return (why, .orange) }
+            return ("Signed out", .red)
+        }
         if let error = state?.error { return (error, .orange) }
         guard state?.snapshot != nil else { return ("—", .secondary) }
         if budget?.capped == true { return ("Capped", .red) }
@@ -385,20 +398,41 @@ struct AccountRow: View {
                             .foregroundStyle(Color.accentColor)
                             .focusable(false)
                             .disabled(isSigningIn)
+                    } else if case .running(let step)? = reconnect, isSavedLoginOut {
+                        HStack(spacing: 5) {
+                            ProgressView().controlSize(.mini)
+                            Text(step)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     } else {
                         Text(verdict.text)
                             .font(.system(size: 11))
                             .foregroundStyle(verdict.color)
                             .lineLimit(1)
+                            .help(verdict.text)
                     }
                 }
 
-                if let email = row.email {
-                    Text(email)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                if row.email != nil || (isSavedLoginOut && !isReconnecting) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        if let email = row.email {
+                            Text(email)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        Spacer(minLength: 6)
+                        if isSavedLoginOut && !isReconnecting && !needsSignIn {
+                            Button("Reconnect", action: reconnectSavedLogin)
+                                .buttonStyle(PressableButtonStyle())
+                                .font(.system(size: 11))
+                                .foregroundStyle(Color.accentColor)
+                                .focusable(false)
+                        }
+                    }
                 }
 
                 if showsMetrics {
@@ -784,7 +818,10 @@ struct PopoverView: View {
             moveDown: { if let account = row.local { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: 1) } } },
             isSigningIn: state.isSigningIn || state.isPromoting,
             signIn: { if let account = row.local { state.signInAgain(account) } },
-            signOut: { if let account = row.local { state.remove(account) } }
+            signOut: { if let account = row.local { state.remove(account) } },
+            savedLogin: state.savedLogins[row.label.uppercased()],
+            reconnect: state.reconnects[row.label.uppercased()],
+            reconnectSavedLogin: { state.reconnect(label: row.label) }
         )
         if let account = row.local {
             base

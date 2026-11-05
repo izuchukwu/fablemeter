@@ -28,6 +28,7 @@ enum CoreChecks {
         numberShapes(check)
         snapshotSource(check)
         machineIds(check)
+        savedLogins(check)
         HTTPSeamCheck.run(check)
     }
 
@@ -455,5 +456,24 @@ enum CoreChecks {
               Slack.config(environment: ["FABLEMETER_SLACK_CONFIG": dir.path]) == SlackConfig(token: "xoxb-file", channel: "C2"), "")
         check("slack: half an environment pair is not a config",
               Slack.config(environment: ["FABLEMETER_SLACK_TOKEN": "x", "FABLEMETER_SLACK_CONFIG": "/nonexistent/x.json"]) == nil, "")
+    }
+
+    /// The saved-login health the CLI prints, and the reconnect it picks.
+    static func savedLogins(_ check: Check) {
+        let json = #"{"accounts":{"a":{"status":"expired","live":true,"detail":"x"},"C":{"status":"ok","live":false},"I":{"status":"bogus"}},"checkedAt":"t"}"#
+        let decoded = SavedLoginHealth.decode(Data(json.utf8))
+        check("saved login: labels upper-case and expired reads as signed out",
+              decoded?["A"]?.status == .expired && decoded?["A"]?.isSignedOut == true, "\(String(describing: decoded))")
+        check("saved login: ok is not signed out", decoded?["C"]?.isSignedOut == false, "")
+        check("saved login: an unknown status is dropped, never guessed", decoded?["I"] == nil, "")
+        check("saved login: not the CLI's shape decodes to nothing", SavedLoginHealth.decode(Data("[]".utf8)) == nil, "")
+        check("saved login: the live account reconnects by saving, with no browser",
+              decoded?["A"]?.reconnectArguments(label: "A") == ["swap", "--save", "A", "--agent", "ux", "--why", "reconnect from menu bar"], "")
+        check("saved login: any other account re-enrolls with --force",
+              decoded?["C"]?.reconnectArguments(label: "C") == ["swap", "--enroll", "C", "--agent", "ux", "--force"], "")
+        check("saved login: failure text drops the CLI prefix and keeps one line",
+              SavedLoginHealth.failureLine("noise\nfablemeter swap: approval timed out\n") == "approval timed out", "")
+        check("saved login: empty failure output still says something",
+              SavedLoginHealth.failureLine("") == "Didn't finish", "")
     }
 }

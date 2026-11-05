@@ -14,6 +14,18 @@ final class AppState: ObservableObject {
     @Published private(set) var budget: [String: BudgetEntry] = [:]
     private var budgetAttempt = Date.distantPast
     private var budgetFetching = false
+    /// Per label. Absent until the first read, which shows nothing rather than
+    /// a guess.
+    @Published private(set) var savedLogins: [String: SavedLoginHealth] = [:]
+    @Published private(set) var reconnects: [String: ReconnectProgress] = [:]
+    private var savedLoginAttempt = Date.distantPast
+    /// Both seams are replaceable so the demo render can drive the whole flow
+    /// against fixtures and never touch a real login.
+    var healthReader: @Sendable () -> Data? = { AppState.runCLI(["swap", "--health"], timeout: 20).stdout }
+    var reconnectRunner: @Sendable ([String], @escaping @Sendable (String) -> Void) -> (ok: Bool, stderr: String) = { arguments, _ in
+        let result = AppState.runCLI(arguments, timeout: 330)
+        return (result.status == 0, result.stderrText)
+    }
     @Published private(set) var accounts: [Account] = []
     @Published private(set) var states: [UUID: AccountState] = [:]
     @Published private(set) var history = UsageHistory(legacy: UsageHistory.legacyFile)
@@ -156,6 +168,7 @@ final class AppState: ObservableObject {
             while !Task.isCancelled {
                 await self?.refreshCodex()
                 await self?.refreshBudget()
+                await self?.refreshSavedLogins()
                 await self?.followIfFollowing()
                 await self?.refreshRemoteIfDue()
                 await self?.refresh(reason: .scheduled)
@@ -170,6 +183,69 @@ final class AppState: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in await self?.refresh(reason: .opportunistic) }
         }
+    }
+
+    private func refreshSavedLogins(force: Bool = false) async {
+        guard !isDemo || force, force || Date().timeIntervalSince(savedLoginAttempt) >= 60 else { return }
+        savedLoginAttempt = Date()
+        let reader = healthReader
+        let data = await Task.detached(priority: .utility) { reader() }.value
+        if let data, let decoded = SavedLoginHealth.decode(data) { savedLogins = decoded }
+    }
+
+    /// Runs the CLI flow for one account and reports into its row. A second
+    /// click while one is in flight is refused: an enroll holds a loopback
+    /// listener and a browser tab.
+    func reconnect(label: String) {
+        let key = label.uppercased()
+        guard let health = savedLogins[key] else { return }
+        if case .running = reconnects[key] { return }
+        reconnects[key] = .running(health.isLive ? "Saving…" : "Approve in browser…")
+        let arguments = health.reconnectArguments(label: key)
+        let runner = reconnectRunner
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { runner(arguments) { _ in } }.value
+            if result.ok {
+                reconnects[key] = .done
+                await refreshSavedLogins(force: true)
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if reconnects[key] == .done { reconnects[key] = nil }
+            } else {
+                reconnects[key] = .failed(SavedLoginHealth.failureLine(result.stderr))
+                await refreshSavedLogins(force: true)
+            }
+        }
+    }
+
+    /// Demo only: put the rows in a chosen state without a CLI.
+    func applyDemoSavedLogins(_ logins: [String: SavedLoginHealth], reconnects: [String: ReconnectProgress] = [:]) {
+        guard isDemo else { return }
+        savedLogins = logins
+        self.reconnects = reconnects
+    }
+
+    nonisolated static func runCLI(_ arguments: [String], timeout: TimeInterval) -> (status: Int32, stdout: Data?, stderrText: String) {
+        let process = Process()
+        process.executableURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/bin/fablemeter")
+        process.arguments = arguments
+        let out = Pipe(), err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        process.standardInput = FileHandle.nullDevice
+        do { try process.run() } catch { return (-1, nil, "Couldn't start fablemeter") }
+        let killer = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
+        // stderr is drained on its own thread so a chatty CLI cannot fill the pipe and stall.
+        var errData = Data()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async { errData = err.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        group.wait()
+        killer.cancel()
+        return (process.terminationStatus, process.terminationStatus == 0 ? data : nil,
+                String(decoding: errData, as: UTF8.self))
     }
 
     private func refreshCodex(force: Bool = false) async {
@@ -602,6 +678,7 @@ final class AppState: ObservableObject {
             defer { isManualRefreshing = false }
             let started = Date()
             await refreshCodex(force: true)
+            await refreshSavedLogins(force: true)
             // A follower's refresh is asking the web for the server's latest,
             // never Anthropic.
             if isFollowingServer { await followIfFollowing(force: true) }
@@ -628,7 +705,7 @@ final class AppState: ObservableObject {
     /// screen has actually gone stale.
     func refreshIfStale() {
         guard !isDemo else { return }
-        Task { await refreshCodex(); await refresh(reason: .opportunistic) }
+        Task { await refreshCodex(); await refreshSavedLogins(); await refresh(reason: .opportunistic) }
     }
 
     private static func load(_ account: Account, vault: TokenVault) async -> FetchOutcome {

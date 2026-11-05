@@ -70,6 +70,13 @@ if let index = CommandLine.arguments.firstIndex(of: "--render-popover") {
     exit(MainActor.assumeIsolated { RenderPopover.run(into: directory) })
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--render-reconnect") {
+    let directory = CommandLine.arguments.dropFirst(index + 1).first ?? "."
+    let application = NSApplication.shared
+    application.setActivationPolicy(.prohibited)
+    exit(MainActor.assumeIsolated { RenderReconnect.run(into: directory) })
+}
+
 if let index = CommandLine.arguments.firstIndex(of: "--callback-loop") {
     let rest = CommandLine.arguments.dropFirst(index + 1).compactMap(Int.init)
     exit(CallbackLoop.run(cycles: rest.first ?? 3, delayMilliseconds: rest.dropFirst().first ?? 0))
