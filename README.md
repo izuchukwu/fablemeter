@@ -96,9 +96,17 @@ a hollow gauge, which is what tells you it is no longer live.
 
 ## Codex
 
-The popover also shows this Mac's Codex five-hour and weekly percentages used, reset times and
+The menu bar shows Codex as one more gauge labelled `X`, after the Claude
+accounts. It is the same gauge as theirs, measuring Codex's weekly headroom (`100 − weekly%`),
+with the same orange and red tiers and the same hollow track when the newest
+read failed. **Show Codex in Menu Bar** in the `…` menu turns it off and on
+(on by default, remembered across launches). A Mac with no `codex-quota` draws
+no Codex gauge either way.
+
+The popover also shows this Mac's Codex weekly percentage used (and the
+five-hour one, only when Codex reports such a window), reset times and
 banked reset credits, using `~/.claude/bin/codex-quota --json`. It reads the
-windows regardless of whether they are primary or secondary. An absent five-hour window shows no data. The row warns
+windows regardless of whether they are primary or secondary. The row warns
 at 90% used and says **Ask for reset** at 95%. An unavailable reading is shown
 as no data, or as stale if a previous reading exists. It refreshes about every
 five minutes and with manual refresh. Codex is display-only and does not affect
@@ -166,6 +174,7 @@ without a relaunch.
 | Flag | What it does |
 | --- | --- |
 | `--selftest` | Decodes an embedded usage fixture, walks the polling and backoff schedules, and exercises token rotation — single-flight refresh, persist-before-return, and the terminal `needs sign-in` state — with no network. Also runs the callback-loop checks below, so consecutive reconnects stay covered. |
+| `--check-expansion` | Opens a real popover with demo accounts, samples account and popover screen frames on each display callback during expansion and collapse, and checks anchoring, translation, monotonic height, delayed opacity, reversal and Reduce Motion. Prints every sample and exits nonzero on failure. Requires a macOS GUI session. |
 | `--callback-loop [cycles] [delayMs]` | Runs the sign-in's loopback listener over and over in one process — bind, receive the redirect, tear down — plus an abandoned flow that never gets a redirect. No browser, no credentials. This is the second reconnect in a session, on its own. |
 | `--slack-test` | Posts one line to the Slack channel in `slack.json` and exits 0 if Slack took it, 1 if there is no readable config or the post was refused. Proves the mirror without waiting for a real threshold to be crossed. |
 | `--probe` | Reads Claude Code's existing access token read-only and prints live parsed buckets. Never writes or refreshes it. |

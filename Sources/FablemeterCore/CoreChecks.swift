@@ -49,6 +49,12 @@ enum CoreChecks {
             var pruned = UsageHistory(file: file, now: later)
             try pruned.record(UsageSample(accountID: a, date: later, percent: 0), now: later)
             check("history: prunes and persists retention", UsageHistory(file: file, now: later).samples.count == 1, "")
+            let moved = dir.appendingPathComponent("new/history.json")
+            var migrated = UsageHistory(file: moved, legacy: file, now: later)
+            check("history: an old file is read when the new one does not exist yet", migrated.samples.count == 1, "")
+            try migrated.record(UsageSample(accountID: b, date: later, percent: 5), now: later)
+            check("history: the next save lands at the new path", UsageHistory(file: moved, now: later).samples.count == 2, "")
+            check("history: once the new file exists the old one is ignored", UsageHistory(file: moved, legacy: file, now: later).samples.count == 2, "")
         } catch {
             check("history: persistence", false, "\(error)")
         }

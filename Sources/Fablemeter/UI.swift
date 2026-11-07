@@ -126,6 +126,11 @@ enum MetricDisplay {
     }
 }
 
+enum UsageColumns {
+    static let percent: CGFloat = 44
+    static let reset: CGFloat = 66
+}
+
 struct MetricRow: View {
     let title: String
     let bucket: UsageBucket?
@@ -134,11 +139,10 @@ struct MetricRow: View {
     let isUnreachable: Bool
     var tintOverride: Color? = nil
 
-    /// Columns are sized off the widest string each can hold at its own weight:
-    /// `100%` measures 32.2pt at 11pt medium, `Wed 12 PM` 61.2pt at 11pt
-    /// regular. Both are pinned so neither can ever wrap again.
-    private static let percentWidth: CGFloat = 36
-    private static let resetWidth: CGFloat = 66
+    /// Share column widths with the budget row so every percentage and reset
+    /// lines up, including a budget percentage above 100%.
+    private static let percentWidth: CGFloat = UsageColumns.percent
+    private static let resetWidth: CGFloat = UsageColumns.reset
 
     private var percent: Double { bucket?.percent ?? 0 }
     private var tint: Color { tintOverride ?? Verdict.color(usedPercent: percent) }
@@ -210,16 +214,66 @@ struct LabelToken: View {
 
 // MARK: - Account
 
+/// The self-imposed 5-hour budget, drawn in the metric rows' own grammar: the
+/// meter and percentage show the share of the cap spent; the last column
+/// says when the window ends.
+struct BudgetRow: View {
+    let entry: BudgetEntry
+    let now: Date
+    let isUnreachable: Bool
+
+    private var tint: Color {
+        if entry.capped { return .red }
+        if entry.fractionOfCap >= 80 { return .orange }
+        return .secondary
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("5h")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(width: 44, alignment: .leading)
+            UsageMeter(
+                percent: entry.fractionOfCap,
+                tint: tint == .secondary ? Color.primary.opacity(0.55) : tint,
+                isUnreachable: isUnreachable || entry.usedPercent == nil
+            )
+            Text(entry.text)
+                .font(.system(size: 11, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(tint)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: UsageColumns.percent, alignment: .trailing)
+            Text(entry.active ? Format.resetStamp(entry.windowEnd, from: now) : "idle")
+                .font(.system(size: 11))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: UsageColumns.reset, alignment: .trailing)
+        }
+    }
+}
+
 struct AccountRow: View {
     enum Field: Hashable { case label, name }
 
     let row: DisplayRow
+    var isActive = false
     let history: UsageHistory
     let now: Date
+    /// The account's 5-hour budget, when the CLI reports one.
+    var budget: BudgetEntry? = nil
+    var resetWindow: (() -> Void)? = nil
+    var selectAccount: (() -> Void)? = nil
+    var canSelectAccount = false
     /// The verdict word is the gauge's reading put into words, so it follows
     /// the same policy the gauge does — the metric rows underneath do not: the
     /// Fable row keeps printing whatever the server said either way.
     let fableFirst: Bool
+    var showsFableBars = true
     /// Bumped when something outside the row is clicked — the cue to commit any
     /// in-place edit and give up focus.
     let dismissToken: Int
@@ -238,8 +292,8 @@ struct AccountRow: View {
     let signOut: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var expanded = false
-    @State private var historyWindow: HistoryWindow = .fiveHours
+    @Environment(\.historyViewport) private var historyViewport
+    @StateObject private var expansion = HistoryExpansion()
     @State private var editingLabel = false
     @State private var editingName = false
     @State private var labelDraft = ""
@@ -264,20 +318,29 @@ struct AccountRow: View {
     private var verdict: (text: String, color: Color) {
         if let error = state?.error { return (error, .orange) }
         guard state?.snapshot != nil else { return ("—", .secondary) }
+        if budget?.capped == true { return ("Capped", .red) }
         return (Verdict.word(headroom: headroom), Verdict.color(headroom: headroom))
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             accountBlock
+                .background(LayoutFrameProbe(id: "account-\(row.id)"))
             historyGraph
                 .padding(.leading, 44)
                 .padding(.trailing, 14)
                 .padding(.top, 10)
-                .frame(height: expanded ? 130 : 0, alignment: .top)
+                .frame(height: 130, alignment: .top)
+                .opacity(expansion.opacity)
+                .frame(height: expansion.height, alignment: .top)
                 .clipped()
-                .allowsHitTesting(expanded)
-                .accessibilityHidden(!expanded)
+                .background(LayoutFrameProbe(id: "graph-\(row.id)"))
+                .allowsHitTesting(expansion.expanded)
+                .accessibilityHidden(!expansion.expanded)
+        }
+        .onAppear {
+            expansion.viewport = historyViewport
+            if ExpansionCheck.enabled { ExpansionCheck.expansions["\(row.id)"] = expansion }
         }
     }
 
@@ -294,6 +357,7 @@ struct AccountRow: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    HStack(alignment: .center, spacing: 4) {
                     if editingName {
                         TextField("", text: $nameDraft)
                             .textFieldStyle(.plain)
@@ -305,6 +369,13 @@ struct AccountRow: View {
                             .font(.system(size: 12, weight: .semibold))
                             .lineLimit(1)
                             .onTapGesture(count: 2) { if !isReadOnly { beginNameEdit() } }
+                    }
+                    if isActive {
+                        Circle()
+                            .fill(Color.secondary.opacity(0.55))
+                            .frame(width: 5, height: 5)
+                            .accessibilityLabel("Active account")
+                    }
                     }
                     Spacer(minLength: 6)
                     if needsSignIn && !isReadOnly {
@@ -332,18 +403,21 @@ struct AccountRow: View {
 
                 if showsMetrics {
                     VStack(alignment: .leading, spacing: 3) {
-                        MetricRow(
-                            title: "5-hour", bucket: state?.snapshot?.fiveHour,
-                            now: now, isUnreachable: isUnreachable
-                        )
+                        if let budget {
+                            BudgetRow(entry: budget, now: now, isUnreachable: isUnreachable)
+                        } else {
+                            MetricRow(title: "5h", bucket: state?.snapshot?.fiveHour, now: now, isUnreachable: isUnreachable)
+                        }
                         MetricRow(
                             title: "Weekly", bucket: state?.snapshot?.weekly,
                             now: now, isUnreachable: isUnreachable
                         )
-                        MetricRow(
-                            title: "Fable", bucket: state?.snapshot?.fable,
-                            now: now, isUnreachable: isUnreachable
-                        )
+                        if showsFableBars {
+                            MetricRow(
+                                title: "Fable", bucket: state?.snapshot?.fable,
+                                now: now, isUnreachable: isUnreachable
+                            )
+                        }
                     }
                     .padding(.top, 5)
                 }
@@ -359,9 +433,18 @@ struct AccountRow: View {
         .contentShape(Rectangle())
         .onTapGesture {
             guard !editingLabel && !editingName else { return }
-            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.25)) { expanded.toggle() }
+            expansion.toggle(reduceMotion: reduceMotion)
         }
         .contextMenu {
+            if let selectAccount {
+                Button("Use This Account", action: selectAccount).disabled(!canSelectAccount)
+                Divider()
+            }
+            // The budget is this Mac's own, so even a server row can reset it.
+            if let resetWindow, budget != nil {
+                Button("Reset 5-Hour Window", action: resetWindow)
+                if !isReadOnly { Divider() }
+            }
             // A server row belongs to the server; there is nothing here to do
             // to it.
             if !isReadOnly {
@@ -390,51 +473,13 @@ struct AccountRow: View {
         .onDisappear {
             commitLabel()
             commitName()
+            expansion.finish()
         }
     }
 
     private var historyGraph: some View {
-        let points = row.local.map { history.slice(accountID: $0.id, window: historyWindow, now: now) } ?? []
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("5-hour usage")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Picker("History window", selection: $historyWindow) {
-                    ForEach(HistoryWindow.allCases, id: \.self) { window in
-                        Text(window.rawValue).tag(window)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 120)
-            }
-            if points.isEmpty {
-                Text(row.local == nil ? "History unavailable for server accounts" : "No history yet")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 70)
-            } else {
-                Chart(points.indices, id: \.self) { index in
-                    let point = points[index]
-                    LineMark(x: .value("Time", point.date), y: .value("Used", point.percent))
-                    PointMark(x: .value("Time", point.date), y: .value("Used", point.percent))
-                        .symbolSize(points.count == 1 ? 20 : 0)
-                }
-                .chartXScale(domain: now.addingTimeInterval(-historyWindow.duration)...now)
-                .chartYScale(domain: 0...100)
-                .chartXAxis(.hidden)
-                .chartYAxis {
-                    AxisMarks(position: .leading, values: [0, 50, 100]) { value in
-                        AxisGridLine()
-                        AxisValueLabel { if let number = value.as(Int.self) { Text("\(number)%").font(.system(size: 9)) } }
-                    }
-                }
-                .frame(height: 70)
-                Text("History since " + points[0].date.formatted(date: .abbreviated, time: .shortened))
-                    .font(.system(size: 9)).foregroundStyle(.secondary)
-            }
-        }
+        HistoryGraph(history: history, accountID: row.local?.id,
+                     metric: state?.snapshot?.fiveHour?.percent == nil ? .weekly : .fiveHour, now: now)
     }
 
     private func beginLabelEdit() {
@@ -537,12 +582,75 @@ struct AccountDropDelegate: DropDelegate {
     }
 }
 
+struct HistoryGraph: View {
+    let history: UsageHistory
+    let accountID: UUID?
+    let now: Date
+    @State private var metric: HistoryMetric
+    @State private var historyWindow: HistoryWindow = .fiveHours
+
+    init(history: UsageHistory, accountID: UUID?, metric: HistoryMetric, now: Date) {
+        self.history = history; self.accountID = accountID; self.now = now
+        _metric = State(initialValue: metric)
+    }
+
+    var body: some View {
+        let points = accountID.map { history.slice(accountID: $0, window: historyWindow, now: now, metric: metric) } ?? []
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Picker("Usage metric", selection: $metric) {
+                    Text("5-hour").tag(HistoryMetric.fiveHour)
+                    Text("Weekly").tag(HistoryMetric.weekly)
+                }
+                .labelsHidden()
+                .frame(width: 105)
+                Spacer()
+                Picker("History window", selection: $historyWindow) {
+                    ForEach(HistoryWindow.allCases, id: \.self) { window in
+                        Text(window.rawValue).tag(window)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 120)
+            }
+            if points.isEmpty {
+                Text(accountID == nil ? "History unavailable for server accounts" : "No history yet")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 70)
+            } else {
+                Chart(points.indices, id: \.self) { index in
+                    let point = points[index]
+                    LineMark(x: .value("Time", point.date), y: .value("Used", point.percent))
+                    PointMark(x: .value("Time", point.date), y: .value("Used", point.percent))
+                        .symbolSize(points.count == 1 ? 20 : 0)
+                }
+                .chartXScale(domain: now.addingTimeInterval(-historyWindow.duration)...now)
+                .chartYScale(domain: 0...100)
+                .chartXAxis(.hidden)
+                .chartYAxis {
+                    AxisMarks(position: .leading, values: [0, 50, 100]) { value in
+                        AxisGridLine()
+                        AxisValueLabel { if let number = value.as(Int.self) { Text("\(number)%").font(.system(size: 9)) } }
+                    }
+                }
+                .frame(height: 70)
+                Text("History since " + points[0].date.formatted(date: .abbreviated, time: .shortened))
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+ }
+
 // MARK: - Popover
 
 struct CodexRow: View {
     let reading: CodexReading?
     let stale: Bool
     let now: Date
+    let history: UsageHistory
+    @State private var expanded = false
 
     private var color: Color {
         guard let percent = reading?.weekly.percent else { return .secondary }
@@ -552,8 +660,9 @@ struct CodexRow: View {
     }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
         HStack(alignment: .top, spacing: 10) {
-            Text("C")
+            Text(String(BarRenderer.codexCharacter))
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .frame(width: 20, height: 20)
                 .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.secondary.opacity(0.15)))
@@ -564,13 +673,28 @@ struct CodexRow: View {
                     Text(stale ? (reading == nil ? "No data" : "Stale") : (reading?.verdict ?? "—"))
                         .font(.system(size: 11)).foregroundStyle(stale ? Color.orange : color)
                 }
-                Text(reading?.resetCredits.map { "\($0) reset credit\($0 == 1 ? "" : "s")" } ?? "Reset credits: —")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-                MetricRow(title: "5-hour", bucket: reading?.fiveHour, now: now, isUnreachable: stale)
-                    .padding(.top, 5)
+                if let credits = reading?.resetCredits {
+                    Text("\(credits) reset credit\(credits == 1 ? "" : "s")")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                // Codex's plan may carry no five-hour window at all; an empty
+                // row for a limit that does not exist is noise, so it only
+                // appears when the server reports one.
+                if let fiveHour = reading?.fiveHour {
+                    MetricRow(title: "5-hour", bucket: fiveHour, now: now, isUnreachable: stale)
+                        .padding(.top, 5)
+                }
                 MetricRow(title: "Weekly", bucket: reading?.weekly, now: now, isUnreachable: stale, tintOverride: color)
                     .padding(.top, 5)
             }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation { expanded.toggle() } }
+        if expanded {
+            HistoryGraph(history: history, accountID: UsageHistory.codexID,
+                         metric: reading?.fiveHour?.percent == nil ? .weekly : .fiveHour, now: now)
+                .padding(.leading, 30).padding(.top, 10)
+        }
         }
         .padding(.horizontal, 14)
         .padding(.top, 16)
@@ -606,7 +730,7 @@ struct PopoverView: View {
                         rowView(row, now: context.date)
                     }
                     if !state.displayRows(now: context.date).isEmpty { Divider() }
-                    CodexRow(reading: state.codex, stale: state.codexStale, now: context.date)
+                    CodexRow(reading: state.codex, stale: state.codexStale, now: context.date, history: state.history)
                 }
             }
 
@@ -629,6 +753,7 @@ struct PopoverView: View {
         .onAppear {
             draggingID = nil
             state.refreshIfStale()
+            Task { await state.refreshBudget(force: true) }
             installClickMonitor()
         }
         .onDisappear {
@@ -641,9 +766,15 @@ struct PopoverView: View {
     private func rowView(_ row: DisplayRow, now: Date) -> some View {
         let base = AccountRow(
             row: row,
+            isActive: state.isActiveAccount(row),
             history: state.history,
             now: now,
+            budget: state.budget(for: row.label),
+            resetWindow: { state.resetBudgetWindow(label: row.label) },
+            selectAccount: { state.selectAccount(row) },
+            canSelectAccount: state.canSelectAccount,
             fableFirst: state.isFableFirst,
+            showsFableBars: state.showsFableBars,
             dismissToken: dismissToken,
             canMoveUp: row.local.map { state.canMove($0, by: -1) } ?? false,
             canMoveDown: row.local.map { state.canMove($0, by: 1) } ?? false,
@@ -725,6 +856,15 @@ struct PopoverView: View {
                     )
 
                     Menu {
+                        Menu("Switch Account") {
+                            ForEach(state.displayRows(now: Date()), id: \.id) { row in
+                                Button { state.selectAccount(row) } label: {
+                                    if state.isActiveAccount(row) { Label(row.nickname, systemImage: "checkmark") }
+                                    else { Text(row.nickname) }
+                                }
+                            }
+                        }
+                        .disabled(!state.canSelectAccount)
                         Button("Add Account…") { state.addAccount() }
                             .disabled(!state.canAddAccount)
                         Button("Connect to Fablemeter Web…") { state.connectWeb() }
@@ -737,7 +877,22 @@ struct PopoverView: View {
                                 set: { LoginItem.set($0) }
                             ))
                         }
+                        Toggle("Show Fable Usage Bars", isOn: $state.showsFableBars)
                         Toggle("Fable-first", isOn: $state.isFableFirst)
+                        Toggle("Show Codex in Menu Bar", isOn: $state.showsCodexInMenuBar)
+                        if !state.budget.isEmpty {
+                            Menu("Reset 5-Hour Window") {
+                                Button("All Accounts") { state.resetBudgetWindow(label: nil) }
+                                Divider()
+                                ForEach(state.displayRows(now: Date())) { row in
+                                    if let entry = state.budget(for: row.label) {
+                                        Button("\(row.nickname)  \(entry.text)") {
+                                            state.resetBudgetWindow(label: row.label)
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         Menu("Warnings") {
                             Toggle("Warn at 75%", isOn: $state.warnAt75)
                             Toggle("Warn at 90%", isOn: $state.warnAt90)

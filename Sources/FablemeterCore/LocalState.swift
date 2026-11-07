@@ -61,6 +61,24 @@ enum ActiveAccount {
         let hits = accounts.filter { normalize($0.email) == needle }
         return hits.count == 1 ? hits[0].id : nil
     }
+
+    /// The account UUID decides first, because it is the identity a sign-in
+    /// is checked against and survives an account with no address or two
+    /// accounts on one address. The address is the fallback for rows whose
+    /// UUID was never recorded. An ambiguous UUID is still not an answer.
+    static func match(accountId: String?, email: String?, accounts: [Account], ids: [UUID: String]) -> UUID? {
+        if let accountId = AccountIdentity.normalize(accountId) {
+            let hits = accounts.filter { ids[$0.id] == accountId }
+            if hits.count == 1 { return hits[0].id }
+            if hits.count > 1 { return nil }
+        }
+        return match(email: email, accounts: accounts)
+    }
+
+    /// This machine's signed-in account among `accounts`, read fresh.
+    static func localMatch(accounts: [Account]) -> UUID? {
+        match(accountId: signedInAccountId(), email: signedInEmail(), accounts: accounts, ids: AccountIdentity.load())
+    }
 }
 
 // MARK: - The local read rail

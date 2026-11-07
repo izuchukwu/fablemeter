@@ -43,10 +43,15 @@ struct CodexReading {
             resetCredits: count.flatMap { $0.isFinite && $0 >= 0 && $0 < 1_000_000 && $0.rounded() == $0 ? Int($0) : nil })
     }
 
+    static var quotaTool: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/bin/codex-quota")
+    }
+
+    static var isAvailable: Bool { FileManager.default.isExecutableFile(atPath: quotaTool.path) }
+
     static func fetch() -> CodexReading? {
         let process = Process()
-        process.executableURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/bin/codex-quota")
+        process.executableURL = quotaTool
         process.arguments = ["--json"]
         let output = Pipe()
         process.standardOutput = output

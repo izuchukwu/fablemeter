@@ -9,9 +9,14 @@ final class AppState: ObservableObject {
     @Published private(set) var codexStale = false
     private var codexAttempt = Date.distantPast
     private var codexFetching = false
+    /// The self-imposed 5-hour budget, by account label, as the `fablemeter`
+    /// CLI computes it. Empty on a Mac without the CLI, and in demo mode.
+    @Published private(set) var budget: [String: BudgetEntry] = [:]
+    private var budgetAttempt = Date.distantPast
+    private var budgetFetching = false
     @Published private(set) var accounts: [Account] = []
     @Published private(set) var states: [UUID: AccountState] = [:]
-    @Published private(set) var history = UsageHistory()
+    @Published private(set) var history = UsageHistory(legacy: UsageHistory.legacyFile)
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var isRefreshing = false
     /// True only while a refresh the *user* asked for is in flight. The footer's
@@ -53,9 +58,19 @@ final class AppState: ObservableObject {
     /// rather than `bool(forKey:)` on purpose: an absent key means the default,
     /// and only a stored `false` means the user turned it off — the same
     /// missing-versus-reported distinction the readings themselves live by.
+    @Published var showsFableBars: Bool = UserDefaults.standard.object(forKey: "showsFableBars") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showsFableBars, forKey: "showsFableBars") }
+    }
     @Published var isFableFirst: Bool = UserDefaults.standard
         .object(forKey: "fableFirst") as? Bool ?? true {
         didSet { UserDefaults.standard.set(isFableFirst, forKey: "fableFirst") }
+    }
+    /// Whether the Codex gauge joins the menu bar cluster. Same absent-key-
+    /// means-default pattern: on unless the user turned it off. The popover's
+    /// Codex row is unaffected.
+    @Published var showsCodexInMenuBar: Bool = UserDefaults.standard
+        .object(forKey: "showCodexInMenuBar") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showsCodexInMenuBar, forKey: "showCodexInMenuBar") }
     }
     /// The warning toggles, same absent-key-means-default pattern as above.
     /// All default ON: this feature exists because a window went 0 to 100 in
@@ -114,6 +129,13 @@ final class AppState: ObservableObject {
             states = seeded.states
             lastUpdated = Date()
             codex = CodexReading(weekly: UsageBucket(id: "codex-weekly", label: "Weekly", percent: 91, resetsAt: Date().addingTimeInterval(86400)), resetCredits: 1)
+            // One account of each budget state, so a render shows them all.
+            let soon = Date().addingTimeInterval(2 * 3600)
+            budget = [
+                "P": BudgetEntry(label: "P", capPercent: 10, usedPercent: 0, capped: false, active: false, windowEnd: nil),
+                "W": BudgetEntry(label: "W", capPercent: 10, usedPercent: 10, capped: true, active: true, windowEnd: soon),
+                "T": BudgetEntry(label: "T", capPercent: 10, usedPercent: 8, capped: false, active: true, windowEnd: soon),
+            ]
             return
         }
         accounts = Store.load()
@@ -133,6 +155,7 @@ final class AppState: ObservableObject {
             await self?.settleRoleAtLaunch()
             while !Task.isCancelled {
                 await self?.refreshCodex()
+                await self?.refreshBudget()
                 await self?.followIfFollowing()
                 await self?.refreshRemoteIfDue()
                 await self?.refresh(reason: .scheduled)
@@ -154,10 +177,72 @@ final class AppState: ObservableObject {
         codexFetching = true
         codexAttempt = Date()
         let reading = await Task.detached(priority: .utility) { CodexReading.fetch() }.value
-        if let reading { codex = reading; codexStale = false }
+        if let reading {
+            codex = reading; codexStale = false
+            do {
+                try history.record(accountID: UsageHistory.codexID, date: Date(), fiveHour: reading.fiveHour?.percent, weekly: reading.weekly.percent)
+            } catch { Log.usage.error("Could not save usage history: \(error.localizedDescription)") }
+        }
         else { codexStale = true }
         codexFetching = false
     }
+
+    /// Every 30s while the loop runs, and on demand. The CLI ticks the windows
+    /// as it answers, so this is also what keeps them moving when the cascade
+    /// is not running.
+    func refreshBudget(force: Bool = false) async {
+        guard !isDemo, !budgetFetching, Budget.isAvailable,
+              force || Date().timeIntervalSince(budgetAttempt) >= 30 else { return }
+        budgetFetching = true
+        budgetAttempt = Date()
+        let reading = await Task.detached(priority: .utility) { Budget.fetch() }.value
+        if let reading, reading != budget { budget = reading }
+        budgetFetching = false
+    }
+
+    /// "Reset 5-Hour Window": a fresh window starts now, for one account or all.
+    func resetBudgetWindow(label: String?) {
+        guard !isDemo, Budget.isAvailable else { return }
+        Task { @MainActor in
+            _ = await Task.detached(priority: .userInitiated) { Budget.reset(label: label) }.value
+            await refreshBudget(force: true)
+        }
+    }
+
+    func budget(for label: String) -> BudgetEntry? { budget[label.uppercased()] }
+
+    @Published private(set) var isSelectingAccount = false
+
+    var canSelectAccount: Bool {
+        !isDemo && !isSelectingAccount && !isSigningIn && !isPromoting && Budget.isAvailable
+    }
+
+    /// The Anthropic account UUID behind a row: the switch is bound to it, not
+    /// to the editable label, so a renamed label can never pick another account.
+    func accountUUID(for row: DisplayRow) -> String? {
+        if let local = row.local { return AccountIdentity.load()[local.id] }
+        guard row.id.hasPrefix("server:"), let followed else { return nil }
+        return AccountIdentity.normalize(followed.accounts.first { "server:\($0.rowId)" == row.id }?.accountId)
+    }
+
+    func selectAccount(_ row: DisplayRow) {
+        guard canSelectAccount else { return }
+        guard let accountId = accountUUID(for: row) else {
+            signInError = "Fablemeter does not know which account \(row.nickname) is yet. Reconnect it once."
+            return
+        }
+        isSelectingAccount = true
+        signInError = nil
+        Task {
+            let error = await Task.detached(priority: .userInitiated) {
+                AccountSelection.select(accountId: accountId)
+            }.value
+            isSelectingAccount = false
+            signInError = error
+            await refreshBudget(force: true)
+        }
+    }
+
 
     /// A promotion owns the sign-in while it runs: a second browser flow would
     /// race it for the loopback listener and the person's attention.
@@ -169,8 +254,11 @@ final class AppState: ObservableObject {
     var barCells: [BarCell] {
         if isFollowingServer, let followed, !followed.accounts.isEmpty {
             let now = Date()
-            return followed.accounts.map {
-                BarCell.cell(character: $0.character, state: followed.state(for: $0, now: now), fableFirst: isFableFirst)
+            return followed.accounts.map { account in
+                var cell = BarCell.cell(character: account.character, state: followed.state(for: account, now: now), fableFirst: isFableFirst,
+                             isCapped: budget(for: account.label)?.capped == true)
+                if let row = followedRows(now: now)?.first(where: { $0.id == "server:\(account.rowId)" }) { cell.isActive = isActiveAccount(row) }
+                return cell
             }
         }
         return accounts.map { account in
@@ -179,12 +267,28 @@ final class AppState: ObservableObject {
             // resets — no relaunch, and per account. The Fable-first toggle
             // repaints the same way: it is `@Published`, so flipping it redraws
             // every cell through the same factory the selftest exercises.
-            BarCell.cell(
+            var cell = BarCell.cell(
                 character: account.character,
                 state: states[account.id],
-                fableFirst: isFableFirst
+                fableFirst: isFableFirst,
+                isCapped: budget(for: account.label)?.capped == true
             )
+            cell.isActive = ActiveAccount.localMatch(accounts: accounts) == account.id
+            return cell
         }
+    }
+
+    /// The Codex gauge for the menu bar, after the Claude cells: weekly headroom,
+    /// hollow when the newest read failed. `nil` on a machine with no
+    /// `codex-quota`, so a Mac that does not run Codex gets no dead gauge, and
+    /// `nil` when "Show Codex in Menu Bar" is off.
+    var codexCell: BarCell? {
+        guard showsCodexInMenuBar, isDemo || CodexReading.isAvailable else { return nil }
+        return BarCell(
+            character: BarRenderer.codexCharacter,
+            headroom: codex?.weekly.percent.map { max(0, 100 - $0) },
+            isUnreachable: codexStale
+        )
     }
 
     func state(for account: Account) -> AccountState? { states[account.id] }
@@ -290,11 +394,11 @@ final class AppState: ObservableObject {
         case .success(let snapshot):
             schedule.recordSuccess()
             lastUpdated = Date()
-            if !isDemo, let percent = snapshot.fiveHour?.percent {
+            if !isDemo {
                 do {
-                    try history.record(UsageSample(accountID: account.id, date: snapshot.fetchedAt, percent: percent))
+                    try history.record(accountID: account.id, date: snapshot.fetchedAt, fiveHour: snapshot.fiveHour?.percent, weekly: snapshot.weekly?.percent)
                 } catch {
-                    Log.usage.error("Could not save usage history")
+                    Log.usage.error("Could not save usage history: \(error.localizedDescription)")
                 }
             }
             // The poll already happened, so the shape of what it decoded is
@@ -853,6 +957,16 @@ final class AppState: ObservableObject {
         }
     }
 
+    func isActiveAccount(_ row: DisplayRow) -> Bool {
+        if row.id.hasPrefix("server:"), let followed,
+           let activeID = ActiveAccount.signedInAccountId() {
+            let matches = followed.accounts.filter { $0.accountId == activeID }
+            return matches.count == 1 && row.id == "server:\(matches[0].rowId)"
+        }
+        guard let local = row.local else { return false }
+        return ActiveAccount.localMatch(accounts: accounts) == local.id
+    }
+
     /// The footer's line: whose numbers these are and how old.
     func footerText(now: Date) -> String {
         if let promotionStep { return promotionStep }
@@ -1138,6 +1252,15 @@ final class AppState: ObservableObject {
                 promotionStep = PromoteSequence.stepText(nickname: "Charm", index: 2, count: 3)
             }
         }
+    }
+
+    /// `--render-live`: the gauge's own on-disk snapshot and the CLI's budget,
+    /// drawn through the follower path so nothing polls, refreshes or writes.
+    func applyLiveSnapshot(_ snapshot: [String: Any], budget entries: [String: BudgetEntry]) {
+        guard isDemo else { return }
+        followed = FollowedSnapshot.decode(snapshot)
+        isFollowingServer = true
+        budget = entries
     }
 
     // MARK: Demo

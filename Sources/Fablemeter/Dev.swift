@@ -66,6 +66,21 @@ enum SelfTest {
         check("Codex HTTP five-hour secondary", codexFixture(0)?.fiveHour?.percent == 23 && codexFixture(0)?.fiveHour?.resetsAt == Date(timeIntervalSince1970: 1790001000))
         check("Codex app-server five-hour primary", codexFixture(0, appServer: true)?.fiveHour?.percent == 10)
         check("Codex missing data is unknown", CodexReading.decode(Data("{}".utf8)) == nil)
+        do {
+            let claude = [BarCell(character: "I", headroom: 70, isUnreachable: false)]
+            let codexCell = BarCell(character: BarRenderer.codexCharacter, headroom: 92, isUnreachable: false)
+            let plain = BarRenderer.image(for: claude).size.width
+            let withCodex = BarRenderer.image(for: claude, codex: codexCell).size.width
+            check("Codex adds exactly one cell to the menu bar, no separator",
+                  withCodex == plain + BarRenderer.cellWidth + BarRenderer.cellSpacing)
+            check("Codex letter is X, not a Claude account letter", BarRenderer.codexCharacter == "X")
+            check("A healthy Codex gauge keeps the cluster a template image",
+                  BarRenderer.image(for: claude, codex: codexCell).isTemplate)
+            check("A low Codex gauge takes the warning colour",
+                  !BarRenderer.image(for: claude, codex: BarCell(character: "X", headroom: 8, isUnreachable: false)).isTemplate)
+            check("No Claude accounts still draws the empty mark, Codex or not",
+                  BarRenderer.image(for: [], codex: codexCell).size.width == BarRenderer.image(for: []).size.width)
+        }
 
         let stamp = "2026-08-12T01:40:00.087143+00:00"
         let parsed = ISODate.parse(stamp)
@@ -2101,6 +2116,15 @@ enum SelfTest {
                   ActiveAccount.match(email: "izu@example.com", accounts: accounts) == personal.id)
             check("active: case and padding do not hide a match",
                   ActiveAccount.match(email: "  IZU@Example.COM \n", accounts: accounts) == personal.id)
+            let uuidP = "11111111-1111-4111-8111-111111111111", uuidC = "22222222-2222-4222-8222-222222222222"
+            let ids = [personal.id: uuidP, charm.id: uuidC]
+            check("active: the signed-in account UUID picks its account, whatever the address",
+                  ActiveAccount.match(accountId: uuidC.uppercased(), email: "izu@example.com", accounts: accounts, ids: ids) == charm.id)
+            check("active: an unrecorded UUID falls back to the address",
+                  ActiveAccount.match(accountId: "33333333-3333-4333-8333-333333333333", email: "izu@example.com", accounts: accounts, ids: ids) == personal.id
+                  && ActiveAccount.match(accountId: nil, email: "izu@example.com", accounts: accounts, ids: [:]) == personal.id)
+            check("active: one UUID on two rows is not an answer",
+                  ActiveAccount.match(accountId: uuidP, email: "izu@example.com", accounts: accounts, ids: [personal.id: uuidP, charm.id: uuidP]) == nil)
             check("active: an address we do not hold resolves to nobody",
                   ActiveAccount.match(email: "someone@else.example", accounts: accounts) == nil)
             check("active: a logged-out machine resolves to nobody",
@@ -2359,7 +2383,11 @@ enum RenderStates {
             guard let appearance = NSAppearance(named: name) else { continue }
             var bar: NSImage?
             appearance.performAsCurrentDrawingAppearance {
-                bar = BarRenderer.image(for: cells, appearance: appearance)
+                bar = BarRenderer.image(
+                    for: cells,
+                    codex: BarCell(character: BarRenderer.codexCharacter, headroom: 88, isUnreachable: false),
+                    appearance: appearance
+                )
             }
             guard let bar else { continue }
 
@@ -2502,6 +2530,60 @@ enum RenderPopover {
 
 /// A picture of the Server submenu for `--render-popover`, drawn from the same
 /// `ServerMenuItem` list the real menu uses.
+/// The ⋯ menu's "Reset 5-Hour Window" submenu, drawn from the same budget
+/// the real menu is built from (a live NSMenu cannot be captured off screen).
+struct BudgetMenuPreview: View {
+    let rows: [(String, String)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Reset 5-Hour Window").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 14).padding(.vertical, 4)
+            item("All Accounts")
+            Divider().padding(.vertical, 5).padding(.horizontal, 10)
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in item("\(row.0)  \(row.1)") }
+        }
+        .padding(.vertical, 5)
+        .frame(width: 220, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color(nsColor: .windowBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.12)))
+        .padding(12)
+    }
+
+    private func item(_ text: String) -> some View {
+        Text(text).font(.system(size: 13)).monospacedDigit().lineLimit(1)
+            .padding(.horizontal, 14).padding(.vertical, 3)
+    }
+}
+
+enum RenderLive {
+    /// Reads `state.json` and `fablemeter budget --json`; never polls or writes.
+    @MainActor
+    static func run(to file: String) -> Int32 {
+        guard let data = try? Data(contentsOf: LocalState.file),
+              let snapshot = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            print("render-live: no state.json"); return 1
+        }
+        let entries = Budget.fetch() ?? [:]
+        let state = AppState(demo: true)
+        state.applyLiveSnapshot(snapshot, budget: entries)
+        let rows = state.displayRows(now: Date()).compactMap { row in
+            state.budget(for: row.label).map { (row.nickname, $0.text) }
+        }
+        let view = HStack(alignment: .top, spacing: 0) {
+            PopoverView(state: state)
+            VStack(alignment: .leading, spacing: 0) {
+                Spacer().frame(height: 40)
+                BudgetMenuPreview(rows: rows)
+            }
+        }
+        RenderPopover.snapshot(view, appearance: .aqua, backdrop: NSColor(white: 0.96, alpha: 1),
+                               to: URL(fileURLWithPath: file))
+        print("wrote \(file)")
+        return 0
+    }
+}
+
 struct ServerMenuPreview: View {
     let items: [ServerMenuItem]
 

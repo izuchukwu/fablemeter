@@ -21,6 +21,11 @@ struct BarCell: Equatable {
     /// where `headroom` says how much of it is left and `isUnreachable` says how
     /// old that is.
     let isFableExhausted: Bool
+    /// The account has spent its self-imposed 5-hour budget. The letter dims
+    /// exactly like a blocked account's: agents treat it as unusable until its
+    /// window resets, so the menu bar says the same.
+    var isCapped: Bool = false
+    var isActive: Bool = false
 
     /// The track is drawn hollow rather than painted. Two ways to earn it, and
     /// they are the same statement: there is no live reading behind this gauge.
@@ -40,12 +45,14 @@ struct BarCell: Equatable {
         character: Character,
         headroom: Double?,
         isUnreachable: Bool,
-        isFableExhausted: Bool = false
+        isFableExhausted: Bool = false,
+        isCapped: Bool = false
     ) {
         self.character = character
         self.headroom = headroom
         self.isUnreachable = isUnreachable
         self.isFableExhausted = isFableExhausted
+        self.isCapped = isCapped
     }
 
     /// How an account's state becomes a cell, under a policy. Pure, and the one
@@ -55,13 +62,14 @@ struct BarCell: Equatable {
     /// fact about the account, it just is not something this gauge is measuring,
     /// so the letter must not go yellow over it.
     static func cell(
-        character: Character, state: AccountState?, fableFirst: Bool
+        character: Character, state: AccountState?, fableFirst: Bool, isCapped: Bool = false
     ) -> BarCell {
         BarCell(
             character: character,
             headroom: state?.snapshot?.headroom(fableFirst: fableFirst),
             isUnreachable: state?.isUnreachable == true,
-            isFableExhausted: fableFirst && state?.snapshot?.isFableExhausted == true
+            isFableExhausted: fableFirst && state?.snapshot?.isFableExhausted == true,
+            isCapped: isCapped
         )
     }
 }
@@ -90,7 +98,7 @@ enum BarRenderer {
     static let outerPadding: CGFloat = 2.5
     static let gap: CGFloat = 1.5
     static let fontSize: CGFloat = 8
-    static let imageHeight: CGFloat = 22
+    static let imageHeight: CGFloat = 26
     static let minimumFill: CGFloat = 1.5
     /// The painted track, when the reading is live.
     static let trackAlpha: CGFloat = 0.20
@@ -101,6 +109,8 @@ enum BarRenderer {
     /// An account with nothing left is unusable, so its letter recedes. This is
     /// the "you cannot use this one" signal — the letters never take colour.
     static let blockedGlyphAlpha: CGFloat = 0.38
+    /// Codex's letter in the menu bar. Not `C`: that is a Claude account's.
+    static let codexCharacter: Character = "X"
 
     /// `nil` means healthy — draw monochrome and let the system tint it.
     static func warningColor(for headroom: Double?) -> NSColor? {
@@ -216,9 +226,14 @@ enum BarRenderer {
     ///   current for the menu bar it is drawing into, which is more correct than
     ///   anything this could pin — and pinning it is what required watching
     ///   `effectiveAppearance`, which is what span the redraw loop.
-    static func image(for cells: [BarCell], appearance: NSAppearance? = nil) -> NSImage {
-        guard !cells.isEmpty else { return emptyImage() }
+    /// - Parameter codex: the Codex gauge, drawn as the last cell after the
+    ///   Claude ones. `nil` draws the Claude cluster exactly as before.
+    static func image(
+        for claudeCells: [BarCell], codex: BarCell? = nil, appearance: NSAppearance? = nil
+    ) -> NSImage {
+        guard !claudeCells.isEmpty else { return emptyImage() }
 
+        let cells = claudeCells + (codex.map { [$0] } ?? [])
         let colored = forcesColor(cells)
         let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
         let textHeight = ceil(font.ascender - font.descender)
@@ -293,6 +308,20 @@ enum BarRenderer {
                     // second answer can retire the first. A blocked account has
                     // no limit left to point at, so it takes the plain dimmed
                     // letter whether or not its Fable week is gone.
+                    if cell.isActive {
+                        neutral.withAlphaComponent(0.45).setFill()
+                        var activeRect = NSRect(
+                            x: cellX + (cellWidth - 5) / 2, y: 0.5, width: 5, height: 1
+                        )
+                        // Centre to the nearest device pixel. The wider mark
+                        // otherwise starts halfway through a Retina pixel.
+                        if let context = NSGraphicsContext.current?.cgContext {
+                            var pixels = context.convertToDeviceSpace(activeRect)
+                            pixels.origin.x.round()
+                            activeRect = context.convertToUserSpace(pixels)
+                        }
+                        NSBezierPath(roundedRect: activeRect, xRadius: 0.5, yRadius: 0.5).fill()
+                    }
                     let glyphInk = glyphColor(
                         colored: colored,
                         fableExhausted: cell.isFableExhausted,
@@ -302,7 +331,7 @@ enum BarRenderer {
                     let attributes: [NSAttributedString.Key: Any] = [
                         .font: font,
                         .foregroundColor: glyphInk.withAlphaComponent(
-                            glyphAlpha(headroom: cell.headroom)
+                            cell.isCapped ? blockedGlyphAlpha : glyphAlpha(headroom: cell.headroom)
                         )
                     ]
                     let size = glyph.size(withAttributes: attributes)
@@ -361,6 +390,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     private let popover = NSPopover()
     private var cancellable: AnyCancellable?
     private var renderedCells: [BarCell]?
+    private var renderedCodex: BarCell??
     /// Live only while the popover is open. See `installOutsideClickMonitor`.
     private var outsideClickMonitor: Any?
 
@@ -369,9 +399,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
 
-        let host = NSHostingController(rootView: PopoverView(state: state))
-        host.sizingOptions = [.preferredContentSize]
+        let host = PopoverScrollController(rootView: PopoverView(state: state))
         popover.contentViewController = host
+        host.popover = popover
         popover.behavior = .transient
         popover.animates = false
         popover.delegate = self
@@ -397,6 +427,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             MainActor.assumeIsolated { self?.closeIfShown() }
         }
         redraw(force: true)
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.redraw() }
+        }
     }
 
     /// Assigns a new image **only when the cells actually changed**, and that
@@ -417,10 +450,12 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     /// cluster costs exactly one comparison per state change and nothing else.
     private func redraw(force: Bool = false) {
         let cells = state.barCells
-        guard force || cells != renderedCells else { return }
+        let codex = state.codexCell
+        guard force || cells != renderedCells || renderedCodex != .some(codex) else { return }
         renderedCells = cells
+        renderedCodex = .some(codex)
         guard let button = statusItem.button else { return }
-        button.image = BarRenderer.image(for: cells)
+        button.image = BarRenderer.image(for: cells, codex: codex)
     }
 
     @objc private func togglePopover() {
@@ -431,6 +466,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         state.refreshIfStale()
         NSApp.activate(ignoringOtherApps: true)
+        (popover.contentViewController as? PopoverScrollController<PopoverView>)?.prepareForDisplay()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
         installOutsideClickMonitor()
