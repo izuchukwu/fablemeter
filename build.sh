@@ -23,6 +23,7 @@ BIN="$(swift build -c release --show-bin-path)/$EXEC_NAME"
 
 echo "==> selftest"
 "$BIN" --selftest
+python3 scripts/fablemeter-select --selftest
 
 echo "==> assembling $APP"
 rm -rf "$APP"
