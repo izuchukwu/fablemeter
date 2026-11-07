@@ -366,6 +366,7 @@ default:
 
     environment:
       FABLEMETER_DATA_DIR         where accounts and the machine key live (a Fly volume)
+      FABLEMETER_MACHINE_NAME     how this machine is named everywhere (default: hostname)
       FABLEMETER_SLACK_TOKEN      Slack bot token (with FABLEMETER_SLACK_CHANNEL)
       FABLEMETER_SLACK_CHANNEL    e.g. C0BT334MZMX
       FABLEMETER_SLACK_CONFIG     or: path to a {"token","channel"} JSON file

@@ -165,8 +165,24 @@ enum MachineIdentity {
         return fresh
     }
 
-    /// How the machine list names this machine.
+    /// How the machine list, the follower's "From ..." line and the Slack posts
+    /// name this machine. FABLEMETER_MACHINE_NAME wins on every platform, so a
+    /// box whose hostname is a provider's random id can carry a human name.
+    /// It is sent fresh on every heartbeat and push, never cached on disk.
     static var displayName: String {
+        displayName(environment: ProcessInfo.processInfo.environment, fallback: systemName)
+    }
+
+    /// The override, trimmed; blank or absent falls back to the system's name.
+    static func displayName(environment: [String: String], fallback: String) -> String {
+        if let raw = environment["FABLEMETER_MACHINE_NAME"] {
+            let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty { return name }
+        }
+        return fallback
+    }
+
+    private static var systemName: String {
         #if os(macOS)
         return Host.current().localizedName ?? ProcessInfo.processInfo.hostName
         #else

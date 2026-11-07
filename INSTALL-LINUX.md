@@ -112,6 +112,7 @@ The first usage lines arrive within one poll cycle (up to ~5 minutes).
 | Variable | Meaning |
 | --- | --- |
 | `FABLEMETER_DATA_DIR` | sign-ins, web key, machine id, remembered role, account ids (mode 700). Must be persistent. Commands run without the wrapper read it from this file too, so every command uses the same directory. |
+| `FABLEMETER_MACHINE_NAME` | how this machine is named in the machine list, the "From ..." line and Slack posts (default: the hostname). Takes effect on the next heartbeat after a restart. |
 | `FABLEMETER_SLACK_TOKEN`, `FABLEMETER_SLACK_CHANNEL` | Slack warnings (server only) |
 | `FABLEMETER_SLACK_CONFIG` | alternatively, a path to `{"token":…,"channel":…}` |
 | `FABLEMETER_FABLE_FIRST=0` | measure `min(5-hour, weekly)` and ignore Fable |
