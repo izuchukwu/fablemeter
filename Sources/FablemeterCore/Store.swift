@@ -356,3 +356,77 @@ enum DataDirConfig {
         return found
     }
 }
+
+/// The order the popover and the menu bar draw things in, across Claude
+/// accounts AND the Codex gauge. Everything here is keyed by a string: an
+/// account's UUID on a Mac that polls, `server:<row id>` for a row a server
+/// measured, and `codexKey` for Codex.
+enum DisplayOrder {
+    static let codexKey = "codex"
+
+    /// `rows` in the preferred order (rows the preference has never heard of
+    /// keep their given order, after the ones it has), with Codex dropped in at
+    /// `codexSlot` — or last when there is no slot. A slot past the end clamps,
+    /// so a row that went away never leaves Codex pointing at nothing.
+    static func arrange(rows: [String], preferred: [String], codexSlot: Int?) -> [String] {
+        let rank = Dictionary(preferred.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        let ordered = rows.enumerated()
+            .sorted { l, r in
+                (rank[l.element] ?? (preferred.count + l.offset)) < (rank[r.element] ?? (preferred.count + r.offset))
+            }
+            .map(\.element)
+        var out = ordered
+        out.insert(codexKey, at: min(max(codexSlot ?? ordered.count, 0), ordered.count))
+        return out
+    }
+
+    /// The rows without Codex, and where Codex sat (nil when it is last, so
+    /// "last" keeps meaning last as accounts come and go).
+    static func split(_ keys: [String]) -> (rows: [String], codexSlot: Int?) {
+        let rows = keys.filter { $0 != codexKey }
+        guard let at = keys.firstIndex(of: codexKey), at < rows.count else { return (rows, nil) }
+        return (rows, at)
+    }
+
+    static func shifted(_ keys: [String], key: String, by delta: Int) -> [String]? {
+        guard delta != 0, let from = keys.firstIndex(of: key) else { return nil }
+        let to = from + delta
+        guard to >= 0, to < keys.count else { return nil }
+        var out = keys
+        out.insert(out.remove(at: from), at: to)
+        return out
+    }
+
+    static func moved(_ keys: [String], key: String, onto target: String) -> [String]? {
+        guard key != target, let from = keys.firstIndex(of: key), let to = keys.firstIndex(of: target) else { return nil }
+        var out = keys
+        out.insert(out.remove(at: from), at: to)
+        return out
+    }
+}
+
+/// This Mac's display preference for `DisplayOrder`. It lives in this Mac's own
+/// defaults and nowhere else: a follower reorders what it DRAWS, and nothing
+/// here is ever sent to a server.
+struct OrderPrefs: Equatable {
+    var rowOrder: [String] = []
+    var codexSlot: Int?
+
+    static let rowOrderKey = "displayRowOrder"
+    static let codexSlotKey = "displayCodexSlot"
+
+    static func load(from defaults: UserDefaults?) -> OrderPrefs {
+        guard let defaults else { return OrderPrefs() }
+        return OrderPrefs(
+            rowOrder: defaults.stringArray(forKey: rowOrderKey) ?? [],
+            codexSlot: defaults.object(forKey: codexSlotKey) as? Int
+        )
+    }
+
+    func save(to defaults: UserDefaults?) {
+        guard let defaults else { return }
+        defaults.set(rowOrder, forKey: Self.rowOrderKey)
+        if let codexSlot { defaults.set(codexSlot, forKey: Self.codexSlotKey) }
+        else { defaults.removeObject(forKey: Self.codexSlotKey) }
+    }
+}

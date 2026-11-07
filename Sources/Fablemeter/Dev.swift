@@ -2178,6 +2178,67 @@ enum SelfTest {
             check("follower: the menu offers promoting this Mac, enabled",
                   follow.serverMenuItems.last == .makeThisMacServer(enabled: true), "")
 
+            // Reordering on a follower: a display preference on this Mac, not
+            // a change to the server's rows or to this Mac's own accounts.
+            let before = follow.displayRows(now: now).map(\.id)
+            let accountsBefore = follow.accounts.map(\.id)
+            let remoteBefore = follow.remote?.server?.machine
+            let lastKey = before.last!
+            check("follower: Codex starts last", follow.popoverItems(now: now).last?.key == DisplayOrder.codexKey, "")
+            check("follower: the last server row can move up", follow.canMoveItem(lastKey, by: -1), "")
+            follow.moveItem(lastKey, onto: before[0])
+            check("follower: a drag reorders the server rows",
+                  follow.displayRows(now: now).map(\.id) == [before[2], before[0], before[1]],
+                  "\(follow.displayRows(now: now).map(\.id))")
+            check("follower: the gauge follows the new order live",
+                  follow.barCells.map(\.character) == ["I", "P", "C"], "\(follow.barCells.map(\.character))")
+            check("follower: the reorder is kept as this Mac's preference",
+                  follow.order.rowOrder == [before[2], before[0], before[1]], "\(follow.order.rowOrder)")
+            check("follower: reordering leaves the server's state and this Mac's accounts alone",
+                  follow.isFollowingServer && follow.accounts.map(\.id) == accountsBefore
+                  && follow.remote?.server?.machine == remoteBefore
+                  && follow.followed?.accounts.map({ "server:\($0.rowId)" }) == before, "")
+            follow.moveItem(DisplayOrder.codexKey, onto: before[2])
+            check("follower: Codex can be dragged to the front",
+                  follow.popoverItems(now: now).first?.key == DisplayOrder.codexKey, "")
+            check("follower: the menu bar places Codex first", follow.codexPosition == 0, "\(follow.codexPosition)")
+            follow.moveItem(DisplayOrder.codexKey, by: 2)
+            check("follower: Codex can step back down", follow.codexPosition == 2, "\(follow.codexPosition)")
+            check("follower: a Codex that is last stays 'last' (no slot kept)",
+                  { follow.moveItem(DisplayOrder.codexKey, by: 1); return follow.order.codexSlot == nil }(), "")
+
+            // Persistence: a fresh load from this Mac's defaults gives the same order.
+            let suiteName = "fablemeter.selftest.order.\(UUID().uuidString)"
+            if let suite = UserDefaults(suiteName: suiteName) {
+                let prefs = OrderPrefs(rowOrder: ["server:b", "server:a"], codexSlot: 1)
+                prefs.save(to: suite)
+                check("order: rows and Codex position survive a reload",
+                      OrderPrefs.load(from: suite) == prefs, "\(OrderPrefs.load(from: suite))")
+                OrderPrefs(rowOrder: ["server:b"], codexSlot: nil).save(to: suite)
+                check("order: Codex back to last clears the stored slot", OrderPrefs.load(from: suite).codexSlot == nil, "")
+                suite.removePersistentDomain(forName: suiteName)
+            } else {
+                check("order: could open a scratch defaults suite", false, suiteName)
+            }
+            check("order: a missing preference loads as the default",
+                  OrderPrefs.load(from: nil) == OrderPrefs(), "")
+            let keys = DisplayOrder.arrange(rows: ["a", "b", "c"], preferred: ["c", "a"], codexSlot: 1)
+            check("order: arrange honors the preference, unknown rows after, Codex at its slot",
+                  keys == ["c", "codex", "a", "b"], "\(keys)")
+            check("order: a Codex slot past the end clamps to last",
+                  DisplayOrder.arrange(rows: ["a"], preferred: [], codexSlot: 9) == ["a", "codex"], "")
+            check("order: split reports a trailing Codex as no slot",
+                  DisplayOrder.split(["a", "b", "codex"]).codexSlot == nil
+                  && DisplayOrder.split(["codex", "a", "b"]).codexSlot == 0, "")
+
+            // A Mac that polls: Codex's place persists too, and the accounts keep theirs.
+            let poller = AppState(demo: true, demoCount: 3)
+            let pollerLabels = { poller.displayRows(now: now).map(\.label).joined() }
+            poller.moveItem(DisplayOrder.codexKey, by: -1)
+            check("poller: Codex moves among the accounts", poller.order.codexSlot == 2 && pollerLabels() == "PWT", "")
+            poller.moveItem(poller.displayRows(now: now)[0].orderKey, onto: poller.displayRows(now: now)[1].orderKey)
+            check("poller: accounts still reorder alongside Codex", pollerLabels() == "WPT" && poller.order.codexSlot == 2, pollerLabels())
+
             let old = AppState(demo: true, demoCount: 3)
             old.applyDemoRole(.following, now: now.addingTimeInterval(-20 * 60))
             check("follower: a server snapshot 22 minutes old goes hollow, numbers kept",
