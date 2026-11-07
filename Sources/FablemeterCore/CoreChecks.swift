@@ -460,17 +460,15 @@ enum CoreChecks {
 
     /// The saved-login health the CLI prints, and the reconnect it picks.
     static func savedLogins(_ check: Check) {
-        let json = #"{"accounts":{"a":{"status":"expired","live":true,"detail":"x"},"C":{"status":"ok","live":false},"I":{"status":"bogus"}},"checkedAt":"t"}"#
+        let p = "11111111-1111-4111-8111-111111111111", c = "22222222-2222-4222-8222-222222222222"
+        let json = #"{"accounts":{"11111111-1111-4111-8111-111111111111":{"status":"expired","live":true},"22222222-2222-4222-8222-222222222222":{"status":"ok","live":false},"33333333-3333-4333-8333-333333333333":{"status":"bogus"},"P":{"status":"expired"}}}"#
         let decoded = SavedLoginHealth.decode(Data(json.utf8))
-        check("saved login: labels upper-case and expired reads as signed out",
-              decoded?["A"]?.status == .expired && decoded?["A"]?.isSignedOut == true, "\(String(describing: decoded))")
-        check("saved login: ok is not signed out", decoded?["C"]?.isSignedOut == false, "")
-        check("saved login: an unknown status is dropped, never guessed", decoded?["I"] == nil, "")
-        check("saved login: not the CLI's shape decodes to nothing", SavedLoginHealth.decode(Data("[]".utf8)) == nil, "")
-        check("saved login: the live account reconnects by saving, with no browser",
-              decoded?["A"]?.reconnectArguments(label: "A") == ["swap", "--save", "A", "--agent", "ux", "--why", "reconnect from menu bar"], "")
-        check("saved login: any other account re-enrolls with --force",
-              decoded?["C"]?.reconnectArguments(label: "C") == ["swap", "--enroll", "C", "--agent", "ux", "--force"], "")
+        check("saved login: keyed by account UUID, and expired reads as signed out",
+              decoded?[p]?.status == .expired && decoded?[p]?.isSignedOut == true && decoded?[p]?.isLive == true, "\(String(describing: decoded))")
+        check("saved login: ok is not signed out", decoded?[c]?.isSignedOut == false, "")
+        check("saved login: an unknown status is dropped, never guessed", decoded?["33333333-3333-4333-8333-333333333333"] == nil, "")
+        check("saved login: a key that is not a UUID (a label) is dropped", decoded?["P"] == nil && decoded?.count == 2, "")
+        check("saved login: not the helper's shape decodes to nothing", SavedLoginHealth.decode(Data("[]".utf8)) == nil, "")
         check("saved login: failure text drops the CLI prefix and keeps one line",
               SavedLoginHealth.failureLine("noise\nfablemeter swap: approval timed out\n") == "approval timed out", "")
         check("saved login: empty failure output still says something",

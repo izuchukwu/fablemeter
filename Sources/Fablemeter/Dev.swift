@@ -3134,14 +3134,13 @@ enum RenderReconnect {
             // The real flow end to end against stubs: click -> running -> CLI ok -> health re-read -> row clears.
             let flow = AppState(demo: true, demoCount: 3)
             flow.applyDemoSavedLogins(["T": liveOut])
-            let healthy = #"{"accounts":{"T":{"status":"ok","live":true}}}"#
-            flow.healthReader = { Data(healthy.utf8) }
-            flow.reconnectRunner = { args, _ in
-                print("stub CLI would run: fablemeter \(args.joined(separator: " "))")
+            flow.healthReader = { nil }
+            flow.reconnectRunner = { key in
+                print("stub helper would run: fablemeter-saved-login reconnect \(key)")
                 Thread.sleep(forTimeInterval: 0.8)
                 return (true, "")
             }
-            flow.reconnect(label: "T")
+            if let row = flow.displayRows(now: Date()).first(where: { $0.label.uppercased() == "T" }) { flow.reconnect(row) }
             shot(flow, "after-clicked")
             RunLoop.current.run(until: Date().addingTimeInterval(1.6))
             shot(flow, "after-reconnect")

@@ -295,6 +295,7 @@ struct AccountRow: View {
     var savedLogin: SavedLoginHealth? = nil
     var reconnect: ReconnectProgress? = nil
     var reconnectSavedLogin: () -> Void = {}
+    var canReconnect = true
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.historyViewport) private var historyViewport
@@ -427,6 +428,7 @@ struct AccountRow: View {
                         Spacer(minLength: 6)
                         if isSavedLoginOut && !isReconnecting && !needsSignIn {
                             Button("Reconnect", action: reconnectSavedLogin)
+                                .disabled(!canReconnect)
                                 .buttonStyle(PressableButtonStyle())
                                 .font(.system(size: 11))
                                 .foregroundStyle(Color.accentColor)
@@ -819,9 +821,10 @@ struct PopoverView: View {
             isSigningIn: state.isSigningIn || state.isPromoting,
             signIn: { if let account = row.local { state.signInAgain(account) } },
             signOut: { if let account = row.local { state.remove(account) } },
-            savedLogin: state.savedLogins[row.label.uppercased()],
-            reconnect: state.reconnects[row.label.uppercased()],
-            reconnectSavedLogin: { state.reconnect(label: row.label) }
+            savedLogin: state.savedLoginKey(for: row).flatMap { state.savedLogins[$0] },
+            reconnect: state.savedLoginKey(for: row).flatMap { state.reconnects[$0] },
+            reconnectSavedLogin: { state.reconnect(row) },
+            canReconnect: state.canReconnect
         )
         if let account = row.local {
             base
