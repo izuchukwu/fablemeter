@@ -105,6 +105,59 @@ enum PushPayload {
     }()
 }
 
+// MARK: - Codex payload
+
+/// The Codex gauge as the web receives it, on its own rail (`/api/codex`).
+/// Codex is read from the local ChatGPT sign-in through `codex-quota`, not from
+/// Anthropic, so it is not part of the server/follower election: whichever
+/// machine can read it sends it, follower or server, and the Claude snapshot
+/// push is left exactly as it was. Same null-versus-zero rule as the push.
+enum CodexPushPayload {
+    static func body(
+        fiveHour: UsageBucket?,
+        weekly: UsageBucket?,
+        resetCredits: Int?,
+        verdict: String,
+        isStale: Bool,
+        slot: Int?,
+        measuredAt: Date?,
+        now: Date = Date(),
+        machine: String? = nil,
+        machineId: String? = nil
+    ) -> [String: Any] {
+        var payload: [String: Any] = [
+            "updatedAt": iso.string(from: now),
+            "measuredAt": measuredAt.map { iso.string(from: $0) as Any } ?? NSNull(),
+            "verdict": verdict,
+            "isStale": isStale,
+            "resetCredits": resetCredits.map { $0 as Any } ?? NSNull(),
+            // Where this Mac draws Codex among the rows; null means last, so
+            // "last" keeps meaning last as accounts come and go.
+            "slot": slot.map { $0 as Any } ?? NSNull(),
+            "buckets": [
+                "fiveHour": bucket(fiveHour),
+                "weekly": bucket(weekly),
+            ],
+        ]
+        if let machine { payload["machine"] = machine }
+        if let machineId { payload["machineId"] = machineId }
+        return payload
+    }
+
+    private static func bucket(_ bucket: UsageBucket?) -> [String: Any] {
+        [
+            "percent": bucket?.percent.map { $0 as Any } ?? NSNull(),
+            "resetsAt": bucket?.resetsAt.map { iso.string(from: $0) as Any } ?? NSNull(),
+        ]
+    }
+
+    private static let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+}
+
 // MARK: - Pusher
 
 /// Fire-and-forget. A push can fail forever without the gauge noticing: no
@@ -114,6 +167,7 @@ enum PushPayload {
 final class Pusher {
     private let keys: PushKeyStore
     private let endpoint = URL(string: "https://fablemeter.oniconic.app/api/push")!
+    private let codexEndpoint = URL(string: "https://fablemeter.oniconic.app/api/codex")!
     /// How the key-management page names this machine, and the stable id the
     /// server role is keyed on.
     private let machine = MachineIdentity.displayName
@@ -216,6 +270,53 @@ final class Pusher {
                 // The same vetted vocabulary the gauge uses — never a body.
                 let verdict = NetworkFailure.text(for: error) ?? NetworkFailure.genericText
                 Log.push.notice("push failed verdict=\(verdict)")
+            }
+        }
+    }
+
+    /// Sends the Codex gauge to `/api/codex`. Same key, same suppression of a
+    /// rejected key, same one-line logging as `push`. No 409 here: Codex is
+    /// not elected, so a follower may send it.
+    func pushCodex(
+        fiveHour: UsageBucket?,
+        weekly: UsageBucket?,
+        resetCredits: Int?,
+        verdict: String,
+        isStale: Bool,
+        slot: Int?,
+        measuredAt: Date?
+    ) {
+        guard let key = keys.currentKey() else { return }
+        guard !flags.withLock({ Self.isSuppressed(key: key, rejected: $0.rejected) }) else { return }
+        let body = CodexPushPayload.body(
+            fiveHour: fiveHour, weekly: weekly, resetCredits: resetCredits,
+            verdict: verdict, isStale: isStale, slot: slot, measuredAt: measuredAt,
+            machine: machine, machineId: machineId
+        )
+        guard let payload = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else {
+            Log.push.error("codex push failed encoding")
+            return
+        }
+        var request = URLRequest(url: codexEndpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = payload
+        Task.detached { [flags] in
+            do {
+                let (_, response) = try await HTTP.data(for: request)
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                switch code {
+                case 200: Log.push.notice("codex push ok")
+                case 401:
+                    flags.withLock { $0.rejected = key }
+                    Log.push.notice("codex push: key rejected — reconnect from the ⋯ menu")
+                default: Log.push.notice("codex push failed status=\(code)")
+                }
+            } catch {
+                let verdict = NetworkFailure.text(for: error) ?? NetworkFailure.genericText
+                Log.push.notice("codex push failed verdict=\(verdict)")
             }
         }
     }

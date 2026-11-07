@@ -9,6 +9,7 @@ final class AppState: ObservableObject {
     @Published private(set) var codexStale = false
     private var codexAttempt = Date.distantPast
     private var codexFetching = false
+    private var codexMeasuredAt: Date?
     /// The self-imposed 5-hour budget, by account label, as the `fablemeter`
     /// CLI computes it. Empty on a Mac without the CLI, and in demo mode.
     @Published private(set) var budget: [String: BudgetEntry] = [:]
@@ -297,13 +298,30 @@ final class AppState: ObservableObject {
         codexAttempt = Date()
         let reading = await Task.detached(priority: .utility) { CodexReading.fetch() }.value
         if let reading {
-            codex = reading; codexStale = false
+            codex = reading; codexStale = false; codexMeasuredAt = Date()
             do {
                 try history.record(accountID: UsageHistory.codexID, date: Date(), fiveHour: reading.fiveHour?.percent, weekly: reading.weekly.percent)
             } catch { Log.usage.error("Could not save usage history: \(error.localizedDescription)") }
         }
         else { codexStale = true }
         codexFetching = false
+        pushCodex()
+    }
+
+    /// The web's copy of the Codex row, sent after every read whether it
+    /// succeeded or not, so a failed read reaches the web as Stale rather than
+    /// as a frozen last number. A Mac without `codex-quota` sends nothing.
+    private func pushCodex() {
+        guard CodexReading.isAvailable, let pusher else { return }
+        pusher.pushCodex(
+            fiveHour: codex?.fiveHour,
+            weekly: codex?.weekly,
+            resetCredits: codex?.resetCredits,
+            verdict: codexStale ? (codex == nil ? "No data" : "Stale") : (codex?.verdict ?? "No data"),
+            isStale: codexStale,
+            slot: order.codexSlot,
+            measuredAt: codexMeasuredAt
+        )
     }
 
     /// Every 30s while the loop runs, and on demand. The CLI ticks the windows
@@ -1057,8 +1075,12 @@ final class AppState: ObservableObject {
             }
         }
         guard next != order else { return }
+        let slotMoved = next.codexSlot != order.codexSlot
         order = next
         order.save(to: orderDefaults)
+        // The web draws Codex where this Mac does, so a move goes out now
+        // rather than at the next read.
+        if slotMoved && !isDemo { pushCodex() }
     }
 
     /// The server's rows in this Mac's preferred order; rows it has not placed

@@ -67,6 +67,30 @@ enum SelfTest {
         check("Codex app-server five-hour primary", codexFixture(0, appServer: true)?.fiveHour?.percent == 10)
         check("Codex missing data is unknown", CodexReading.decode(Data("{}".utf8)) == nil)
         do {
+            // The web's copy of the Codex row: a reported zero stays 0, a
+            // missing window stays null, and "last" is a null slot.
+            let r = codexFixture(0)!
+            let body = CodexPushPayload.body(
+                fiveHour: r.fiveHour, weekly: r.weekly, resetCredits: r.resetCredits,
+                verdict: r.verdict, isStale: false, slot: nil, measuredAt: Date(timeIntervalSince1970: 1790000000),
+                machine: "mac", machineId: "abc")
+            let b = body["buckets"] as? [String: [String: Any]]
+            check("Codex web payload keeps a reported zero as 0", (b?["weekly"]?["percent"] as? Double) == 0)
+            check("Codex web payload carries the five-hour window", (b?["fiveHour"]?["percent"] as? Double) == 23)
+            check("Codex web payload says last as a null slot", body["slot"] is NSNull)
+            check("Codex web payload carries reset credits", (body["resetCredits"] as? Int) == 0)
+            let empty = CodexPushPayload.body(
+                fiveHour: nil, weekly: nil, resetCredits: nil, verdict: "No data",
+                isStale: true, slot: 1, measuredAt: nil)
+            let e = empty["buckets"] as? [String: [String: Any]]
+            check("Codex web payload sends no reading as null, never 0",
+                  e?["weekly"]?["percent"] is NSNull && e?["fiveHour"]?["percent"] is NSNull && empty["measuredAt"] is NSNull)
+            check("Codex web payload carries a moved slot and staleness",
+                  (empty["slot"] as? Int) == 1 && (empty["isStale"] as? Bool) == true && empty["machine"] == nil)
+            check("Codex web payload encodes as JSON",
+                  (try? JSONSerialization.data(withJSONObject: body)) != nil && (try? JSONSerialization.data(withJSONObject: empty)) != nil)
+        }
+        do {
             let claude = [BarCell(character: "I", headroom: 70, isUnreachable: false)]
             let codexCell = BarCell(character: BarRenderer.codexCharacter, headroom: 92, isUnreachable: false)
             let plain = BarRenderer.image(for: claude).size.width
