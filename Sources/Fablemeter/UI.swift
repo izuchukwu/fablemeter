@@ -406,7 +406,7 @@ struct AccountRow: View {
                         if let budget {
                             BudgetRow(entry: budget, now: now, isUnreachable: isUnreachable)
                         } else {
-                            MetricRow(title: "5h", bucket: nil, now: now, isUnreachable: isUnreachable)
+                            MetricRow(title: "5h", bucket: state?.snapshot?.fiveHour, now: now, isUnreachable: isUnreachable)
                         }
                         MetricRow(
                             title: "Weekly", bucket: state?.snapshot?.weekly,

@@ -39,9 +39,10 @@ enum Budget {
 
     /// The interpreter is named rather than left to the shebang: a login item
     /// starts with launchd's bare PATH, where `env python3` may not resolve.
-    private static var python: String {
-        let brew = "/opt/homebrew/bin/python3"
-        return FileManager.default.isExecutableFile(atPath: brew) ? brew : "/usr/bin/python3"
+    static var python: String {
+        // Apple silicon Homebrew, Intel Homebrew, then the system stub.
+        ["/opt/homebrew/bin/python3", "/usr/local/bin/python3"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
     }
 
     static func decode(_ data: Data) -> [String: BudgetEntry]? {

@@ -8,9 +8,7 @@ enum AccountSelection {
             return "Account switch helper is missing. Reinstall Fablemeter."
         }
         let process = Process()
-        let brew = "/opt/homebrew/bin/python3"
-        process.executableURL = URL(fileURLWithPath:
-            FileManager.default.isExecutableFile(atPath: brew) ? brew : "/usr/bin/python3")
+        process.executableURL = URL(fileURLWithPath: Budget.python)
         process.arguments = [helper.path, label]
         let output = Pipe()
         process.standardOutput = output
