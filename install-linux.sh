@@ -70,8 +70,10 @@ if [ -z "$BINARY" ]; then
       curl -fsSL "$url.sig" -o "$tmp/swiftly.tgz.sig"
       # swift.org's published release keys, in a throwaway keyring so nothing
       # is added to this user's own. Refuse to run an unverified download.
+      # --compressed: swift.org serves the key file gzip-encoded, and without it
+      # gpg is handed the compressed bytes and imports nothing.
       export GNUPGHOME="$tmp/gnupg"; mkdir -m 700 "$GNUPGHOME"
-      curl -fsSL "https://www.swift.org/keys/all-keys.asc" | gpg --batch --quiet --import - \
+      curl -fsSL --compressed "https://www.swift.org/keys/all-keys.asc" | gpg --batch --quiet --import - \
         || die "could not import swift.org's signing keys"
       gpg --batch --quiet --verify "$tmp/swiftly.tgz.sig" "$tmp/swiftly.tgz" 2>/dev/null \
         || die "swiftly's signature did not verify — refusing to run it"
@@ -82,6 +84,17 @@ if [ -z "$BINARY" ]; then
       # shellcheck disable=SC1091
       . "${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/env.sh"
       hash -r
+      # env.sh only puts swiftly's own bin dir on PATH, and that dir holds no
+      # swift proxy while swiftly is "unlinked" (it can be, right after init).
+      # So put the installed toolchain's own bin dir on PATH directly.
+      if ! command -v swift >/dev/null; then
+        tc="$(swiftly use --print-location 2>/dev/null | grep '^/' | tail -1 || true)"
+        [ -x "$tc/usr/bin/swift" ] || tc="$(ls -d "${SWIFTLY_TOOLCHAINS_DIR:-${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/toolchains}"/*/ 2>/dev/null | sort -V | tail -1 || true)"
+        tc="${tc%/}"
+        [ -x "$tc/usr/bin/swift" ] && export PATH="$tc/usr/bin:$PATH" && hash -r
+      fi
+      command -v swift >/dev/null || die "swiftly installed a toolchain, but swift is still not on PATH"
+      say "using $(command -v swift)"
     else
       die "no Swift toolchain. Re-run with --install-swift, or build elsewhere and pass --binary"
     fi
