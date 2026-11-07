@@ -1043,7 +1043,9 @@ final class AppState: ObservableObject {
         let (rows, slot) = DisplayOrder.split(keys)
         var next = order
         next.codexSlot = slot
-        if isFollowingServer {
+        // Keyed on what is actually drawn: a follower with no snapshot yet is
+        // still drawing this Mac's own accounts.
+        if followedRows(now: Date()) != nil {
             next.rowOrder = rows
         } else {
             let byKey = Dictionary(accounts.map { ($0.id.uuidString, $0) }, uniquingKeysWith: { first, _ in first })
