@@ -165,10 +165,13 @@ enum MachineIdentity {
         return fresh
     }
 
-    /// How the machine list, the follower's "From ..." line and the Slack posts
-    /// name this machine. FABLEMETER_MACHINE_NAME wins on every platform, so a
-    /// box whose hostname is a provider's random id can carry a human name.
-    /// It is sent fresh on every heartbeat and push, never cached on disk.
+    /// How the web's machine list and a follower's "From ..." line name this
+    /// machine. FABLEMETER_MACHINE_NAME wins on every platform, so a box whose
+    /// hostname is a provider's random id can carry a human name. Resolved once
+    /// at process start and sent with every heartbeat and push; never written
+    /// to disk, so a restart is all a rename needs. The menu bar app is started
+    /// by launchd and does not see a shell export: on a Mac, set it with
+    /// `launchctl setenv` before launch, or leave the Mac on its own name.
     static var displayName: String {
         displayName(environment: ProcessInfo.processInfo.environment, fallback: systemName)
     }
