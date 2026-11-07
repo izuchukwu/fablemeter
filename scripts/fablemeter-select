@@ -4,20 +4,38 @@
 The CLI's agent entry point is reserved for Icon. A person clicking the menu
 is logged as the user, without impersonating an agent. Preserve its locks,
 credential preflight, backups, readback, Personal guard and audit log.
+
+The app passes the clicked row's Anthropic account UUID, never its display
+label: the app's labels are editable and are not the CLI's, so a label could
+name a different saved account. The UUID is resolved to the CLI's own key,
+and an id the CLI does not hold exactly once is refused before anything moves.
 """
 import os
 import runpy
 import sys
+import uuid as uuidlib
 
 
 def main():
     if len(sys.argv) != 2 or not sys.argv[1].strip():
         print("Choose an account in Fablemeter.", file=sys.stderr)
         return 1
+    try:
+        want = str(uuidlib.UUID(sys.argv[1].strip())).lower()
+    except ValueError:
+        print("Fablemeter does not know which account this row is.", file=sys.stderr)
+        return 1
     api = runpy.run_path(os.path.expanduser("~/.claude/bin/fablemeter"))
+    ctx = api["real_ctx"]()
+    meta = api["_load_meta"](ctx)
+    hits = [k for k, v in meta.items() if str(v.get("accountUuid", "")).lower() == want]
+    if len(hits) != 1:
+        print("This account is not saved for switching on this Mac. Enroll it with fablemeter swap --enroll.",
+              file=sys.stderr)
+        return 1
     try:
         return api["swap_to"](
-            api["real_ctx"](), sys.argv[1], who="user: Fablemeter menu",
+            ctx, hits[0], who="user: Fablemeter menu",
             why="User explicitly selected this account in Fablemeter",
             personal_first=True, cooldown_min=0,
         )

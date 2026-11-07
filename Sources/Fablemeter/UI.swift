@@ -771,7 +771,7 @@ struct PopoverView: View {
             now: now,
             budget: state.budget(for: row.label),
             resetWindow: { state.resetBudgetWindow(label: row.label) },
-            selectAccount: { state.selectAccount(label: row.label) },
+            selectAccount: { state.selectAccount(row) },
             canSelectAccount: state.canSelectAccount,
             fableFirst: state.isFableFirst,
             showsFableBars: state.showsFableBars,
@@ -858,7 +858,7 @@ struct PopoverView: View {
                     Menu {
                         Menu("Switch Account") {
                             ForEach(state.displayRows(now: Date()), id: \.id) { row in
-                                Button { state.selectAccount(label: row.label) } label: {
+                                Button { state.selectAccount(row) } label: {
                                     if state.isActiveAccount(row) { Label(row.nickname, systemImage: "checkmark") }
                                     else { Text(row.nickname) }
                                 }

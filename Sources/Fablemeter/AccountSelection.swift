@@ -3,13 +3,13 @@ import Foundation
 enum AccountSelection {
     /// An explicit menu selection uses the existing locked, verified switch
     /// implementation. No refresh token is ever read by the app.
-    static func select(label: String) -> String? {
+    static func select(accountId: String) -> String? {
         guard let helper = Bundle.main.url(forResource: "fablemeter-select", withExtension: nil) else {
             return "Account switch helper is missing. Reinstall Fablemeter."
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: Budget.python)
-        process.arguments = [helper.path, label]
+        process.arguments = [helper.path, accountId]
         let output = Pipe()
         process.standardOutput = output
         process.standardError = output

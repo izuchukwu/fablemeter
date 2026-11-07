@@ -217,13 +217,25 @@ final class AppState: ObservableObject {
         !isDemo && !isSelectingAccount && !isSigningIn && !isPromoting && Budget.isAvailable
     }
 
-    func selectAccount(label: String) {
+    /// The Anthropic account UUID behind a row: the switch is bound to it, not
+    /// to the editable label, so a renamed label can never pick another account.
+    func accountUUID(for row: DisplayRow) -> String? {
+        if let local = row.local { return AccountIdentity.load()[local.id] }
+        guard row.id.hasPrefix("server:"), let followed else { return nil }
+        return AccountIdentity.normalize(followed.accounts.first { "server:\($0.rowId)" == row.id }?.accountId)
+    }
+
+    func selectAccount(_ row: DisplayRow) {
         guard canSelectAccount else { return }
+        guard let accountId = accountUUID(for: row) else {
+            signInError = "Fablemeter does not know which account \(row.nickname) is yet. Reconnect it once."
+            return
+        }
         isSelectingAccount = true
         signInError = nil
         Task {
             let error = await Task.detached(priority: .userInitiated) {
-                AccountSelection.select(label: label)
+                AccountSelection.select(accountId: accountId)
             }.value
             isSelectingAccount = false
             signInError = error
