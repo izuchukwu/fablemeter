@@ -165,8 +165,27 @@ enum MachineIdentity {
         return fresh
     }
 
-    /// How the machine list names this machine.
+    /// How the web's machine list and a follower's "From ..." line name this
+    /// machine. FABLEMETER_MACHINE_NAME wins on every platform, so a box whose
+    /// hostname is a provider's random id can carry a human name. Resolved once
+    /// at process start and sent with every heartbeat and push; never written
+    /// to disk, so a restart is all a rename needs. The menu bar app is started
+    /// by launchd and does not see a shell export: on a Mac, set it with
+    /// `launchctl setenv` before launch, or leave the Mac on its own name.
     static var displayName: String {
+        displayName(environment: ProcessInfo.processInfo.environment, fallback: systemName)
+    }
+
+    /// The override, trimmed; blank or absent falls back to the system's name.
+    static func displayName(environment: [String: String], fallback: String) -> String {
+        if let raw = environment["FABLEMETER_MACHINE_NAME"] {
+            let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty { return name }
+        }
+        return fallback
+    }
+
+    private static var systemName: String {
         #if os(macOS)
         return Host.current().localizedName ?? ProcessInfo.processInfo.hostName
         #else
