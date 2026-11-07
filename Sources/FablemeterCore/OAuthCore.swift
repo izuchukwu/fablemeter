@@ -378,4 +378,10 @@ actor TokenVault {
     func reset(_ id: UUID) { forget(id) }
 
     func isRejected(_ id: UUID) -> Bool { rejected.contains(id) }
+
+    /// Who the cached access token says it is, as the token response reported
+    /// it. Nil when nothing is cached for the account.
+    func identity(of id: UUID) -> (accountId: String?, email: String?)? {
+        cache[id].map { ($0.accountId, $0.email) }
+    }
 }

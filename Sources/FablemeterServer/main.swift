@@ -7,8 +7,8 @@ import Foundation
 //             server through the web companion; write ~/.claude/fablemeter/
 //             state.json either way; post Slack only as the server.
 //   connect   get this machine a key for the web companion (paste-back).
-//   promote   sign into each account here, one at a time, then make this
-//             machine the owner's server.
+//   promote   keep each account's own working sign-in here, sign in the
+//             rest one at a time, then make this machine the owner's server.
 //   status    who is the server, which machines are around, what is signed in.
 //   selftest  the core's pure checks, runnable on the box itself.
 //   oob-test  prove the paste-back sign-in without keeping anything.
@@ -174,7 +174,7 @@ case "promote":
 
         print("Promote \(MachineIdentity.displayName) to server.")
         print("Data directory: \(Store.directory.path)")
-        print("Every account gets a fresh sign-in on THIS machine, one at a time, so no token is ever copied from another machine.")
+        print("Each account keeps this machine's own sign-in if it still works; the rest sign in here. No token is ever copied from another machine.")
 
         // What the current server calls each account, keyed by the Anthropic
         // account id, so this machine inherits the same labels and nicknames
@@ -205,9 +205,23 @@ case "promote":
             }
         }
 
-        // Re-sign every account already here, then offer to add more.
+        // Every account already here: keep its own sign-in if it still works
+        // and is the right account, otherwise sign it in again. Then offer to
+        // add more.
         let existing = Store.load()
+        let vault = TokenVault()
         for (index, account) in existing.enumerated() {
+            // Tested for real against this machine's own stored token (the
+            // vault takes the account's refresh lock and persists the
+            // rotation), and judged by the same identity verdict as a sign-in.
+            let current = Store.load().first(where: { $0.id == account.id }) ?? account
+            switch await KeepOwnSignIn.check(current, rows: identityRows(), vault: vault) {
+            case .keep:
+                print("  \(KeepOwnSignIn.keptText(nickname: account.nickname, machine: "this machine"))")
+                continue
+            case .signIn(let reason):
+                print("  \(account.nickname): \(reason.text) — sign in again")
+            }
             let heading = "Account \(index + 1) of \(existing.count) — \(account.nickname) (\(account.email))"
             guard let result = await signIn(heading: heading) else {
                 print("  skipped \(account.nickname); it keeps its current sign-in")
@@ -358,7 +372,7 @@ default:
     usage: fablemeter-server <command>
 
       connect    link this machine to the web companion (paste a code)
-      promote    sign in each account here, one at a time, and become the server
+      promote    keep each working sign-in, sign in the rest here, and become the server
       run        the daemon (server or follower, decided by the web)
       status     role, machines, accounts
       selftest   core checks
