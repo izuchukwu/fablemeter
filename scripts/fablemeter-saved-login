@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""The CLI's saved logins, as the menu bar sees them: keyed by account UUID.
+
+The app's row labels are editable and are not the CLI's keys, and the CLI's
+own lookups match nicknames too, so nothing here is keyed by a letter.
+
+  health            JSON {"accounts": {<uuid>: {"status", "live"}}}, read-only.
+  reconnect <uuid>  Make that account's saved login work again. Decided now,
+                    from the live login: the live account is saved from the
+                    running login (no browser), any other is re-enrolled with
+                    one browser approval. The CLI's checks run under its own
+                    lock and are bound to the UUID, so a login switched or a
+                    label renamed in between refuses instead of saving the
+                    wrong account. Logged as the user, never as an agent.
+"""
+import io
+import json
+import os
+import runpy
+import sys
+import uuid as uuidlib
+
+WHO = "user: Fablemeter menu"
+
+
+def norm(value):
+    try:
+        return str(uuidlib.UUID(str(value).strip())).lower()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def by_uuid(meta, want):
+    """The one saved key holding `want`, or None. Keys and nicknames are never
+    consulted: a nickname can collide with another row's key."""
+    hits = [k for k, v in meta.items() if norm(v.get("accountUuid")) == want]
+    return hits[0] if len(hits) == 1 else None
+
+
+def rekey(health_accounts, meta):
+    """The CLI's per-key health, re-keyed by account UUID. A key with no UUID,
+    or a UUID on two keys, is dropped: it cannot be shown on the right row."""
+    out = {}
+    for key, entry in health_accounts.items():
+        want = norm((meta.get(key) or {}).get("accountUuid"))
+        if want and by_uuid(meta, want) == key:
+            out[want] = {"status": entry.get("status"), "live": entry.get("live") is True}
+    return out
+
+
+def bound_state_row(meta, key, want):
+    """What save and enroll check the account against, from the UUID and the
+    CLI's own record, never from the app's label."""
+    row = meta.get(key) or {}
+    return {"accountId": want, "label": key, "nickname": row.get("nickname") or key}
+
+
+def load_api():
+    return runpy.run_path(os.path.expanduser("~/.claude/bin/fablemeter"))
+
+
+def health():
+    api = load_api()
+    ctx = api["real_ctx"]()
+    buffer = io.StringIO()
+    status = api["swap_health"](ctx, out=lambda text: buffer.write(text))
+    if status != 0:
+        return 1
+    accounts = json.loads(buffer.getvalue()).get("accounts") or {}
+    print(json.dumps({"accounts": rekey(accounts, api["_load_meta"](ctx))}, sort_keys=True))
+    return 0
+
+
+def reconnect(raw):
+    want = norm(raw)
+    if not want:
+        print("Fablemeter does not know which account this row is.", file=sys.stderr)
+        return 1
+    api = load_api()
+    SwapError = api["SwapError"]
+    ctx = api["real_ctx"]()
+    key = by_uuid(api["_load_meta"](ctx), want)
+    if not key:
+        print("This account is not saved for switching on this Mac.", file=sys.stderr)
+        return 1
+    save, enroll = api["swap_save"], api["swap_enroll"]
+    # Both functions share one module namespace. Their account check and their
+    # read of the live login are bound to the UUID there, so they run under
+    # the CLI's own lock against what is true at that moment.
+    names = save.__globals__
+    names["_state_row"] = lambda c, label: bound_state_row(api["_load_meta"](c), label, want)
+    original_live = names["_live_identity"]
+    live = original_live(ctx) or {}
+    try:
+        if norm(live.get("accountUuid")) == want:
+            def live_is_want(c):
+                found = original_live(c)
+                if not found or norm(found.get("accountUuid")) != want:
+                    raise SwapError("the logged-in account changed; nothing saved")
+                return found
+            names["_live_identity"] = live_is_want
+            return save(ctx, key, lambda text: print(text), who=WHO)
+        return enroll(ctx, key, who=WHO, force=True)
+    except SwapError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+def selftest():
+    a, b = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    meta = {"C": {"nickname": "P", "accountUuid": b}, "P": {"nickname": "Personal", "accountUuid": a.upper()},
+            "X": {"nickname": "No id"}}
+    checks = [
+        ("a nickname equal to another key does not capture its UUID", by_uuid(meta, a) == "P"),
+        ("an unknown UUID resolves to nothing", by_uuid(meta, "33333333-3333-4333-8333-333333333333") is None),
+        ("a UUID on two keys resolves to nothing",
+         by_uuid({"A": {"accountUuid": a}, "B": {"accountUuid": a}}, a) is None),
+        ("health is keyed by UUID, and a key with no UUID is dropped",
+         rekey({"C": {"status": "expired", "live": False}, "P": {"status": "ok", "live": True},
+                "X": {"status": "ok"}}, meta)
+         == {b: {"status": "expired", "live": False}, a: {"status": "ok", "live": True}}),
+        ("health drops a UUID held by two keys",
+         rekey({"A": {"status": "ok"}, "B": {"status": "ok"}},
+               {"A": {"accountUuid": a}, "B": {"accountUuid": a}}) == {}),
+        ("save and enroll are checked against the UUID, not the app's label",
+         bound_state_row(meta, "C", b) == {"accountId": b, "label": "C", "nickname": "P"}),
+        ("a malformed id is no id", norm("not-a-uuid") is None and norm(None) is None),
+    ]
+    for name, ok in checks:
+        print(("PASS  " if ok else "FAIL  ") + "saved login: " + name)
+    return 0 if all(ok for _, ok in checks) else 1
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--selftest"]:
+        return selftest()
+    if args == ["health"]:
+        return health()
+    if len(args) == 2 and args[0] == "reconnect":
+        return reconnect(args[1])
+    print("usage: fablemeter-saved-login health | reconnect <account-uuid>", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

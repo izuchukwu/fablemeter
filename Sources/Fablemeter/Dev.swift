@@ -3076,3 +3076,77 @@ enum SignInWriteChecks {
         }
     }
 }
+
+/// `--render-reconnect <dir>`: the signed-out row, the reconnect in flight, a
+/// failed reconnect, and the row after a real `reconnect` call succeeds, in both
+/// appearances. Demo accounts and stubbed CLI seams only: no login is read or
+/// changed.
+enum RenderReconnect {
+    @MainActor
+    static func run(into directory: String) -> Int32 {
+        let url = URL(fileURLWithPath: directory, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let out = SavedLoginHealth(status: .expired, isLive: false)
+        let liveOut = SavedLoginHealth(status: .expired, isLive: true)
+
+        for (name, backdrop, tag) in [
+            (NSAppearance.Name.aqua, NSColor(white: 0.96, alpha: 1), "light"),
+            (NSAppearance.Name.darkAqua, NSColor(white: 0.13, alpha: 1), "dark")
+        ] {
+            guard let appearance = NSAppearance(named: name) else { continue }
+            func shot(_ state: AppState, _ file: String) {
+                let host = NSHostingView(rootView: PopoverView(state: state))
+                host.appearance = appearance
+                host.wantsLayer = true
+                host.layer?.backgroundColor = backdrop.cgColor
+                host.frame = NSRect(origin: .zero, size: host.fittingSize)
+                let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+                window.appearance = appearance
+                window.backgroundColor = backdrop
+                window.contentView = host
+                window.orderFront(nil)
+                host.layoutSubtreeIfNeeded()
+                RunLoop.current.run(until: Date().addingTimeInterval(0.6))
+                host.layoutSubtreeIfNeeded()
+                if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                    host.cacheDisplay(in: host.bounds, to: rep)
+                    if let png = rep.representation(using: .png, properties: [:]) {
+                        let path = url.appendingPathComponent("\(file)-\(tag).png")
+                        try? png.write(to: path)
+                        print("wrote \(path.path)")
+                    }
+                }
+                window.orderOut(nil)
+            }
+
+            let signedOut = AppState(demo: true, demoCount: 3)
+            signedOut.applyDemoSavedLogins(["T": out, "W": SavedLoginHealth(status: .ok, isLive: false), "P": SavedLoginHealth(status: .ok, isLive: true)])
+            shot(signedOut, "signedout")
+
+            let running = AppState(demo: true, demoCount: 3)
+            running.applyDemoSavedLogins(["T": out], reconnects: ["T": .running("Approve in browser…")])
+            shot(running, "running")
+
+            let failed = AppState(demo: true, demoCount: 3)
+            failed.applyDemoSavedLogins(["T": out], reconnects: ["T": .failed("approval timed out")])
+            shot(failed, "failed")
+
+            // The real flow end to end against stubs: click -> running -> CLI ok -> health re-read -> row clears.
+            let flow = AppState(demo: true, demoCount: 3)
+            flow.applyDemoSavedLogins(["T": liveOut])
+            flow.healthReader = { nil }
+            flow.reconnectRunner = { key in
+                print("stub helper would run: fablemeter-saved-login reconnect \(key)")
+                Thread.sleep(forTimeInterval: 0.8)
+                return (true, "")
+            }
+            if let row = flow.displayRows(now: Date()).first(where: { $0.label.uppercased() == "T" }) { flow.reconnect(row) }
+            shot(flow, "after-clicked")
+            RunLoop.current.run(until: Date().addingTimeInterval(1.6))
+            shot(flow, "after-reconnect")
+            RunLoop.current.run(until: Date().addingTimeInterval(4.5))
+            shot(flow, "after-settled")
+        }
+        return 0
+    }
+}

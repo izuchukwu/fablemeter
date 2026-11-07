@@ -14,6 +14,20 @@ final class AppState: ObservableObject {
     @Published private(set) var budget: [String: BudgetEntry] = [:]
     private var budgetAttempt = Date.distantPast
     private var budgetFetching = false
+    /// Per account UUID (see `savedLoginKey`), never per label: the app's
+    /// labels are editable and are not the CLI's keys. Absent until the first
+    /// read, which shows nothing rather than a guess.
+    @Published private(set) var savedLogins: [String: SavedLoginHealth] = [:]
+    @Published private(set) var reconnects: [String: ReconnectProgress] = [:]
+    private var savedLoginAttempt = Date.distantPast
+    /// Both seams are replaceable so the demo render can drive the whole flow
+    /// against fixtures. In a demo they start inert (see `init`), so nothing a
+    /// demo does can reach a real login, whatever path asks.
+    var healthReader: @Sendable () -> Data? = { AppState.runHelper("fablemeter-saved-login", ["health"], timeout: 20).stdout }
+    var reconnectRunner: @Sendable (String) -> (ok: Bool, stderr: String) = { accountId in
+        let result = AppState.runHelper("fablemeter-saved-login", ["reconnect", accountId], timeout: 330)
+        return (result.status == 0, result.stderrText)
+    }
     @Published private(set) var accounts: [Account] = []
     @Published private(set) var states: [UUID: AccountState] = [:]
     @Published private(set) var history = UsageHistory(legacy: UsageHistory.legacyFile)
@@ -124,6 +138,8 @@ final class AppState: ObservableObject {
     init(demo: Bool = false, demoCount: Int? = nil) {
         isDemo = demo
         if demo {
+            healthReader = { nil }
+            reconnectRunner = { _ in (false, "Not available in the demo") }
             let seeded = AppState.demoData(count: demoCount)
             accounts = seeded.accounts
             states = seeded.states
@@ -156,6 +172,7 @@ final class AppState: ObservableObject {
             while !Task.isCancelled {
                 await self?.refreshCodex()
                 await self?.refreshBudget()
+                await self?.refreshSavedLogins()
                 await self?.followIfFollowing()
                 await self?.refreshRemoteIfDue()
                 await self?.refresh(reason: .scheduled)
@@ -170,6 +187,101 @@ final class AppState: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in await self?.refresh(reason: .opportunistic) }
         }
+    }
+
+    private func refreshSavedLogins(force: Bool = false) async {
+        guard force || Date().timeIntervalSince(savedLoginAttempt) >= 60 else { return }
+        savedLoginAttempt = Date()
+        let reader = healthReader
+        let data = await Task.detached(priority: .utility) { reader() }.value
+        if let data, let decoded = SavedLoginHealth.decode(data) { savedLogins = decoded }
+    }
+
+    /// The key a row's saved-login health and reconnect live under: the row's
+    /// Anthropic account UUID. A demo row has no real one, so it gets a demo
+    /// key the inert demo seams never resolve.
+    func savedLoginKey(for row: DisplayRow) -> String? {
+        isDemo ? "demo:\(row.label.uppercased())" : accountUUID(for: row)
+    }
+
+    var isReconnecting: Bool {
+        reconnects.values.contains { if case .running = $0 { return true }; return false }
+    }
+
+    /// One interactive flow at a time: an enroll holds a loopback listener and
+    /// a browser tab, and a save reads the live login, so neither may overlap a
+    /// sign-in, a promotion, an account switch or another reconnect.
+    var canReconnect: Bool { !isSigningIn && !isPromoting && !isSelectingAccount && !isReconnecting }
+
+    /// Runs the saved-login flow for one account and reports into its row.
+    /// Whether it saves the live login or enrolls through the browser is
+    /// decided by the helper at the moment it runs, not from the cached read.
+    func reconnect(_ row: DisplayRow) {
+        guard canReconnect, let key = savedLoginKey(for: row), let health = savedLogins[key] else { return }
+        reconnects[key] = .running(health.isLive ? "Saving…" : "Approve in browser…")
+        let runner = reconnectRunner
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { runner(key) }.value
+            if result.ok {
+                reconnects[key] = .done
+                savedLogins[key] = SavedLoginHealth(status: .ok, isLive: health.isLive)
+                await refreshSavedLogins(force: true)
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if reconnects[key] == .done { reconnects[key] = nil }
+            } else {
+                reconnects[key] = .failed(SavedLoginHealth.failureLine(result.stderr))
+                await refreshSavedLogins(force: true)
+            }
+        }
+    }
+
+    /// Demo only: put the rows in a chosen state without a CLI. Keys are row
+    /// labels here and become demo keys.
+    func applyDemoSavedLogins(_ logins: [String: SavedLoginHealth], reconnects: [String: ReconnectProgress] = [:]) {
+        guard isDemo else { return }
+        savedLogins = Dictionary(uniqueKeysWithValues: logins.map { ("demo:\($0.key.uppercased())", $0.value) })
+        self.reconnects = Dictionary(uniqueKeysWithValues: reconnects.map { ("demo:\($0.key.uppercased())", $0.value) })
+    }
+
+    /// Runs a bundled helper with a named interpreter (a login item starts with
+    /// launchd's bare PATH, where `env python3` may not resolve). Bounded: past
+    /// `timeout` the child is asked to stop, then killed, and the read gives up
+    /// shortly after either way, so a wedged child never stalls the poll loop.
+    nonisolated static func runHelper(_ name: String, _ arguments: [String], timeout: TimeInterval) -> (status: Int32, stdout: Data?, stderrText: String) {
+        guard let helper = Bundle.main.url(forResource: name, withExtension: nil) else {
+            return (-1, nil, "Reinstall Fablemeter: a helper is missing")
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: Budget.python)
+        process.arguments = [helper.path] + arguments
+        let out = Pipe(), err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        process.standardInput = FileHandle.nullDevice
+        do { try process.run() } catch { return (-1, nil, "Couldn't start the helper") }
+        let pid = process.processIdentifier
+        let stop = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        let kill = DispatchWorkItem { if process.isRunning { Darwin.kill(pid, SIGKILL) } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: stop)
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout + 5, execute: kill)
+        // Both pipes drain on their own threads, so neither a chatty child nor
+        // a grandchild holding a pipe open can stall this thread past the bound.
+        final class Box: @unchecked Sendable { var out = Data(); var err = Data() }
+        let box = Box()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async { box.out = out.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+        group.enter()
+        DispatchQueue.global().async { box.err = err.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+        let finished = group.wait(timeout: .now() + timeout + 10) == .success
+        stop.cancel(); kill.cancel()
+        guard finished, !process.isRunning else {
+            if process.isRunning { Darwin.kill(pid, SIGKILL) }
+            return (-1, nil, "Didn't finish in time")
+        }
+        process.waitUntilExit()
+        return (process.terminationStatus, process.terminationStatus == 0 ? box.out : nil,
+                String(decoding: box.err, as: UTF8.self))
     }
 
     private func refreshCodex(force: Bool = false) async {
@@ -214,7 +326,7 @@ final class AppState: ObservableObject {
     @Published private(set) var isSelectingAccount = false
 
     var canSelectAccount: Bool {
-        !isDemo && !isSelectingAccount && !isSigningIn && !isPromoting && Budget.isAvailable
+        !isDemo && !isSelectingAccount && !isSigningIn && !isPromoting && !isReconnecting && Budget.isAvailable
     }
 
     /// The Anthropic account UUID behind a row: the switch is bound to it, not
@@ -240,13 +352,15 @@ final class AppState: ObservableObject {
             isSelectingAccount = false
             signInError = error
             await refreshBudget(force: true)
+            // Which account is live decides how a reconnect runs.
+            await refreshSavedLogins(force: true)
         }
     }
 
 
     /// A promotion owns the sign-in while it runs: a second browser flow would
     /// race it for the loopback listener and the person's attention.
-    var canAddAccount: Bool { !isDemo && !isSigningIn && !isPromoting }
+    var canAddAccount: Bool { !isDemo && !isSigningIn && !isPromoting && !isReconnecting }
 
     /// What the status item draws, one cell per account. `headroom` is the last
     /// reading that arrived even when the newest attempt failed, so a 429 dims
@@ -602,6 +716,7 @@ final class AppState: ObservableObject {
             defer { isManualRefreshing = false }
             let started = Date()
             await refreshCodex(force: true)
+            await refreshSavedLogins(force: true)
             // A follower's refresh is asking the web for the server's latest,
             // never Anthropic.
             if isFollowingServer { await followIfFollowing(force: true) }
@@ -628,7 +743,7 @@ final class AppState: ObservableObject {
     /// screen has actually gone stale.
     func refreshIfStale() {
         guard !isDemo else { return }
-        Task { await refreshCodex(); await refresh(reason: .opportunistic) }
+        Task { await refreshCodex(); await refreshSavedLogins(); await refresh(reason: .opportunistic) }
     }
 
     private static func load(_ account: Account, vault: TokenVault) async -> FetchOutcome {
@@ -737,7 +852,7 @@ final class AppState: ObservableObject {
     /// keeps its id, nickname, label and place in the order; only the
     /// credential underneath it is replaced.
     func signInAgain(_ account: Account) {
-        guard !isDemo, !isSigningIn, !isPromoting else { return }
+        guard !isDemo, !isSigningIn, !isPromoting, !isReconnecting else { return }
         isSigningIn = true
         signInError = nil
         let id = account.id
@@ -999,7 +1114,7 @@ final class AppState: ObservableObject {
     /// here, one at a time. Then — only then — the web is told. See
     /// `PromoteSequence` and `KeepOwnSignIn`.
     func promoteThisMac() {
-        guard !isDemo, !isPromoting, !isSigningIn, !isConnectingWeb, let client = webClient() else { return }
+        guard !isDemo, !isPromoting, !isSigningIn, !isReconnecting, !isConnectingWeb, let client = webClient() else { return }
         isPromoting = true
         promotionStep = nil
         signInError = nil

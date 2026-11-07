@@ -24,12 +24,14 @@ BIN="$(swift build -c release --show-bin-path)/$EXEC_NAME"
 echo "==> selftest"
 "$BIN" --selftest
 python3 scripts/fablemeter-select --selftest
+python3 scripts/fablemeter-saved-login --selftest
 
 echo "==> assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/$EXEC_NAME"
 cp scripts/fablemeter-select "$APP/Contents/Resources/fablemeter-select"
+cp scripts/fablemeter-saved-login "$APP/Contents/Resources/fablemeter-saved-login"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
