@@ -138,14 +138,18 @@ extension CoreChecks {
             func add(_ s: String) { entries.withLock { $0.append(s) } }
             var all: [String] { entries.withLock { $0 } }
         }
-        func run(failAt: Int? = nil, cancelAt: Int? = nil, promoteFails: Bool = false) -> (PromoteSequence.Outcome, [String]) {
+        func run(failAt: Int? = nil, cancelAt: Int? = nil, promoteFails: Bool = false, keepLabels: Set<String> = []) -> (PromoteSequence.Outcome, [String]) {
             let log = Log()
             let done = DispatchSemaphore(value: 0)
             let result = Locked<PromoteSequence.Outcome?>(initialState: nil)
             Task.detached {
                 let outcome = await PromoteSequence.run(
                     accounts: accounts,
-                    progress: { i, n, a in log.add("step \(i)/\(n) \(a.nickname)") },
+                    progress: { i, n, a, phase in
+                        if phase == .signingIn { log.add("step \(i)/\(n) \(a.nickname)") }
+                        if phase == .kept { log.add("kept \(a.label)") }
+                    },
+                    keep: { a in keepLabels.contains(a.label) },
                     signIn: { a in
                         log.add("sign \(a.label)")
                         if let failAt, a.label == accounts[failAt].label { throw Boom() }
@@ -167,6 +171,12 @@ extension CoreChecks {
         let ok = run()
         check("promote: all three sign in, one at a time, in order, then the web is told",
               ok.0 == .promoted && ok.1 == ["step 1/3 Personal", "sign P", "step 2/3 Charm", "sign C", "step 3/3 Iconic", "sign I", "promote"], "\(ok.1)")
+        let mixed = run(keepLabels: ["P", "I"])
+        check("promote: accounts whose own sign-in works are kept; only the rest sign in, then the web is told",
+              mixed.0 == .promoted && mixed.1 == ["kept P", "step 2/3 Charm", "sign C", "kept I", "promote"], "\(mixed.1)")
+        let allKept = run(keepLabels: ["P", "C", "I"])
+        check("promote: when every own sign-in works, nobody is asked to sign in",
+              allKept.0 == .promoted && allKept.1 == ["kept P", "kept C", "kept I", "promote"], "\(allKept.1)")
         let failed = run(failAt: 1)
         check("promote: a failed sign-in stops everything and never calls /api/promote",
               failed.0 == .failed("boom") && !failed.1.contains("promote") && !failed.1.contains("sign I"), "\(failed.1)")
@@ -192,7 +202,7 @@ extension CoreChecks {
         let nothing = DispatchSemaphore(value: 0)
         let empty = Locked<PromoteSequence.Outcome?>(initialState: nil)
         Task.detached {
-            let o = await PromoteSequence.run(accounts: [], progress: { _, _, _ in }, signIn: { _ in }, promote: {}, describe: { _ in "" })
+            let o = await PromoteSequence.run(accounts: [], progress: { _, _, _, _ in }, keep: { _ in false }, signIn: { _ in }, promote: {}, describe: { _ in "" })
             empty.withLock { $0 = o }
             nothing.signal()
         }

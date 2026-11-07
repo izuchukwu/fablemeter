@@ -23,6 +23,7 @@ enum CoreChecks {
         followerDrawing(check)
         serverMenu(check)
         promoteSequence(check)
+        keepOwnSignIn(check)
         signInIdentity(check)
         numberShapes(check)
         snapshotSource(check)
@@ -70,6 +71,12 @@ enum CoreChecks {
 
         check("machine id: normalize lowercases and trims", MachineID.normalize(" \(upper)\n") == lower, "")
         check("machine id: same() ignores case", MachineID.same(upper, lower), "")
+        check("machine name: FABLEMETER_MACHINE_NAME overrides the hostname, trimmed",
+              MachineIdentity.displayName(environment: ["FABLEMETER_MACHINE_NAME": "  Icon Remote\n"], fallback: "1kxdd40caw") == "Icon Remote", "")
+        check("machine name: a blank override falls back to the hostname",
+              MachineIdentity.displayName(environment: ["FABLEMETER_MACHINE_NAME": " \n"], fallback: "1kxdd40caw") == "1kxdd40caw", "")
+        check("machine name: no override is the hostname",
+              MachineIdentity.displayName(environment: [:], fallback: "1kxdd40caw") == "1kxdd40caw", "")
         check("machine id: same() never matches a missing id",
               !MachineID.same(nil, lower) && !MachineID.same(lower, nil) && !MachineID.same(nil, nil), "")
         check("machine id: same() never matches two empty ids", !MachineID.same("", " "), "")
