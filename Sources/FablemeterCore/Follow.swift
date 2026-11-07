@@ -200,8 +200,12 @@ enum ServerMenuModel {
 
 // MARK: - Promoting this Mac
 
-/// Sign every account in again on this machine, one at a time, then — only
-/// then — tell the web this machine is the server.
+/// Make sure every account has a working sign-in of this machine's own, one at
+/// a time, then — only then — tell the web this machine is the server.
+///
+/// Each account first tests the sign-in this machine already holds (`keep`,
+/// see `KeepOwnSignIn`): a token that still refreshes and still belongs to the
+/// row is kept, and only the rest are asked to sign in again.
 ///
 /// A cancel or a failure anywhere before the last sign-in stops everything:
 /// the web is never told, so the machine stays whatever it was. Accounts that
@@ -214,11 +218,21 @@ enum PromoteSequence {
         case failed(String)
     }
 
+    enum Phase: Equatable {
+        /// Testing the sign-in this machine already holds.
+        case checking
+        /// The stored sign-in works and is the right account: no sign-in.
+        case kept
+        /// Asking for a fresh sign-in.
+        case signingIn
+    }
+
     static let noAccountsText = "No accounts to sign in"
 
     static func run(
         accounts: [Account],
-        progress: @Sendable (_ index: Int, _ count: Int, _ account: Account) async -> Void,
+        progress: @Sendable (_ index: Int, _ count: Int, _ account: Account, _ phase: Phase) async -> Void,
+        keep: @Sendable (Account) async -> Bool,
         signIn: @Sendable (Account) async throws -> Void,
         promote: @Sendable () async throws -> Void,
         describe: @Sendable (Error) -> String
@@ -226,7 +240,14 @@ enum PromoteSequence {
         guard !accounts.isEmpty else { return .failed(noAccountsText) }
         for (index, account) in accounts.enumerated() {
             if Task.isCancelled { return .cancelled }
-            await progress(index + 1, accounts.count, account)
+            await progress(index + 1, accounts.count, account, .checking)
+            let kept = await keep(account)
+            if Task.isCancelled { return .cancelled }
+            if kept {
+                await progress(index + 1, accounts.count, account, .kept)
+                continue
+            }
+            await progress(index + 1, accounts.count, account, .signingIn)
             do {
                 try await signIn(account)
             } catch is CancellationError {

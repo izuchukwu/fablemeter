@@ -880,8 +880,10 @@ final class AppState: ObservableObject {
 
     // MARK: Promotion
 
-    /// "Make This Mac the Server": every account signs in again here, one at a
-    /// time, then — only then — the web is told. See `PromoteSequence`.
+    /// "Make This Mac the Server": each account keeps this Mac's own sign-in
+    /// if it still works and is the right account; the rest sign in again
+    /// here, one at a time. Then — only then — the web is told. See
+    /// `PromoteSequence` and `KeepOwnSignIn`.
     func promoteThisMac() {
         guard !isDemo, !isPromoting, !isSigningIn, !isConnectingWeb, let client = webClient() else { return }
         isPromoting = true
@@ -919,8 +921,18 @@ final class AppState: ObservableObject {
         let renamed = await inheritServerNames(client: client)
         let outcome = await PromoteSequence.run(
             accounts: accounts,
-            progress: { [weak self] index, count, account in
-                await self?.showStep(PromoteSequence.stepText(nickname: account.nickname, index: index, count: count))
+            progress: { [weak self] index, count, account, phase in
+                let text: String
+                switch phase {
+                case .checking: text = KeepOwnSignIn.checkingText(nickname: account.nickname, index: index, count: count)
+                case .kept: text = KeepOwnSignIn.keptText(nickname: account.nickname, machine: "this Mac")
+                case .signingIn: text = PromoteSequence.stepText(nickname: account.nickname, index: index, count: count)
+                }
+                await self?.showStep(text)
+            },
+            keep: { [weak self] account in
+                guard let self else { return false }
+                return await self.keepOwnSignIn(account)
             },
             signIn: { [weak self] account in
                 guard let self else { throw CancellationError() }
@@ -954,6 +966,31 @@ final class AppState: ObservableObject {
     }
 
     private func showStep(_ text: String) { promotionStep = text }
+
+    /// Test this Mac's own stored sign-in for one account before asking for a
+    /// new one. The vault spends the token under the account's refresh lock
+    /// and persists the rotation, exactly like an ordinary refresh; the
+    /// identity it reports is judged by `SignInCheck`. Only a proven match is
+    /// kept. See `KeepOwnSignIn`.
+    private func keepOwnSignIn(_ account: Account) async -> Bool {
+        let current = Store.load().first(where: { $0.id == account.id }) ?? account
+        let decision = await KeepOwnSignIn.check(current, rows: Self.identityRows(), vault: vault)
+        // The probe spent and rotated the token on disk; the in-memory row
+        // must carry the rotated one, never the consumed one, whatever the
+        // verdict.
+        syncFromDisk(account.id)
+        switch decision {
+        case .keep:
+            Log.role.notice("role: promote kept [\(account.character)]'s own sign-in")
+            states[account.id]?.needsSignIn = false
+            retry[account.id] = nil
+            lastAttempt[account.id] = nil
+            return true
+        case .signIn(let reason):
+            Log.role.notice("role: promote [\(account.character)] needs a sign-in — \(reason.text)")
+            return false
+        }
+    }
 
     /// One account, signed in again on this Mac. The account's cross-process
     /// refresh lock is held for the whole of it, so no refresh — this app's or

@@ -23,6 +23,7 @@ enum CoreChecks {
         followerDrawing(check)
         serverMenu(check)
         promoteSequence(check)
+        keepOwnSignIn(check)
         signInIdentity(check)
         numberShapes(check)
         snapshotSource(check)
