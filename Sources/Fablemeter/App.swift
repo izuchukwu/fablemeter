@@ -57,6 +57,11 @@ final class AppState: ObservableObject {
     /// which bricks nothing, and it cannot push anyway. Connect it (⋯ menu) to
     /// make it a proper follower.
     @Published private(set) var isFollowingServer = false
+    /// How this Mac orders what it draws (rows and the Codex gauge). A display
+    /// preference only: it is kept in this Mac's own defaults and is never
+    /// sent to, or read from, the server.
+    @Published private(set) var order = OrderPrefs()
+    private let orderDefaults: UserDefaults?
     /// The last answer from `/api/state`: who the server is and which machines
     /// have checked in. The Server submenu is drawn from this and nothing else,
     /// so opening the menu never waits on the network.
@@ -137,6 +142,8 @@ final class AppState: ObservableObject {
 
     init(demo: Bool = false, demoCount: Int? = nil) {
         isDemo = demo
+        orderDefaults = demo ? nil : .standard
+        order = OrderPrefs.load(from: orderDefaults)
         if demo {
             healthReader = { nil }
             reconnectRunner = { _ in (false, "Not available in the demo") }
@@ -368,7 +375,7 @@ final class AppState: ObservableObject {
     var barCells: [BarCell] {
         if isFollowingServer, let followed, !followed.accounts.isEmpty {
             let now = Date()
-            return followed.accounts.map { account in
+            return orderedFollowedAccounts(followed).map { account in
                 var cell = BarCell.cell(character: account.character, state: followed.state(for: account, now: now), fableFirst: isFableFirst,
                              isCapped: budget(for: account.label)?.capped == true)
                 if let row = followedRows(now: now)?.first(where: { $0.id == "server:\(account.rowId)" }) { cell.isActive = isActiveAccount(row) }
@@ -404,6 +411,9 @@ final class AppState: ObservableObject {
             isUnreachable: codexStale
         )
     }
+
+    /// Where the Codex gauge sits among the menu bar cells, left to right.
+    var codexPosition: Int { barCells.count.clamped(codexSlot: order.codexSlot) }
 
     func state(for account: Account) -> AccountState? { states[account.id] }
 
@@ -998,26 +1008,69 @@ final class AppState: ObservableObject {
     // redraws off `objectWillChange`, so the cluster rearranges as the drag
     // crosses each row rather than on drop.
 
-    func canMove(_ account: Account, by delta: Int) -> Bool {
-        AccountOrder.shifted(accounts, id: account.id, by: delta) != nil
+    /// The popover's items, top to bottom, which is also the menu bar's left to
+    /// right: this Mac's own accounts, or the server's rows while following, with
+    /// the Codex gauge wherever the person put it (last by default).
+    func popoverItems(now: Date) -> [PopoverItem] {
+        let rows = displayRows(now: now)
+        let byKey = Dictionary(rows.map { ($0.orderKey, $0) }, uniquingKeysWith: { first, _ in first })
+        return DisplayOrder.arrange(rows: rows.map(\.orderKey), preferred: [], codexSlot: order.codexSlot)
+            .compactMap { key in key == DisplayOrder.codexKey ? .codex : byKey[key].map(PopoverItem.account) }
     }
 
-    func move(_ account: Account, by delta: Int) {
-        guard let reordered = AccountOrder.shifted(accounts, id: account.id, by: delta) else { return }
-        applyOrder(reordered)
+    private func currentOrderKeys() -> [String] {
+        DisplayOrder.arrange(rows: displayRows(now: Date()).map(\.orderKey), preferred: [], codexSlot: order.codexSlot)
     }
 
-    func move(_ account: Account, onto target: Account) {
-        guard let reordered = AccountOrder.moved(accounts, id: account.id, onto: target.id) else { return }
-        applyOrder(reordered)
+    func canMoveItem(_ key: String, by delta: Int) -> Bool {
+        DisplayOrder.shifted(currentOrderKeys(), key: key, by: delta) != nil
     }
 
-    private func applyOrder(_ reordered: [Account]) {
-        accounts = reordered
-        let order = reordered.map(\.id)
-        persistAccounts { stored in
-            stored = AccountOrder.sorted(stored, by: order)
+    func moveItem(_ key: String, by delta: Int) {
+        guard let keys = DisplayOrder.shifted(currentOrderKeys(), key: key, by: delta) else { return }
+        applyOrder(keys)
+    }
+
+    func moveItem(_ key: String, onto target: String) {
+        guard let keys = DisplayOrder.moved(currentOrderKeys(), key: key, onto: target) else { return }
+        applyOrder(keys)
+    }
+
+    /// A Mac that polls owns its accounts' order in the account file (the
+    /// existing behaviour). A follower owns nothing but a preference, so it
+    /// writes only that. Codex's place is a preference either way.
+    private func applyOrder(_ keys: [String]) {
+        let (rows, slot) = DisplayOrder.split(keys)
+        var next = order
+        next.codexSlot = slot
+        // Keyed on what is actually drawn: a follower with no snapshot yet is
+        // still drawing this Mac's own accounts.
+        if followedRows(now: Date()) != nil {
+            next.rowOrder = rows
+        } else {
+            let byKey = Dictionary(accounts.map { ($0.id.uuidString, $0) }, uniquingKeysWith: { first, _ in first })
+            let reordered = rows.compactMap { byKey[$0] }
+            if reordered.count == accounts.count, reordered.map(\.id) != accounts.map(\.id) {
+                accounts = reordered
+                let ids = reordered.map(\.id)
+                persistAccounts { stored in stored = AccountOrder.sorted(stored, by: ids) }
+            }
         }
+        guard next != order else { return }
+        order = next
+        order.save(to: orderDefaults)
+    }
+
+    /// The server's rows in this Mac's preferred order; rows it has not placed
+    /// keep the server's order, after the ones it has.
+    private func orderedFollowedAccounts(_ snapshot: FollowedSnapshot) -> [FollowedAccount] {
+        let rank = Dictionary(order.rowOrder.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        return snapshot.accounts.enumerated()
+            .sorted { l, r in
+                (rank["server:\(l.element.rowId)"] ?? (order.rowOrder.count + l.offset))
+                    < (rank["server:\(r.element.rowId)"] ?? (order.rowOrder.count + r.offset))
+            }
+            .map(\.element)
     }
 
     func setLabel(_ raw: String, for account: Account) {
@@ -1052,7 +1105,7 @@ final class AppState: ObservableObject {
         // UUID — the payload never carries an address, and a label match could
         // put one account's address on another's numbers.
         let ids = isDemo ? [:] : AccountIdentity.load()
-        return followed.accounts.map { row in
+        return orderedFollowedAccounts(followed).map { row in
             let local = row.accountId.flatMap { id in
                 accounts.first { ids[$0.id] == id }
             }
@@ -1590,4 +1643,25 @@ struct DisplayRow: Identifiable {
     let local: Account?
 
     var character: Character { label.first ?? "?" }
+
+    /// The key this row goes by in `DisplayOrder`: the account's UUID here, or
+    /// `server:<row id>`, which is already what `id` holds for a server row.
+    var orderKey: String { local?.id.uuidString ?? id }
+}
+
+enum PopoverItem {
+    case account(DisplayRow)
+    case codex
+
+    var key: String {
+        switch self {
+        case .account(let row): return row.orderKey
+        case .codex: return DisplayOrder.codexKey
+        }
+    }
+}
+
+private extension Int {
+    /// `codexSlot` clamped to a list of `self` cells; nil means last.
+    func clamped(codexSlot: Int?) -> Int { Swift.min(Swift.max(codexSlot ?? self, 0), self) }
 }

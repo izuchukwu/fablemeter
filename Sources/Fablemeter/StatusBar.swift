@@ -229,11 +229,13 @@ enum BarRenderer {
     /// - Parameter codex: the Codex gauge, drawn as the last cell after the
     ///   Claude ones. `nil` draws the Claude cluster exactly as before.
     static func image(
-        for claudeCells: [BarCell], codex: BarCell? = nil, appearance: NSAppearance? = nil
+        for claudeCells: [BarCell], codex: BarCell? = nil, codexIndex: Int? = nil,
+        appearance: NSAppearance? = nil
     ) -> NSImage {
         guard !claudeCells.isEmpty else { return emptyImage() }
 
-        let cells = claudeCells + (codex.map { [$0] } ?? [])
+        var cells = claudeCells
+        if let codex { cells.insert(codex, at: min(max(codexIndex ?? cells.count, 0), cells.count)) }
         let colored = forcesColor(cells)
         let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
         let textHeight = ceil(font.ascender - font.descender)
@@ -391,6 +393,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     private var cancellable: AnyCancellable?
     private var renderedCells: [BarCell]?
     private var renderedCodex: BarCell??
+    private var renderedCodexIndex: Int?
     /// Live only while the popover is open. See `installOutsideClickMonitor`.
     private var outsideClickMonitor: Any?
 
@@ -451,11 +454,13 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     private func redraw(force: Bool = false) {
         let cells = state.barCells
         let codex = state.codexCell
-        guard force || cells != renderedCells || renderedCodex != .some(codex) else { return }
+        let codexIndex = state.codexPosition
+        guard force || cells != renderedCells || renderedCodex != .some(codex) || renderedCodexIndex != codexIndex else { return }
         renderedCells = cells
         renderedCodex = .some(codex)
+        renderedCodexIndex = codexIndex
         guard let button = statusItem.button else { return }
-        button.image = BarRenderer.image(for: cells, codex: codex)
+        button.image = BarRenderer.image(for: cells, codex: codex, codexIndex: codexIndex)
     }
 
     @objc private func togglePopover() {

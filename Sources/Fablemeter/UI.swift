@@ -481,16 +481,18 @@ struct AccountRow: View {
                 Button("Reset 5-Hour Window", action: resetWindow)
                 if !isReadOnly { Divider() }
             }
-            // A server row belongs to the server; there is nothing here to do
-            // to it.
+            // A server row belongs to the server, so the only thing to do to it
+            // here is place it: the order is this Mac's own preference.
             if !isReadOnly {
                 Button("Reconnect Account…", action: signIn).disabled(isSigningIn)
                 Divider()
                 Button("Set Label…", action: beginLabelEdit)
                 Button("Rename…", action: beginNameEdit)
                 Divider()
-                Button("Move Up", action: moveUp).disabled(!canMoveUp)
-                Button("Move Down", action: moveDown).disabled(!canMoveDown)
+            }
+            Button("Move Up", action: moveUp).disabled(!canMoveUp)
+            Button("Move Down", action: moveDown).disabled(!canMoveDown)
+            if !isReadOnly {
                 Divider()
                 Button("Sign Out", action: signOut)
             }
@@ -569,11 +571,25 @@ extension View {
     }
 }
 
+extension View {
+    /// Lifts, drags and accepts drops for one item in the popover's list, an
+    /// account row or the Codex row alike.
+    func reorderable(key: String, enabled: Bool, state: AppState, draggingID: Binding<String?>) -> some View {
+        self
+            .modifier(LiftEffect(isLifted: draggingID.wrappedValue == key))
+            .onDrag(if: enabled) {
+                draggingID.wrappedValue = key
+                return NSItemProvider(object: key as NSString)
+            }
+            .onDrop(of: [.text], delegate: AccountDropDelegate(targetKey: key, state: state, draggingID: draggingID))
+    }
+}
+
 /// Catches the drop that lands in the popover but not on a row — the footer,
 /// the padding, a divider — so the lifted row settles back instead of staying
 /// dimmed.
 struct LiftReleaseDelegate: DropDelegate {
-    @Binding var draggingID: UUID?
+    @Binding var draggingID: String?
 
     func validateDrop(info: DropInfo) -> Bool { draggingID != nil }
 
@@ -590,9 +606,9 @@ struct LiftReleaseDelegate: DropDelegate {
 /// is the model, so there is nothing to commit afterwards — the drop only ends
 /// the lift.
 struct AccountDropDelegate: DropDelegate {
-    let target: Account
+    let targetKey: String
     let state: AppState
-    @Binding var draggingID: UUID?
+    @Binding var draggingID: String?
 
     func validateDrop(info: DropInfo) -> Bool { draggingID != nil }
 
@@ -600,11 +616,9 @@ struct AccountDropDelegate: DropDelegate {
 
     func dropEntered(info: DropInfo) {
         MainActor.assumeIsolated {
-            guard let draggingID, draggingID != target.id,
-                  let source = state.accounts.first(where: { $0.id == draggingID })
-            else { return }
+            guard let draggingID, draggingID != targetKey else { return }
             withAnimation(.easeInOut(duration: 0.18)) {
-                state.move(source, onto: target)
+                state.moveItem(draggingID, onto: targetKey)
             }
         }
     }
@@ -745,9 +759,11 @@ struct PopoverView: View {
     @State private var dismissToken = 0
     @State private var clickMonitor: Any?
     /// The account currently lifted out of the list, if any.
-    @State private var draggingID: UUID?
+    @State private var draggingID: String?
 
-    private var canReorder: Bool { !state.isFollowingServer && state.accounts.count > 1 }
+    /// Works on a follower too: the order is this Mac's own display preference.
+    /// Codex counts as an item, so even a lone account can be ordered against it.
+    private func canReorder(_ items: [PopoverItem]) -> Bool { items.count > 1 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -760,13 +776,18 @@ struct PopoverView: View {
             Divider()
 
             TimelineView(.periodic(from: .now, by: 30)) { context in
+                let items = state.popoverItems(now: context.date)
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(state.displayRows(now: context.date).enumerated()), id: \.element.id) { index, row in
+                    ForEach(Array(items.enumerated()), id: \.element.key) { index, item in
                         if index > 0 { Divider() }
-                        rowView(row, now: context.date)
+                        switch item {
+                        case .account(let row):
+                            rowView(row, now: context.date, reorderable: canReorder(items))
+                        case .codex:
+                            CodexRow(reading: state.codex, stale: state.codexStale, now: context.date, history: state.history)
+                                .reorderable(key: DisplayOrder.codexKey, enabled: canReorder(items), state: state, draggingID: $draggingID)
+                        }
                     }
-                    if !state.displayRows(now: context.date).isEmpty { Divider() }
-                    CodexRow(reading: state.codex, stale: state.codexStale, now: context.date, history: state.history)
                 }
             }
 
@@ -799,7 +820,7 @@ struct PopoverView: View {
     }
 
     @ViewBuilder
-    private func rowView(_ row: DisplayRow, now: Date) -> some View {
+    private func rowView(_ row: DisplayRow, now: Date, reorderable: Bool) -> some View {
         let base = AccountRow(
             row: row,
             isActive: state.isActiveAccount(row),
@@ -812,12 +833,12 @@ struct PopoverView: View {
             fableFirst: state.isFableFirst,
             showsFableBars: state.showsFableBars,
             dismissToken: dismissToken,
-            canMoveUp: row.local.map { state.canMove($0, by: -1) } ?? false,
-            canMoveDown: row.local.map { state.canMove($0, by: 1) } ?? false,
+            canMoveUp: state.canMoveItem(row.orderKey, by: -1),
+            canMoveDown: state.canMoveItem(row.orderKey, by: 1),
             setLabel: { value in if let account = row.local { state.setLabel(value, for: account) } },
             setNickname: { value in if let account = row.local { state.setNickname(value, for: account) } },
-            moveUp: { if let account = row.local { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: -1) } } },
-            moveDown: { if let account = row.local { withAnimation(.easeInOut(duration: 0.18)) { state.move(account, by: 1) } } },
+            moveUp: { withAnimation(.easeInOut(duration: 0.18)) { state.moveItem(row.orderKey, by: -1) } },
+            moveDown: { withAnimation(.easeInOut(duration: 0.18)) { state.moveItem(row.orderKey, by: 1) } },
             isSigningIn: state.isSigningIn || state.isPromoting,
             signIn: { if let account = row.local { state.signInAgain(account) } },
             signOut: { if let account = row.local { state.remove(account) } },
@@ -826,20 +847,7 @@ struct PopoverView: View {
             reconnectSavedLogin: { state.reconnect(row) },
             canReconnect: state.canReconnect
         )
-        if let account = row.local {
-            base
-                .modifier(LiftEffect(isLifted: draggingID == account.id))
-                .onDrag(if: canReorder) {
-                    draggingID = account.id
-                    return NSItemProvider(object: account.id.uuidString as NSString)
-                }
-                .onDrop(
-                    of: [.text],
-                    delegate: AccountDropDelegate(target: account, state: state, draggingID: $draggingID)
-                )
-        } else {
-            base
-        }
+        base.reorderable(key: row.orderKey, enabled: reorderable, state: state, draggingID: $draggingID)
     }
 
     /// A transparent hit target behind the rows never sees these clicks — the
