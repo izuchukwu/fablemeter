@@ -210,6 +210,11 @@ case "promote":
         // add more.
         let existing = Store.load()
         let vault = TokenVault()
+        // Rows that ended with neither a kept sign-in nor a checked fresh one.
+        // Any of them stops the promotion, as a failed sign-in does on the
+        // Mac: a server never starts on a credential nothing has proven. A
+        // re-run is cheap, because every account that works is kept.
+        var unproven: [String] = []
         for (index, account) in existing.enumerated() {
             // Tested for real against this machine's own stored token (the
             // vault takes the account's refresh lock and persists the
@@ -224,7 +229,8 @@ case "promote":
             }
             let heading = "Account \(index + 1) of \(existing.count) — \(account.nickname) (\(account.email))"
             guard let result = await signIn(heading: heading) else {
-                print("  skipped \(account.nickname); it keeps its current sign-in")
+                print("  skipped \(account.nickname)")
+                unproven.append(account.nickname)
                 continue
             }
             // Judged before anything is written. The wrong account never lands
@@ -243,14 +249,17 @@ case "promote":
                 } else {
                     print("  ✗ that was \(ownerName), not \(account.nickname)")
                 }
-                print("    \(account.nickname) keeps its current sign-in. Sign out of \(ownerName) in the browser and run promote again.")
+                print("    \(account.nickname) is unchanged. Sign out of \(ownerName) in the browser and run promote again.")
+                unproven.append(account.nickname)
                 continue
             case .mismatch:
                 print("  ✗ that signed in as \(result.email), not \(account.nickname) (\(account.email))")
-                print("    \(account.nickname) keeps its current sign-in. To track \(result.email), add it as a new account below.")
+                print("    \(account.nickname) is unchanged. To track \(result.email), add it as a new account below.")
+                unproven.append(account.nickname)
                 continue
             case .unidentified:
-                print("  ✗ could not tell which account that was — \(account.nickname) keeps its current sign-in")
+                print("  ✗ could not tell which account that was — \(account.nickname) is unchanged")
+                unproven.append(account.nickname)
                 continue
             }
             do {
@@ -268,6 +277,9 @@ case "promote":
                 fail("could not save \(account.nickname)'s sign-in — nothing was promoted")
             }
         }
+        // Before offering more accounts, so nobody adds one to a promotion
+        // that is going to be refused.
+        if let refusal = KeepOwnSignIn.promoteRefusal(unproven: unproven) { fail(refusal) }
         while true {
             let prompt = Store.load().isEmpty ? "Add an account now? [Y/n] " : "Add another account? [y/N] "
             let answer = ask(prompt).lowercased()

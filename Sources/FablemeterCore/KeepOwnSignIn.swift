@@ -118,6 +118,13 @@ enum KeepOwnSignIn {
         "✓ \(nickname): kept \(machine)'s sign-in"
     }
 
+    /// The headless promote's last gate: every existing row must have ended
+    /// kept or freshly signed in and checked. Nil means promote may proceed.
+    static func promoteRefusal(unproven: [String]) -> String? {
+        guard !unproven.isEmpty else { return nil }
+        return "nothing was promoted — still needs a sign-in: \(unproven.joined(separator: ", ")). Run promote again; working sign-ins are kept."
+    }
+
     /// "Checking Iconic (1 of 3)…"
     static func checkingText(nickname: String, index: Int, count: Int) -> String {
         "Checking \(nickname) (\(index) of \(count))…"
@@ -217,6 +224,10 @@ extension CoreChecks {
         check("keep: a row that never knew who it is cannot be confirmed, so it signs in",
               blank.0 == .signIn(.unidentified) && blank.2.isEmpty, "\(blank)")
 
+        check("keep: a promote with every row kept or signed in may proceed",
+              KeepOwnSignIn.promoteRefusal(unproven: []) == nil, "")
+        check("keep: a promote with a skipped or refused row is refused and names it",
+              KeepOwnSignIn.promoteRefusal(unproven: ["Charm"])?.contains("Charm") == true, "")
         check("keep: the kept line reads short",
               KeepOwnSignIn.keptText(nickname: "Iconic", machine: "this Mac") == "✓ Iconic: kept this Mac's sign-in", "")
     }
