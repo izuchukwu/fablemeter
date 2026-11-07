@@ -309,6 +309,11 @@ final class Pusher {
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                 switch code {
                 case 200: Log.push.notice("codex push ok")
+                case 409:
+                    // The web has no Claude snapshot to put Codex beside yet
+                    // (no server has pushed). Nothing to fix here; the next
+                    // read after the server's first push lands.
+                    Log.push.notice("codex push: waiting for the server's first snapshot")
                 case 401:
                     flags.withLock { $0.rejected = key }
                     Log.push.notice("codex push: key rejected — reconnect from the ⋯ menu")
