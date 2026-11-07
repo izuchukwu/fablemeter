@@ -83,8 +83,11 @@ enum KeepOwnSignIn {
             accountId = identity.accountId
             email = SignInCheck.isRealEmail(identity.email) ? identity.email : nil
         }
-        if accountId == nil, let fetched = try? await profile(access) {
-            accountId = fetched.accountId
+        // Either half missing: ask the profile, the same way a sign-in does,
+        // and fill only the gaps. A row that knows only its address needs the
+        // address even when the refresh named the account id.
+        if accountId == nil || email == nil, let fetched = try? await profile(access) {
+            if accountId == nil { accountId = fetched.accountId }
             if email == nil, SignInCheck.isRealEmail(fetched.email) { email = fetched.email }
         }
         return .refreshed(accountId: accountId, email: email)
@@ -198,6 +201,13 @@ extension CoreChecks {
         check("keep: …and a profile naming another account asks for a sign-in",
               profileWrong.0 == .signIn(.wrongAccount), "\(profileWrong.0)")
 
+        let idOnlyRows = [SignInCheck.Row(id: iconic.id, accountId: nil, email: iconic.email), rows[1]]
+        let idOnly = run({ _ in bundle(iconicId, nil) }, rows: idOnlyRows, profile: { _ in ("izu@iconic.test", iconicId) })
+        check("keep: a refresh naming only the id still reads the address from the profile for an address-only row",
+              idOnly.0 == .keep, "\(idOnly.0)")
+        let idOnlyWrong = run({ _ in bundle(iconicId, nil) }, rows: idOnlyRows, profile: { _ in ("izu@personal.test", nil) })
+        check("keep: …and an address-only row whose profile names another address signs in",
+              idOnlyWrong.0 != .keep, "\(idOnlyWrong.0)")
         let noIdRows = [SignInCheck.Row(id: iconic.id, accountId: nil, email: iconic.email), rows[1]]
         let learned = run({ _ in bundle(iconicId, "izu@iconic.test") }, rows: noIdRows)
         check("keep: a row matched by address learns its account id",

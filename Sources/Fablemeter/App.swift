@@ -975,6 +975,10 @@ final class AppState: ObservableObject {
     private func keepOwnSignIn(_ account: Account) async -> Bool {
         let current = Store.load().first(where: { $0.id == account.id }) ?? account
         let decision = await KeepOwnSignIn.check(current, rows: Self.identityRows(), vault: vault)
+        // The probe spent and rotated the token on disk; the in-memory row
+        // must carry the rotated one, never the consumed one, whatever the
+        // verdict.
+        syncFromDisk(account.id)
         switch decision {
         case .keep:
             Log.role.notice("role: promote kept [\(account.character)]'s own sign-in")
