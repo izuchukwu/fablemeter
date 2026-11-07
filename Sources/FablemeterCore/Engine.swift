@@ -292,7 +292,7 @@ final class LocalStateFile: @unchecked Sendable {
     private var loggedFailure = false
 
     func write(accounts: [Account], states: [UUID: AccountState], fableFirst: Bool) {
-        let activeID = ActiveAccount.match(email: ActiveAccount.signedInEmail(), accounts: accounts)
+        let activeID = ActiveAccount.localMatch(accounts: accounts)
         write {
             try LocalState.data(
                 accounts: accounts, states: states, fableFirst: fableFirst, activeID: activeID,

@@ -16,7 +16,7 @@ final class AppState: ObservableObject {
     private var budgetFetching = false
     @Published private(set) var accounts: [Account] = []
     @Published private(set) var states: [UUID: AccountState] = [:]
-    @Published private(set) var history = UsageHistory()
+    @Published private(set) var history = UsageHistory(legacy: UsageHistory.legacyFile)
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var isRefreshing = false
     /// True only while a refresh the *user* asked for is in flight. The footer's
@@ -261,7 +261,7 @@ final class AppState: ObservableObject {
                 fableFirst: isFableFirst,
                 isCapped: budget(for: account.label)?.capped == true
             )
-            cell.isActive = ActiveAccount.match(email: ActiveAccount.signedInEmail(), accounts: accounts) == account.id
+            cell.isActive = ActiveAccount.localMatch(accounts: accounts) == account.id
             return cell
         }
     }
@@ -952,7 +952,7 @@ final class AppState: ObservableObject {
             return matches.count == 1 && row.id == "server:\(matches[0].rowId)"
         }
         guard let local = row.local else { return false }
-        return ActiveAccount.match(email: ActiveAccount.signedInEmail(), accounts: accounts) == local.id
+        return ActiveAccount.localMatch(accounts: accounts) == local.id
     }
 
     /// The footer's line: whose numbers these are and how old.

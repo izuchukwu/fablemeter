@@ -2116,6 +2116,15 @@ enum SelfTest {
                   ActiveAccount.match(email: "izu@example.com", accounts: accounts) == personal.id)
             check("active: case and padding do not hide a match",
                   ActiveAccount.match(email: "  IZU@Example.COM \n", accounts: accounts) == personal.id)
+            let uuidP = "11111111-1111-4111-8111-111111111111", uuidC = "22222222-2222-4222-8222-222222222222"
+            let ids = [personal.id: uuidP, charm.id: uuidC]
+            check("active: the signed-in account UUID picks its account, whatever the address",
+                  ActiveAccount.match(accountId: uuidC.uppercased(), email: "izu@example.com", accounts: accounts, ids: ids) == charm.id)
+            check("active: an unrecorded UUID falls back to the address",
+                  ActiveAccount.match(accountId: "33333333-3333-4333-8333-333333333333", email: "izu@example.com", accounts: accounts, ids: ids) == personal.id
+                  && ActiveAccount.match(accountId: nil, email: "izu@example.com", accounts: accounts, ids: [:]) == personal.id)
+            check("active: one UUID on two rows is not an answer",
+                  ActiveAccount.match(accountId: uuidP, email: "izu@example.com", accounts: accounts, ids: [personal.id: uuidP, charm.id: uuidP]) == nil)
             check("active: an address we do not hold resolves to nobody",
                   ActiveAccount.match(email: "someone@else.example", accounts: accounts) == nil)
             check("active: a logged-out machine resolves to nobody",

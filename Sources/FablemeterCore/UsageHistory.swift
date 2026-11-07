@@ -38,9 +38,16 @@ struct UsageHistory {
     let file: URL
     var samples: [UsageSample]
 
-    init(file: URL = LocalState.directory.appendingPathComponent("usage-history.json"), now: Date = Date()) {
+    /// Where history lived before it moved beside the local state file. Read
+    /// only while the new file does not exist yet; the next save writes the
+    /// new path, so a machine upgrading from the old build keeps its graph.
+    static var legacyFile: URL { Store.directory.appendingPathComponent("usage-history.json") }
+
+    init(file: URL = LocalState.directory.appendingPathComponent("usage-history.json"),
+         legacy: URL? = nil, now: Date = Date()) {
         self.file = file
-        let data = try? Data(contentsOf: file)
+        let data = (try? Data(contentsOf: file))
+            ?? (FileManager.default.fileExists(atPath: file.path) ? nil : legacy.flatMap { try? Data(contentsOf: $0) })
         samples = data.flatMap { try? JSONDecoder().decode([UsageSample].self, from: $0) } ?? []
         prune(now: now)
     }
